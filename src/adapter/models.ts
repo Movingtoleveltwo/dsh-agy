@@ -78,6 +78,31 @@ export async function fetchAvailableModels(
   throw lastError instanceof Error ? lastError : new Error('fetchAvailableModels: all endpoints failed')
 }
 
+export async function retrieveUserQuotaSummary(
+  accessToken: string,
+  fetchImpl: typeof fetch = proxiedFetch,
+): Promise<any> {
+  let lastError: unknown = null
+  for (const baseEndpoint of AGY_ENDPOINT_FALLBACKS) {
+    try {
+      const response = await fetchImpl(`${baseEndpoint}/v1internal:retrieveUserQuotaSummary`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'User-Agent': getAgyBootstrapUserAgent(),
+        },
+        body: JSON.stringify({}),
+      })
+      if (response.ok) return await response.json()
+      lastError = new Error(`retrieveUserQuotaSummary ${response.status} at ${baseEndpoint}`)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error('retrieveUserQuotaSummary: all endpoints failed')
+}
+
 /** Merge dynamic ids with catalog metadata; non-chat models and unknowns keep minimal info. */
 export function mergeModelCatalog(dynamic: DiscoveredModels): LlmModelInfo[] {
   const entries: LlmModelInfo[] = []

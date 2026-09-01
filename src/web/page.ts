@@ -6,9 +6,7 @@
 import { I18N_DICT } from './i18n.ts'
 
 export function renderDashboardHtml(): string {
-  const i18nJson = JSON.stringify(I18N_DICT)
-
-  return `<!doctype html>
+return `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -336,61 +334,78 @@ export function renderDashboardHtml(): string {
       flex-wrap: wrap;
     }
 
-    /* Quota Section */
-    .quota-table-wrap {
-      overflow-x: auto;
-      margin-top: 8px;
+    /* Quota Section (dsh-antigravity card style) */
+    .dsha-quota-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: var(--text-primary);
+      margin: 16px 0 6px;
     }
-    .quota-table {
-      width: 100%;
-      border-collapse: collapse;
+    .dsha-quota-group {
+      margin-top: 10px;
+      padding: 12px 14px;
+      background: var(--bg-surface-elevated);
+      border: 1px solid var(--border-l1);
+      border-radius: 10px;
+    }
+    .dsha-group-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }
+    .dsha-group-title {
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+    .dsha-group-desc {
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
+    .dsha-row {
+      padding: 8px 0;
+      border-top: 1px solid var(--border-l1);
+    }
+    .dsha-row:first-of-type {
+      border-top: 0;
+      padding-top: 0;
+    }
+    .dsha-rowtop {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--text-primary);
+      font-weight: 600;
       font-size: 13px;
     }
-    .quota-table th, .quota-table td {
-      padding: 8px 10px;
-      text-align: left;
-      border-bottom: 1px solid var(--border-l1);
-    }
-    .quota-table th {
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--text-tertiary);
-      text-transform: uppercase;
-      letter-spacing: 0.03em;
-    }
-    .model-name {
-      font-family: var(--ds-font-family-code);
-      font-weight: 500;
-      font-size: 12.5px;
-      color: var(--text-primary);
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 4px;
-    }
-    .model-name:hover {
-      color: var(--brand-primary);
-      text-decoration: underline;
-    }
-    .progress-bar {
-      background: var(--bg-surface-elevated);
-      border-radius: 4px;
-      height: 8px;
-      width: 110px;
-      overflow: hidden;
-      display: inline-block;
-      vertical-align: middle;
-      margin-right: 8px;
-    }
-    .progress-fill {
-      height: 100%;
-      border-radius: 4px;
-      transition: width var(--ds-transition-normal);
-    }
-    .reset-time {
-      font-size: 12px;
-      color: var(--text-tertiary);
+    .dsha-metrics {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
       white-space: nowrap;
+      color: var(--text-tertiary);
+      font-size: 12px;
+    }
+    .dsha-percent {
+      font-size: 13px;
+      font-weight: 750;
+    }
+    .dsha-bar {
+      height: 6px;
+      margin-top: 6px;
+      border-radius: 999px;
+      background: var(--bg-input);
+      border: 1px solid var(--border-l1);
+      overflow: hidden;
+    }
+    .dsha-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width var(--ds-transition-normal);
     }
 
     /* Collapsible diagnostics */
@@ -568,7 +583,7 @@ export function renderDashboardHtml(): string {
   <div id="toast-container"></div>
 
   <script>
-    const I18N = ${i18nJson};
+    const I18N = ${JSON.stringify(I18N_DICT)};
     let currentLang = localStorage.getItem('agy_lang') || (navigator.language.startsWith('zh') ? 'zh' : 'en');
     let accountData = [];
     let selectedIndex = 0;
@@ -632,7 +647,9 @@ export function renderDashboardHtml(): string {
       if (diffMin < 60) return t('resetIn') + diffMin + 'm';
       const diffHours = (diffMs / 3600000).toFixed(1);
       if (diffHours < 24) return t('resetIn') + diffHours + 'h';
-      return t('resetAt') + new Date(target).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const diffDays = (diffMs / 86400000).toFixed(1);
+      if (diffDays < 7) return t('resetIn') + diffDays + 'd';
+      return t('resetAt') + new Date(target).toLocaleDateString([], { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     }
 
     function quotaColor(fraction) {
@@ -642,12 +659,21 @@ export function renderDashboardHtml(): string {
 
     function getWorstQuotaFraction(acc) {
       const models = (acc.quota && acc.quota.models) || [];
+      const groups = (acc.quota && acc.quota.groups) || [];
       let worst = 1;
       let hasQuota = false;
       for (const m of models) {
         if (m.remainingFraction != null) {
           worst = Math.min(worst, m.remainingFraction);
           hasQuota = true;
+        }
+      }
+      for (const g of groups) {
+        for (const b of (g.buckets || [])) {
+          if (b.remainingFraction != null) {
+            worst = Math.min(worst, b.remainingFraction);
+            hasQuota = true;
+          }
         }
       }
       return hasQuota ? worst : null;
@@ -732,26 +758,59 @@ export function renderDashboardHtml(): string {
       const isCooling = a.state === 'cooling' && a.cooldownUntil;
       const coolInfo = isCooling ? ' (' + formatRelativeTime(a.cooldownUntil) + ')' : '';
 
-      const models = (a.quota && a.quota.models) || [];
-      const quotaRows = models.map((m) => {
-        const pct = m.remainingFraction != null ? Math.round(m.remainingFraction * 100) : null;
-        const color = quotaColor(m.remainingFraction);
-        const resetText = m.resetTime ? formatRelativeTime(m.resetTime) : '';
-        const exactReset = m.resetTime ? new Date(m.resetTime).toLocaleString() : '';
+      const groups = (a.quota && a.quota.groups) || [];
+      let quotaHtml = '';
+      if (groups.length > 0) {
+        const groupCardsHtml = groups.map((g) => {
+          const bucketsHtml = (g.buckets || []).map((b) => {
+            const pct = b.remainingFraction != null ? Math.round(b.remainingFraction * 100) : null;
+            const color = quotaColor(b.remainingFraction);
+            const resetText = b.resetTime ? formatRelativeTime(b.resetTime) : '';
+            const exactReset = b.resetTime ? new Date(b.resetTime).toLocaleString() : '';
+            const isWeekly = b.window === 'weekly' || (b.displayName && b.displayName.toLowerCase().includes('weekly')) || (b.bucketId && b.bucketId.includes('weekly'));
+            
+            let label = b.displayName;
+            if (currentLang === 'zh') {
+              label = isWeekly ? '周额度 (' + b.displayName + ')' : '5小时额度 (' + b.displayName + ')';
+            }
 
-        return '<tr>' +
-          '<td><span class="model-name" onclick="copyToClipboard(\\'' + esc(m.id) + '\\')" title="Click to copy ID">' + esc(m.id) + '</span></td>' +
-          '<td>' +
-            (pct != null
-              ? '<div class="progress-bar"><div class="progress-fill" style="width:' + pct + '%;background:' + color + '"></div></div><span style="font-weight:500;font-size:12px;">' + pct + '%</span>'
-              : '<span style="color:var(--text-tertiary);font-size:12px;">' + esc(t('noQuotaReported')) + '</span>') +
-          '</td>' +
-          '<td><span class="reset-time" title="' + esc(exactReset) + '">' + esc(resetText) + '</span></td>' +
-          '<td style="text-align:right;">' +
-            '<button class="btn btn-secondary btn-sm" data-test-model="' + esc(m.id) + '">' + esc(t('testModel')) + '</button>' +
-          '</td>' +
-        '</tr>';
-      }).join('');
+            const descTooltip = b.description ? ' title="' + esc(b.description) + '"' : '';
+
+            return '<div class="dsha-row"' + descTooltip + '>' +
+              '<div class="dsha-rowtop">' +
+                '<span>' + esc(label) + '</span>' +
+                '<div class="dsha-metrics">' +
+                  (resetText ? '<span title="' + esc(exactReset) + '">' + esc(resetText) + '</span>' : '') +
+                  '<span class="dsha-percent" style="color:' + color + '">' + (pct != null ? pct + '%' : '—') + '</span>' +
+                '</div>' +
+              '</div>' +
+              '<div class="dsha-bar">' +
+                '<div class="dsha-fill" style="width:' + (pct != null ? pct : 0) + '%;background:' + color + '"></div>' +
+              '</div>' +
+            '</div>';
+          }).join('');
+
+          return '<div class="dsha-quota-group">' +
+            '<div class="dsha-group-head">' +
+              '<span class="dsha-group-title">' + esc(g.displayName) + '</span>' +
+              (g.description ? '<span class="dsha-group-desc">' + esc(g.description) + '</span>' : '') +
+            '</div>' +
+            '<div>' + (bucketsHtml || '<div style="color:var(--text-tertiary);font-size:12px;padding:6px 0;">' + esc(t('noQuotaReported')) + '</div>') + '</div>' +
+          '</div>';
+        }).join('');
+
+        quotaHtml = '<div style="margin-top:16px;">' +
+          '<h3 class="dsha-quota-title">' + esc(t('groupQuotaTitle')) + '</h3>' +
+          groupCardsHtml +
+        '</div>';
+      } else {
+        quotaHtml = '<div style="margin-top:16px;">' +
+          '<h3 class="dsha-quota-title">' + esc(t('groupQuotaTitle')) + '</h3>' +
+          '<div class="dsha-quota-group" style="text-align:center;color:var(--text-tertiary);font-size:13px;padding:18px 14px;">' +
+            esc(t('quotaUnavailable')) +
+          '</div>' +
+        '</div>';
+      }
 
       container.innerHTML = 
         '<div class="detail-head">' +
@@ -778,18 +837,7 @@ export function renderDashboardHtml(): string {
           '<span id="proxy-status" style="font-size:12px;color:var(--text-secondary);">' + ((a.proxy || a.proxyMasked) ? 'Current: ' + esc(a.proxy || a.proxyMasked) : 'No proxy (using env)') + '</span>' +
         '</div>' +
 
-        '<div style="margin-top:16px;">' +
-          '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">' +
-            '<h3 style="font-size:13.5px;font-weight:600;">' + esc(t('quotaTitle')) + ' (' + models.length + ')</h3>' +
-            (models.length > 0 ? '<button class="btn btn-secondary btn-sm" id="btn-action-test-all">⚡ ' + esc(t('testAll')) + '</button>' : '') +
-          '</div>' +
-          '<div class="quota-table-wrap">' +
-            '<table class="quota-table">' +
-              '<thead><tr><th>Model</th><th>Remaining</th><th>Reset</th><th style="text-align:right;">Action</th></tr></thead>' +
-              '<tbody>' + (quotaRows || '<tr><td colspan="4" style="color:var(--text-tertiary);text-align:center;padding:16px 0;">' + esc(t('quotaUnavailable')) + '</td></tr>') + '</tbody>' +
-            '</table>' +
-          '</div>' +
-        '</div>' +
+        quotaHtml +
 
         '<details class="diagnostics" id="diagnostics-panel">' +
           '<summary><span>' + esc(t('fingerprintTitle')) + ' & Output</span><span>▼</span></summary>' +
@@ -1060,9 +1108,9 @@ export function renderDashboardHtml(): string {
     // Init
     applyI18nLabels();
     render();
-  </script>
+  <\/script>
 </body>
-</html>`
+</html>`;
 }
 
 export function renderCallbackHtml(options: { ok: boolean; error?: string; email?: string | null; baseUrl: string }): string {

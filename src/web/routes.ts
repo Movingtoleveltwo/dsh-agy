@@ -98,27 +98,63 @@ export function createAgyWebRoutes(options: AgyWebOptions): WebRoute[] {
       }
       list.push(entry)
     }
-    // Best-effort per-account quota via fetchAvailableModels (fresh token).
-    for (const entry of list) {
-      const session = await sessions.getSession().catch(() => undefined)
-      if (!session || session.index !== entry.index) continue
+    const activeAccount = storage.accounts[storage.activeIndex]
+    const activeEntry = list[storage.activeIndex]
+    if (activeAccount && activeEntry && activeAccount.enabled !== false && !activeAccount.verificationRequired) {
       try {
-        const { fetchAvailableModels } = await import('../adapter/models.ts')
-        const discovered = await fetchAvailableModels(session.auth.access, session.account.projectId)
-        const models = Object.entries(discovered.models ?? {})
-        if (models.length > 0) {
-          const quotaRows = models
-            .map(([id, m]) => ({
-              id,
-              remainingFraction: typeof m.quotaInfo?.remainingFraction === 'number'
-                ? Math.max(0, Math.min(1, m.quotaInfo.remainingFraction))
-                : null,
-              resetTime: m.quotaInfo?.resetTime ?? null,
-            }))
-            .sort((a, b) => (a.remainingFraction ?? -1) - (b.remainingFraction ?? -1))
-          entry.quota = {
-            modelCount: models.length,
-            models: quotaRows,
+        const session = await sessions.getSession().catch(() => undefined)
+        if (session?.auth?.access) {
+          const { retrieveUserQuotaSummary, fetchAvailableModels } = await import('../adapter/models.ts')
+          const summary = await retrieveUserQuotaSummary(session.auth.access).catch(() => ({}))
+          const groups = []
+          for (const group of Array.isArray(summary?.groups) ? summary.groups : []) {
+            if (!group || typeof group !== 'object') continue
+            const buckets = []
+            for (const bucket of Array.isArray(group.buckets) ? group.buckets : []) {
+              if (!bucket || typeof bucket !== 'object') continue
+              const remaining = typeof bucket.remainingFraction === 'number'
+                ? Math.max(0, Math.min(1, bucket.remainingFraction))
+                : null
+              buckets.push({
+                bucketId: String(bucket.bucketId || bucket.displayName || 'unknown'),
+                displayName: String(bucket.displayName || bucket.bucketId || 'Limit'),
+                window: bucket.window ? String(bucket.window) : undefined,
+                resetTime: bucket.resetTime ? String(bucket.resetTime) : undefined,
+                description: bucket.description ? String(bucket.description) : undefined,
+                remainingFraction: remaining,
+              })
+            }
+            if (!buckets.length && !group.displayName) continue
+            groups.push({
+              displayName: String(group.displayName || 'Quota group'),
+              description: group.description ? String(group.description) : undefined,
+              buckets,
+            })
+          }
+
+          if (groups.length > 0) {
+            activeEntry.quota = {
+              groups,
+              groupDescription: summary?.description ? String(summary.description) : undefined,
+            }
+          } else {
+            const discovered = await fetchAvailableModels(session.auth.access, session.account.projectId).catch(() => ({} as any))
+            const models = Object.entries(discovered.models ?? {})
+            if (models.length > 0) {
+              const quotaRows = models
+                .map(([id, m]) => ({
+                  id,
+                  remainingFraction: typeof m.quotaInfo?.remainingFraction === 'number'
+                    ? Math.max(0, Math.min(1, m.quotaInfo.remainingFraction))
+                    : null,
+                  resetTime: m.quotaInfo?.resetTime ?? null,
+                }))
+                .sort((a, b) => (a.remainingFraction ?? -1) - (b.remainingFraction ?? -1))
+              activeEntry.quota = {
+                modelCount: models.length,
+                models: quotaRows,
+              }
+            }
           }
         }
       } catch {

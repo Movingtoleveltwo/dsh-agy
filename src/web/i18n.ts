@@ -29,6 +29,9 @@ export interface I18nStrings {
   confirmDelete: string
   confirmTestAll: string
   confirmRegenerateFp: string
+  groupQuotaTitle: string
+  weeklyLimit: string
+  fiveHourLimit: string
   quotaTitle: string
   quotaUnavailable: string
   noQuotaReported: string
@@ -93,8 +96,11 @@ export const I18N_DICT: { en: I18nStrings; zh: I18nStrings } = {
     confirmDelete: 'Are you sure you want to delete this account? This action cannot be undone.',
     confirmTestAll: 'Test All will execute real API calls on all models, consuming actual quota. Continue?',
     confirmRegenerateFp: 'Generate a fresh device fingerprint and user agent for this account?',
+    groupQuotaTitle: 'Quota',
+    weeklyLimit: 'Weekly Limit',
+    fiveHourLimit: '5-Hour Limit',
     quotaTitle: 'Model Quotas',
-    quotaUnavailable: 'Quota information unavailable for this account',
+    quotaUnavailable: 'No quota data reported for this account',
     noQuotaReported: 'No quota reported by upstream',
     testModel: 'Test',
     testing: 'Testing...',
@@ -155,8 +161,11 @@ export const I18N_DICT: { en: I18nStrings; zh: I18nStrings } = {
     confirmDelete: '确定要删除此账号吗？该操作不可撤销。',
     confirmTestAll: '批量测试将对所有模型发起真实调用并消耗 API 配额，确认继续？',
     confirmRegenerateFp: '确定要为该账号重新生成全新的设备指纹与 User-Agent 吗？',
+    groupQuotaTitle: '额度',
+    weeklyLimit: '周额度',
+    fiveHourLimit: '5小时额度',
     quotaTitle: '模型配额池',
-    quotaUnavailable: '无法获取该账号的模型配额信息',
+    quotaUnavailable: '暂无该账号配额数据，设为默认并刷新后即可查看',
     noQuotaReported: '上游未返回配额信息',
     testModel: '测试',
     testing: '测试中...',
