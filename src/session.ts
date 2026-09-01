@@ -309,104 +309,55 @@ export class AgySessionManager {
     if (!account) return undefined
     return { account, index: activeIdx }
   }
+
   /**
    * Adapter hook: resolve the active session (refresh if needed), healing a
-   * missing projectId at request time — the OAuth-time loadCodeAssist may have
-   * transiently failed even when the Google account owns a Cloud Code project
-   * (mirrors OmniRoute's ensureAntigravityProjectAssigned + persistence).
-   * @param model - requested model id; drives family-scoped quota ranking.
+   * missing projectId at request time.
+   * Pure manual mode: always uses the active account, never rotates or probes other accounts.
    */
-  async getSession(model?: string): Promise<AgyAccountSession | undefined> {
-    let storage = await this.store.load()
-    const maxAttempts = storage.accounts.filter((account) => account.enabled !== false).length
-    let proxyUnreachableCount = 0
+  async getSession(_model?: string): Promise<AgyAccountSession | undefined> {
+    const storage = await this.store.load()
+    const picked = await this.pickAccount(storage)
+    if (!picked) return undefined
 
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const eligible = storage.accounts.filter((account) => account.enabled !== false)
-      if (eligible.length > 1) {
-        await this.refreshQuotaCache(storage)
-        // In-memory overlay on storage already took place in refreshQuotaCache.
-      }
-      const picked = await this.pickAccount(storage, model)
-      if (!picked) return undefined
-      let auth: OAuthAuthDetails | undefined
+    const auth = await this.accessTokenFor(picked.account)
+    if (!auth) return undefined
+
+    const key = this.accountKey(picked.account)
+    if (!picked.account.projectId && !this.projectRetryFailed.has(key)) {
       try {
-        auth = await this.accessTokenFor(picked.account)
-      } catch (error) {
-        if (error instanceof AgyAuthError && error.kind === 'transport' && isProxyUnreachableError(error)) {
-          // Fail-closed for per-account proxy: skip this account this request, do not write cooldown.
-          proxyUnreachableCount++
-          this.lastUsed = null
-          // Rotate activeIndex away from the dead proxy account for next pick
-          const deadIndex = storage.accounts.findIndex((a) => this.accountKey(a) === this.accountKey(picked.account))
-          if (deadIndex !== -1) {
-            const next = pickNextAccountIndex(storage.accounts, deadIndex, Date.now())
-            if (next !== storage.activeIndex) {
-              storage.activeIndex = next
-              await this.store.mutate((s) => { s.activeIndex = next }).catch(() => {})
+        const { loadCodeAssist } = await import('./oauth/exchange.ts')
+        const { projectId } = await loadCodeAssist(auth.access)
+        if (projectId) {
+          await this.store.mutate((s) => {
+            const account = s.accounts.find((candidate) => this.accountKey(candidate) === key)
+            if (account) {
+              account.projectId = projectId
+              // Keep the packed refresh string in sync.
+              const parts = parseRefreshParts(account.refresh)
+              account.refresh = formatRefreshParts({
+                refreshToken: parts.refreshToken,
+                projectId,
+                managedProjectId: parts.managedProjectId,
+              })
             }
-          }
-          storage = await this.store.load()
-          continue
-        }
-        // Also handle direct isProxyUnreachableError without AgyAuthError wrapper
-        if (isProxyUnreachableError(error)) {
-          proxyUnreachableCount++
-          this.lastUsed = null
-          storage = await this.store.load()
-          continue
-        }
-        throw error
-      }
-      if (!auth) {
-        // The selected credential was revoked and disabled by accessTokenFor.
-        // Re-read and select another enabled account within this same request.
-        this.lastUsed = null
-        storage = await this.store.load()
-        continue
-      }
-
-      const key = this.accountKey(picked.account)
-      if (!picked.account.projectId && !this.projectRetryFailed.has(key)) {
-        try {
-          const { loadCodeAssist } = await import('./oauth/exchange.ts')
-          const { projectId } = await loadCodeAssist(auth.access)
-          if (projectId) {
-            await this.store.mutate((s) => {
-              const account = s.accounts.find((candidate) => this.accountKey(candidate) === key)
-              if (account) {
-                account.projectId = projectId
-                // Keep the packed refresh string in sync.
-                const parts = parseRefreshParts(account.refresh)
-                account.refresh = formatRefreshParts({
-                  refreshToken: parts.refreshToken,
-                  projectId,
-                  managedProjectId: parts.managedProjectId,
-                })
-              }
-            })
-            picked.account.projectId = projectId
-          } else {
-            this.projectRetryFailed.add(key)
-          }
-        } catch {
+          })
+          picked.account.projectId = projectId
+        } else {
           this.projectRetryFailed.add(key)
         }
-      }
-
-      this.lastUsed = { key, at: Date.now() }
-      return {
-        auth,
-        account: picked.account,
-        index: picked.index,
-        impersonation: impersonationHeadersFor(picked.account),
+      } catch {
+        this.projectRetryFailed.add(key)
       }
     }
 
-    if (proxyUnreachableCount === maxAttempts && maxAttempts > 0) {
-      throw new AgyAuthError('transport', 'proxy_unreachable')
+    this.lastUsed = { key, at: Date.now() }
+    return {
+      auth,
+      account: picked.account,
+      index: picked.index,
+      impersonation: impersonationHeadersFor(picked.account),
     }
-    return undefined
   }
 
   /** Adapter hook: apply rotation decisions and fingerprint regeneration. */
@@ -472,13 +423,7 @@ export class AgySessionManager {
       }
 
       if (decision.action === 'rotate') {
-        const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
-        const familyKey = familyKeyOf(info?.model)
-        const nextIndex = pickNextAccountIndex(storage.accounts, currentIndex >= 0 ? currentIndex : storage.activeIndex, Date.now(), familyKey)
-        if (nextIndex !== storage.activeIndex) {
-          storage.activeIndex = nextIndex
-          nextIndexToRotate = nextIndex
-        }
+        // Pure manual mode: do not rotate or mutate storage.activeIndex.
         this.lastUsed = null
       }
     })

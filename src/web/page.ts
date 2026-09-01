@@ -587,6 +587,7 @@ return `<!doctype html>
     let currentLang = localStorage.getItem('agy_lang') || (navigator.language.startsWith('zh') ? 'zh' : 'en');
     let accountData = [];
     let selectedIndex = 0;
+    let initialLoad = true;
     let isBusy = false;
 
     function t(key) {
@@ -1036,7 +1037,13 @@ return `<!doctype html>
       try {
         const data = await api('/accounts');
         accountData = data.accounts || [];
-        if (selectedIndex >= accountData.length) selectedIndex = Math.max(0, accountData.length - 1);
+        if (initialLoad) {
+          const activeIdx = accountData.findIndex((a) => a.active);
+          if (activeIdx >= 0) selectedIndex = activeIdx;
+          initialLoad = false;
+        } else if (selectedIndex >= accountData.length) {
+          selectedIndex = Math.max(0, accountData.length - 1);
+        }
         renderMasterList();
         renderDetailView();
       } catch (e) {
