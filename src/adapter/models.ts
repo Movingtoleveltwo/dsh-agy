@@ -103,16 +103,17 @@ export async function retrieveUserQuotaSummary(
   throw lastError instanceof Error ? lastError : new Error('retrieveUserQuotaSummary: all endpoints failed')
 }
 
-/** Merge dynamic ids with catalog metadata; non-chat models and unknowns keep minimal info. */
+/** Merge dynamic ids with catalog metadata; filtered to only expose the public models. */
 export function mergeModelCatalog(dynamic: DiscoveredModels): LlmModelInfo[] {
+  const allowed = new Set(AGY_PUBLIC_MODELS.map((m) => m.id))
   const entries: LlmModelInfo[] = []
   for (const [id, entry] of Object.entries(dynamic.models ?? {})) {
-    if (!isChatCallableModelId(id)) continue
+    if (!allowed.has(id)) continue
     const meta = catalogModel(id)
     entries.push({
       provider: AGY_PROVIDER,
       id,
-      name: entry.displayName ?? meta?.name ?? entry.modelName ?? id,
+      name: meta?.name ?? entry.displayName ?? entry.modelName ?? id,
       inputModalities: inputModalitiesFor(meta),
       ...(meta ? { context: { contextWindow: meta.contextLength } } : {}),
     })
