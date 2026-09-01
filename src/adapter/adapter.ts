@@ -124,6 +124,13 @@ export class AgyAdapter extends LlmAdapter {
     return resolveAgyModel(provider, model)
   }
 
+  async prepareCall(provider: string, model: string, signal?: AbortSignal) {
+    return {
+      model: await this.resolveModel(provider, model),
+      stream: (options: GenerateOptions) => this.stream(options),
+    }
+  }
+
   /**
    * Pre-resolve every image attachment into base64 bytes before translation.
    * Image input hard-fails with UNSUPPORTED_CONTENT (terminal, never retried)
