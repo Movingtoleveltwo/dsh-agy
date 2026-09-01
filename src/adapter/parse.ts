@@ -9,7 +9,12 @@
  */
 
 import type { FinishReason, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import * as DshLlm from '@deepseek-ai/dsh-llm'
+
+const CallId = (id: string) => {
+  const factory = (DshLlm as Record<string, unknown>).ToolCallId ?? (DshLlm as Record<string, unknown>).CallId
+  return typeof factory === 'function' ? (factory as (s: string) => any)(id) : id
+}
 
 export interface SsePart {
   text?: string

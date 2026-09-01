@@ -297,61 +297,17 @@ export class AgySessionManager {
   }
 
   /**
-   * Pick the account for one request: the affinity pin wins while it is fresh,
-   * healthy, and not drained for the requested model; otherwise the pool is
-   * ranked by family-scoped usage (OMP-aligned) and the best candidate wins.
+   * Pure manual mode:
+   * Always uses the user-selected active account (`storage.activeIndex`).
+   * No automatic rotation, no background pool scanning.
    */
-  private async pickAccount(storage: AccountStorageV4, model?: string): Promise<{ account: ManagedAccount; index: number } | undefined> {
-    const now = Date.now()
-    for (const account of storage.accounts) clearExpiredState(account, now)
-
-    const family = modelFamilyOf(model)
-    const familyKey = familyKeyOf(model)
-    // Session affinity (time-window approximation): reuse the last-used account
-    // while it is fresh and healthy, so one conversation stays on one account
-    // (upstream prefix cache + sessionId continuity). A drained family or a
-    // cooldown breaks the pin and re-ranks, mirroring OMP's pinned-until-unusable.
-    if (this.lastUsed && now - this.lastUsed.at < SESSION_AFFINITY_WINDOW_MS) {
-      const lastIndex = storage.accounts.findIndex((a) => this.accountKey(a) === this.lastUsed!.key)
-      if (lastIndex !== -1) {
-        const last = storage.accounts[lastIndex]!
-        if (
-          last.enabled !== false &&
-          !isCoolingDown(last, now) &&
-          !isFamilyRateLimited(last, familyKey, now) &&
-          !isFamilyDrained(last, family, now)
-        ) {
-          return { account: last, index: lastIndex }
-        }
-      }
-    }
-    const eligible = storage.accounts
-      .map((account, index) => ({ account, index }))
-      .filter(({ account }) => account.enabled !== false)
-    if (eligible.length === 0) return undefined
-
-    const ranked = rankPoolCandidates(eligible, model, now, storage.activeIndex)
-    const picked = ranked.find((candidate) => candidate.blockedUntil === null)
-    if (!picked) {
-      const quotaExhausted = (account: ManagedAccount): boolean => {
-        if (account.cooldownReason === 'quota-exhausted' && (account.coolingDownUntil ?? 0) > now) return true
-        const quota = familyQuotaFor(account, family)
-        if ((quota?.remainingFraction ?? 1) > 0 || !quota?.resetTime) return false
-        const resetAt = Date.parse(quota.resetTime)
-        return !Number.isNaN(resetAt) && resetAt > now
-      }
-      const retryable = ranked.filter((candidate) => !quotaExhausted(candidate.account))
-      const blocked = retryable.length > 0 ? retryable : ranked
-      const blockedUntil = Math.min(...blocked.map((candidate) => candidate.blockedUntil ?? now))
-      throw new AgyPoolBlockedError(retryable.length > 0 ? 'retryable' : 'quota-exhausted', blockedUntil)
-    }
-    if (picked.index !== storage.activeIndex) {
-      storage.activeIndex = picked.index
-      await this.store.mutate((s) => {
-        s.activeIndex = picked.index
-      })
-    }
-    return { account: picked.account, index: picked.index }
+  private async pickAccount(storage: AccountStorageV4, _model?: string): Promise<{ account: ManagedAccount; index: number } | undefined> {
+    const activeIdx = typeof storage.activeIndex === 'number' && storage.activeIndex >= 0 && storage.activeIndex < storage.accounts.length
+      ? storage.activeIndex
+      : 0
+    const account = storage.accounts[activeIdx]
+    if (!account) return undefined
+    return { account, index: activeIdx }
   }
   /**
    * Adapter hook: resolve the active session (refresh if needed), healing a

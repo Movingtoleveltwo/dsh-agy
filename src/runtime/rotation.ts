@@ -110,7 +110,7 @@ export function decideRotation(
 
   switch (kind) {
     case 'rate-limit': {
-      if (category === 'soft_rate_limit') {
+      if (category === 'soft_rate_limit' || (consecutiveFailures < 3 && category !== 'quota_exhausted')) {
         // Transient burst: retry the same account almost immediately.
         return { action: 'retry', backoffMs: Math.min(retryAfterMs ?? backoffMs, 3000) }
       }
@@ -126,13 +126,13 @@ export function decideRotation(
         return { action: 'cool', backoffMs: Math.max(cooldownMs, 60_000) }
       }
       // Per-minute rate limit: prefer the server's real reset (capped), then
-      // Retry-After, then the fixed short window. The family-scoped reset is
-      // recorded in account.rateLimitResetTimes, so other model families on
-      // this account stay unblocked (AuthStorage-aligned).
+      // Retry-After, then the fixed short window.
       const resetMs = parseFutureResetMs(resetTime, now)
       const cooldownMs = resetMs !== undefined
         ? Math.min(resetMs - now, MAX_RATE_LIMIT_COOLDOWN_MS)
         : (retryAfterMs ?? RATE_LIMIT_COOLDOWN_MS)
+      account.coolingDownUntil = now + Math.max(cooldownMs, 60_000)
+      account.cooldownReason = 'rate-limited'
       return { action: 'rotate', backoffMs: Math.max(cooldownMs, 1000) }
     }
     case 'auth-failure': {
@@ -144,9 +144,18 @@ export function decideRotation(
       return { action: 'revoke' }
     }
     case 'network-error': {
+      if (consecutiveFailures < 2) {
+        return { action: 'retry', backoffMs: Math.min(backoffMs, 2000) }
+      }
       account.coolingDownUntil = now + backoffMs
       account.cooldownReason = 'network-error'
       return { action: 'rotate', backoffMs }
+    }
+    case 'proxy-unreachable': {
+      if (consecutiveFailures < 2) {
+        return { action: 'retry', backoffMs: 1000 }
+      }
+      return { action: 'rotate', backoffMs: Math.min(backoffMs, 1000) }
     }
     case 'project-error': {
       account.coolingDownUntil = now + backoffMs

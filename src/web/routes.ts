@@ -259,7 +259,15 @@ export function createAgyWebRoutes(options: AgyWebOptions): WebRoute[] {
       await store.mutate((storage) => {
         if (index < 0 || index >= storage.accounts.length) throw new Error('account not found')
         storage.activeIndex = index
+        const target = storage.accounts[index]
+        if (target) {
+          delete target.coolingDownUntil
+          delete target.cooldownReason
+          delete target.rateLimitResetTimes
+          target.enabled = true
+        }
       })
+      sessions.clearSessionAffinity?.()
       sendJson(res, 200, { ok: true, index })
     } catch (error) {
       sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) })
