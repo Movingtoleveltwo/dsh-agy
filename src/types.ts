@@ -60,6 +60,7 @@ export interface ManagedAccount {
   fingerprintHistory?: FingerprintVersion[]
   cachedQuota?: Record<string, CachedQuota>
   cachedQuotaUpdatedAt?: number
+  lastQuotaSummary?: Record<string, unknown>
   /** Per-account proxy URL (e.g. http://user:pass@host:8080 or socks5://host:1080). Undefined = follow env. */
   proxy?: string
 }

@@ -639,11 +639,25 @@ return `<!doctype html>
       document.body.removeChild(ta);
     }
 
+    function formatAge(ts) {
+      if (!ts) return '';
+      const diffMs = Date.now() - new Date(ts).getTime();
+      if (diffMs < 0) return '';
+      const diffMin = Math.floor(diffMs / 60000);
+      if (diffMin < 1) return currentLang === 'zh' ? '刚刚' : 'just now';
+      if (diffMin < 60) return currentLang === 'zh' ? (diffMin + ' 分钟前') : (diffMin + 'm ago');
+      const diffHours = Math.floor(diffMs / 3600000);
+      if (diffHours < 24) return currentLang === 'zh' ? (diffHours + ' 小时前') : (diffHours + 'h ago');
+      const diffDays = Math.floor(diffMs / 86400000);
+      return currentLang === 'zh' ? (diffDays + ' 天前') : (diffDays + 'd ago');
+    }
+
     function formatRelativeTime(dateStr) {
       if (!dateStr) return '';
       const target = new Date(dateStr).getTime();
+      if (isNaN(target)) return '';
       const diffMs = target - Date.now();
-      if (diffMs <= 0) return '';
+      if (diffMs <= 0) return t('resetPassed');
       const diffMin = Math.round(diffMs / 60000);
       if (diffMin < 60) return t('resetIn') + diffMin + 'm';
       const diffHours = (diffMs / 3600000).toFixed(1);
@@ -800,8 +814,19 @@ return `<!doctype html>
           '</div>';
         }).join('');
 
+        const isSnapshot = !a.active || (a.quota && a.quota.isSnapshot);
+        const badgeType = isSnapshot ? 'badge-warn' : 'badge-primary';
+        const ageText = a.quota && a.quota.updatedAt ? formatAge(a.quota.updatedAt) : '';
+        const badgeLabel = isSnapshot
+          ? (t('snapshotQuota') + (ageText ? ' (' + ageText + ')' : ''))
+          : (t('realtimeQuota') + (ageText ? ' (' + ageText + ')' : ''));
+        const statusBadge = '<span class="badge ' + badgeType + '" style="font-size:11px;font-weight:normal;margin-left:8px;padding:2px 8px;">' + esc(badgeLabel) + '</span>';
+
         quotaHtml = '<div style="margin-top:16px;">' +
-          '<h3 class="dsha-quota-title">' + esc(t('groupQuotaTitle')) + '</h3>' +
+          '<div style="display:flex;align-items:center;margin-bottom:8px;">' +
+            '<h3 class="dsha-quota-title" style="margin-bottom:0;">' + esc(t('groupQuotaTitle')) + '</h3>' +
+            statusBadge +
+          '</div>' +
           groupCardsHtml +
         '</div>';
       } else {

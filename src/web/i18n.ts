@@ -66,6 +66,9 @@ export interface I18nStrings {
   retryLogin: string
   resetIn: string
   resetAt: string
+  resetPassed: string
+  realtimeQuota: string
+  snapshotQuota: string
 }
 
 export const I18N_DICT: { en: I18nStrings; zh: I18nStrings } = {
@@ -100,7 +103,7 @@ export const I18N_DICT: { en: I18nStrings; zh: I18nStrings } = {
     weeklyLimit: 'Weekly Limit',
     fiveHourLimit: '5-Hour Limit',
     quotaTitle: 'Model Quotas',
-    quotaUnavailable: 'No quota data reported for this account',
+    quotaUnavailable: 'No quota data reported for this account yet',
     noQuotaReported: 'No quota reported by upstream',
     testModel: 'Test',
     testing: 'Testing...',
@@ -133,6 +136,9 @@ export const I18N_DICT: { en: I18nStrings; zh: I18nStrings } = {
     retryLogin: 'Return to Dashboard',
     resetIn: 'Resets in ',
     resetAt: 'Resets at ',
+    resetPassed: 'Reset passed',
+    realtimeQuota: 'Live',
+    snapshotQuota: 'Last snapshot',
   },
   zh: {
     title: 'Antigravity 账号池管理',
@@ -165,7 +171,7 @@ export const I18N_DICT: { en: I18nStrings; zh: I18nStrings } = {
     weeklyLimit: '周额度',
     fiveHourLimit: '5小时额度',
     quotaTitle: '模型配额池',
-    quotaUnavailable: '暂无该账号配额数据，设为默认并刷新后即可查看',
+    quotaUnavailable: '暂无该账号配额数据，设为当前使用并刷新后即可获取',
     noQuotaReported: '上游未返回配额信息',
     testModel: '测试',
     testing: '测试中...',
@@ -198,5 +204,8 @@ export const I18N_DICT: { en: I18nStrings; zh: I18nStrings } = {
     retryLogin: '返回控制面板',
     resetIn: '将在 ',
     resetAt: '重置时间：',
+    resetPassed: '重置周期已过',
+    realtimeQuota: '实时',
+    snapshotQuota: '历史快照',
   },
 }

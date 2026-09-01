@@ -92,7 +92,7 @@ export function createAgyWebRoutes(options: AgyWebOptions): WebRoute[] {
           ? { userAgent: account.fingerprint.userAgent, deviceId: account.fingerprint.deviceId, createdAt: account.fingerprint.createdAt }
           : null,
         fingerprintHistory: (account.fingerprintHistory ?? []).length,
-        quota: null as Record<string, unknown> | null,
+        quota: account.lastQuotaSummary ? { ...account.lastQuotaSummary, isSnapshot: true } : null,
         proxy: account.proxy ? maskProxyUrl(account.proxy) : null,
         proxyMasked: account.proxy ? maskProxyUrl(account.proxy) : null,
       }
@@ -132,10 +132,13 @@ export function createAgyWebRoutes(options: AgyWebOptions): WebRoute[] {
             })
           }
 
+          let freshQuota: Record<string, unknown> | null = null
           if (groups.length > 0) {
-            activeEntry.quota = {
+            freshQuota = {
               groups,
               groupDescription: summary?.description ? String(summary.description) : undefined,
+              updatedAt: Date.now(),
+              isSnapshot: false,
             }
           } else {
             const discovered = await fetchAvailableModels(session.auth.access, session.account.projectId).catch(() => ({} as any))
@@ -150,15 +153,28 @@ export function createAgyWebRoutes(options: AgyWebOptions): WebRoute[] {
                   resetTime: m.quotaInfo?.resetTime ?? null,
                 }))
                 .sort((a, b) => (a.remainingFraction ?? -1) - (b.remainingFraction ?? -1))
-              activeEntry.quota = {
+              freshQuota = {
                 modelCount: models.length,
                 models: quotaRows,
+                updatedAt: Date.now(),
+                isSnapshot: false,
               }
             }
           }
+
+          if (freshQuota) {
+            activeEntry.quota = freshQuota
+            const activeIdx = storage.activeIndex
+            await store.mutate((s) => {
+              const target = s.accounts[activeIdx]
+              if (target) {
+                target.lastQuotaSummary = freshQuota!
+              }
+            }).catch(() => {})
+          }
         }
       } catch {
-        // quota stays null
+        // quota falls back to stored lastQuotaSummary
       }
     }
     return list
