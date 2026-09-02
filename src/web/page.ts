@@ -684,6 +684,7 @@ return `<!doctype html>
         }
       }
       for (const g of groups) {
+        if (g.displayName && (g.displayName.toLowerCase().includes('claude') || g.displayName.toLowerCase().includes('gpt'))) continue;
         for (const b of (g.buckets || [])) {
           if (b.remainingFraction != null) {
             worst = Math.min(worst, b.remainingFraction);
@@ -773,7 +774,9 @@ return `<!doctype html>
       const isCooling = a.state === 'cooling' && a.cooldownUntil;
       const coolInfo = isCooling ? ' (' + formatRelativeTime(a.cooldownUntil) + ')' : '';
 
-      const groups = (a.quota && a.quota.groups) || [];
+      const groups = ((a.quota && a.quota.groups) || []).filter(function(g) {
+        return !g.displayName || (!g.displayName.toLowerCase().includes('claude') && !g.displayName.toLowerCase().includes('gpt'));
+      });
       let quotaHtml = '';
       if (groups.length > 0) {
         const groupCardsHtml = groups.map((g) => {

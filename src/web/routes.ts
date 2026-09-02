@@ -109,6 +109,10 @@ export function createAgyWebRoutes(options: AgyWebOptions): WebRoute[] {
           const groups = []
           for (const group of Array.isArray(summary?.groups) ? summary.groups : []) {
             if (!group || typeof group !== 'object') continue
+            const gName = String(group.displayName || '')
+            if (gName.toLowerCase().includes('claude') || gName.toLowerCase().includes('gpt')) {
+              continue
+            }
             const buckets = []
             for (const bucket of Array.isArray(group.buckets) ? group.buckets : []) {
               if (!bucket || typeof bucket !== 'object') continue
