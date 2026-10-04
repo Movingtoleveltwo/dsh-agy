@@ -374,12 +374,12 @@ describe('OpenAI Relay HTTP endpoints', () => {
     expect(json.endpoints).toContain('/agy/v1/chat/completions')
   })
 
-  it('handles GET /agy/v1/models', async () => {
+  it('handles GET /agy/v1/models (maps raw internal IDs to clean public IDs)', async () => {
     const res = await fetch(`${baseUrl}/agy/v1/models`)
     expect(res.status).toBe(200)
     const json = (await res.json()) as { object: string; data: Array<{ id: string }> }
     expect(json.object).toBe('list')
-    expect(json.data.map((m) => m.id)).toContain('gemini-3.8-flash-tiered')
+    expect(json.data.map((m) => m.id)).toContain('gemini-3.8-flash')
     expect(json.data.map((m) => m.id)).toContain('claude-3-7-sonnet-tiered')
   })
 

@@ -183,15 +183,18 @@ export function createOpenAiRelayHandler(options: OpenAiRelayOptions) {
           const models: readonly { id: string }[] = typeof listAllModels === 'function'
             ? await listAllModels().catch(() => AGY_PUBLIC_MODELS)
             : AGY_PUBLIC_MODELS
-          const data = models.map((m) => ({
-            id: m.id,
-            object: 'model',
-            created: 1700000000,
-            owned_by: 'google-antigravity',
-            permission: [],
-            root: m.id,
-            parent: null,
-          }))
+          const data = models.map((m) => {
+            const publicId = formatRelayPublicModelId(m.id)
+            return {
+              id: publicId,
+              object: 'model',
+              created: 1700000000,
+              owned_by: 'google-antigravity',
+              permission: [],
+              root: publicId,
+              parent: null,
+            }
+          })
           sendJson(res, 200, { object: 'list', data })
           return
         }
@@ -620,6 +623,26 @@ async function handleNonStreamingCompletion(
   } catch (error) {
     handleError(res, error)
   }
+}
+
+/**
+ * Outward-facing model IDs for /v1/models: maps raw internal engine IDs to
+ * clean, human-intuitive CLI-style identifiers so consumers like Hermes display
+ * clean names (e.g. 'Gemini 3.8 Flash' instead of 'Gemini 3.8 Flash Tiered',
+ * 'Gemini 3.1 Pro High' instead of 'Gemini Pro Agent').
+ */
+export const RELAY_PUBLIC_MODEL_IDS: Readonly<Record<string, string>> = {
+  'gemini-pro-agent': 'gemini-3.1-pro-high',
+  'gemini-3.8-flash-tiered': 'gemini-3.8-flash',
+  'gemini-3.7-flash-tiered': 'gemini-3.7-flash',
+  'gpt-oss-120b-medium': 'gpt-oss-120b',
+}
+
+/**
+ * Normalizes an internal model info entry to its outward public model ID.
+ */
+export function formatRelayPublicModelId(internalId: string): string {
+  return RELAY_PUBLIC_MODEL_IDS[internalId] ?? internalId
 }
 
 /**
