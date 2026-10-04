@@ -721,6 +721,8 @@ export function translateOpenAiMessages(
                 } else {
                   throw new Error(`Remote image URLs ('${url.slice(0, 32)}...') are not supported; please provide base64 data URIs ('data:<media-type>;base64,<data>')`)
                 }
+              } else {
+                throw new Error("Malformed image part: missing 'url' in 'image_url'")
               }
             } else if (typeof p.text === 'string') {
               blocks.push({ type: 'text', text: p.text })
@@ -915,6 +917,33 @@ function handleError(res: ServerResponse, error: unknown): void {
       status = 400
       code = 'unsupported_content'
       type = 'invalid_request_error'
+    }
+  }
+
+  // Structured HTTP status code if present on the error object
+  if (status === 500 && error && typeof error === 'object') {
+    const errObj = error as { status?: unknown; statusCode?: unknown; httpStatus?: unknown }
+    const rawStatus = typeof errObj.status === 'number'
+      ? errObj.status
+      : (typeof errObj.statusCode === 'number'
+        ? errObj.statusCode
+        : (typeof errObj.httpStatus === 'number' ? errObj.httpStatus : undefined))
+
+    if (rawStatus && rawStatus >= 400 && rawStatus < 600) {
+      status = rawStatus
+      if (status === 404) {
+        code = 'model_not_found'
+        type = 'invalid_request_error'
+      } else if (status === 400) {
+        code = 'invalid_request_error'
+        type = 'invalid_request_error'
+      } else if (status === 401 || status === 403) {
+        code = 'invalid_api_key'
+        type = 'invalid_request_error'
+      } else if (status === 429) {
+        code = 'insufficient_quota'
+        type = 'insufficient_quota'
+      }
     }
   }
 

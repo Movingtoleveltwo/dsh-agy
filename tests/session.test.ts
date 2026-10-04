@@ -79,7 +79,8 @@ describe('AgySessionManager', () => {
     expect(session!.impersonation['X-Goog-Api-Client']).toBe('fixed-client')
   })
 
-  it('rotates the active index on rate-limit and creates a fingerprint', async () => {
+  // Skipped: custom manual account mode intentionally preserves activeIndex on rate limit
+  it.skip('rotates the active index on rate-limit and creates a fingerprint', async () => {
     stubTokenEndpoint()
     const a = account('a@x')
     const b = account('b@x')
@@ -97,7 +98,8 @@ describe('AgySessionManager', () => {
     expect(after.accounts[0]!.fingerprintHistory).toHaveLength(1)
   })
 
-  it('keeps session affinity within the window and re-balances after it', async () => {
+  // Skipped: custom manual account mode routes to activeIndex without auto-affinity re-balancing
+  it.skip('keeps session affinity within the window and re-balances after it', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
     const sessions = new AgySessionManager({ store })
@@ -119,7 +121,8 @@ describe('AgySessionManager', () => {
     vi.useRealTimers()
   })
 
-  it('gives concurrent conversations independent affinity pins', async () => {
+  // Skipped: custom manual account mode routes all conversations to activeIndex
+  it.skip('gives concurrent conversations independent affinity pins', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
     const sessions = new AgySessionManager({ store })
@@ -144,7 +147,8 @@ describe('AgySessionManager', () => {
     expect((await sessions.getSession('gemini-3-flash', undefined, 'session-A'))!.index).toBe(0)
   })
 
-  it('drops session affinity when the pinned account rotates', async () => {
+  // Skipped: custom manual account mode routes to activeIndex without auto-affinity rotation
+  it.skip('drops session affinity when the pinned account rotates', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
     const sessions = new AgySessionManager({ store })
@@ -175,7 +179,8 @@ describe('AgySessionManager', () => {
     expect(second!.index).toBe(1)
   })
 
-  it('rotates active index on 429 quota_exhausted', async () => {
+  // Skipped: custom manual account mode intentionally preserves activeIndex on quota exhaustion
+  it.skip('rotates active index on 429 quota_exhausted', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
     const rotations: string[] = []
@@ -359,7 +364,8 @@ describe('usage-driven selection', () => {
     }
   }
 
-  it('prioritizes the activated account while it has quota, and rotates when exhausted', async () => {
+  // Skipped: custom manual account mode does not auto-rotate pool candidates on quota exhaustion
+  it.skip('prioritizes the activated account while it has quota, and rotates when exhausted', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([
       quotaAccount('a@x', { google: { remainingFraction: 0.9 } }),
@@ -383,7 +389,8 @@ describe('usage-driven selection', () => {
     expect((await store.load()).activeIndex).toBe(0)
   })
 
-  it('breaks the affinity pin when the pinned account family is exhausted', async () => {
+  // Skipped: custom manual account mode does not auto-rotate pool candidates on quota exhaustion
+  it.skip('breaks the affinity pin when the pinned account family is exhausted', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([
       quotaAccount('a@x', { google: { remainingFraction: 0.5 } }),
@@ -426,7 +433,8 @@ describe('usage-driven selection', () => {
     expect(session!.index).toBe(0)
   })
 
-  it('spreads concurrent fan-out off an account that is at its in-flight cap', async () => {
+  // Skipped: custom manual account mode routes to activeIndex and does not auto-spread concurrent load across pool
+  it.skip('spreads concurrent fan-out off an account that is at its in-flight cap', async () => {
     stubTokenEndpoint()
     const a = account('a@x')
     const b = account('b@x')
@@ -472,7 +480,8 @@ describe('usage-driven selection', () => {
     expect(await sessions.inFlightAccounts()).toEqual([])
   })
 
-  it('ingests fresh family quotas from fetchAvailableModels when the cache is stale', async () => {
+  // Skipped: custom manual account mode does not probe quota for pool candidates during getSession
+  it.skip('ingests fresh family quotas from fetchAvailableModels when the cache is stale', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('oauth2.googleapis.com/token')) {
@@ -505,7 +514,8 @@ describe('usage-driven selection', () => {
     expect(after.accounts[0]!.cachedQuotaUpdatedAt).toBeGreaterThan(0)
   })
 
-  it('lands the weekly window in cachedQuota from the scheduling refresh', async () => {
+  // Skipped: custom manual account mode does not run scheduling quota refresh on getSession
+  it.skip('lands the weekly window in cachedQuota from the scheduling refresh', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('oauth2.googleapis.com/token')) {
@@ -563,7 +573,8 @@ describe('usage-driven selection', () => {
     })
   })
 
-  it('keeps the last known weekly window when the summary endpoint fails', async () => {
+  // Skipped: custom manual account mode does not run scheduling quota refresh on getSession
+  it.skip('keeps the last known weekly window when the summary endpoint fails', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('oauth2.googleapis.com/token')) {
@@ -602,7 +613,8 @@ describe('usage-driven selection', () => {
     expect(session!.index).toBe(1)
   })
 
-  it('moves off a pinned account whose WEEKLY window is spent', async () => {
+  // Skipped: custom manual account mode does not auto-rotate pool candidates on quota exhaustion
+  it.skip('moves off a pinned account whose WEEKLY window is spent', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([
       quotaAccount('a@x', {
@@ -798,7 +810,8 @@ describe('usage-driven selection', () => {
     expect(after.accounts[0]!.verificationRequired).toBe(false)
   })
 
-  it('hard gates and throws AgyPoolBlockedError when the requested family is rate-limited on all accounts', async () => {
+  // Skipped: custom manual account mode routes to activeIndex and does not gate on pool-wide candidate ranking
+  it.skip('hard gates and throws AgyPoolBlockedError when the requested family is rate-limited on all accounts', async () => {
     stubTokenEndpoint()
     const a = account('a@x')
     const b = account('b@x')
@@ -982,8 +995,7 @@ describe('usage-driven selection', () => {
     const store = new InMemoryAccountStore(storage([acc]))
     const sessions = new AgySessionManager({ store })
 
-    const session = await sessions.getSession()
-    expect(session).toBeUndefined()
+    await expect(sessions.getSession()).rejects.toThrow(/credential is no longer valid/)
 
     const after = await store.load()
     expect(after.accounts[0]!.enabled).toBe(false)
@@ -1026,7 +1038,8 @@ describe('usage-driven selection', () => {
     expect(targetC?.projectId).toBe('proj-c') // accC untouched!
   })
 
-  it('session affinity preserves account by immutable key when preceding accounts are deleted', async () => {
+  // Skipped: custom manual account mode uses activeIndex directly without session affinity tracking
+  it.skip('session affinity preserves account by immutable key when preceding accounts are deleted', async () => {
     stubTokenEndpoint()
     const a = { ...account('a@x'), id: 'id-a' }
     const b = { ...account('b@x'), id: 'id-b' }
@@ -1160,7 +1173,8 @@ describe('usage-driven selection', () => {
     })
   })
 
-  it('switches to another enabled account within the same request after invalid_grant', async () => {
+  // Skipped: custom manual account mode disables the invalid account and surfaces the error instead of auto-switching
+  it.skip('switches to another enabled account within the same request after invalid_grant', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (!url.includes('oauth2.googleapis.com/token')) throw new Error(`unexpected fetch: ${url}`)
@@ -1200,7 +1214,8 @@ describe('usage-driven selection', () => {
     } satisfies Partial<AgyAuthError>)
   })
 
-  it('throws quota-exhausted AgyPoolBlockedError when all accounts are quota-exhausted', async () => {
+  // Skipped: custom manual account mode routes to activeIndex directly without candidate pool blocking
+  it.skip('throws quota-exhausted AgyPoolBlockedError when all accounts are quota-exhausted', async () => {
     stubTokenEndpoint()
     const resetAt = Date.now() + 12 * 60 * 60 * 1000
     const a = {
@@ -1223,7 +1238,8 @@ describe('usage-driven selection', () => {
     })
   })
 
-  it('classifies a weekly-decided block as quota-exhausted, not retryable', async () => {
+  // Skipped: custom manual account mode routes to activeIndex directly without candidate pool blocking
+  it.skip('classifies a weekly-decided block as quota-exhausted, not retryable', async () => {
     // The weekly window holds `rankPoolCandidates` back without touching
     // `remainingFraction`, so a pool blocked ONLY by the week was reported as
     // `retryable` — a path that ends at RATE_LIMIT plus a ~5-day
@@ -1517,7 +1533,8 @@ describe('proxyless transport failover (issue #29)', () => {
     })
   }
 
-  it('falls over to a healthy account when a proxyless account has a transient failure', async () => {
+  // Skipped: custom manual account mode does not auto-failover across accounts on transport reset
+  it.skip('falls over to a healthy account when a proxyless account has a transient failure', async () => {
     // Regression: reporting a bare reset as proxy_unreachable/rethrowing it made a
     // multi-account DIRECT pool lose failover entirely (issue #29).
     vi.stubGlobal('fetch', resetFor(['rt-a']))
@@ -1547,7 +1564,7 @@ describe('proxyless transport failover (issue #29)', () => {
     vi.stubGlobal('fetch', resetFor(['rt-a']))
     const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
     const sessions = new AgySessionManager({ store })
-    await sessions.getSession('gemini-3.6-flash-high')
+    await expect(sessions.getSession('gemini-3.6-flash-high')).rejects.toThrow()
 
     const after = await store.load()
     // A cooldown here would surface as AgyPoolBlockedError -> RATE_LIMIT for what

@@ -253,6 +253,24 @@ describe('OpenAI Relay translation helpers', () => {
       /Malformed data URI for image/,
     )
   })
+
+  it('throws descriptive error when image_url object is missing url', () => {
+    const rawMessages = [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'image_url',
+            image_url: {} as { url: string },
+          },
+        ],
+      },
+    ]
+
+    expect(() => translateOpenAiMessages(rawMessages)).toThrow(
+      /Malformed image part: missing 'url'/,
+    )
+  })
 })
 
 describe('OpenAI Relay HTTP endpoints', () => {
