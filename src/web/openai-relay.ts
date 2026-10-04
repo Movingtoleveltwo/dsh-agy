@@ -636,27 +636,46 @@ export function normalizeModelName(raw?: string): string {
 }
 
 /**
- * Official CLI-style model names (`agy models`) mapped onto the account ids
- * the upstream actually serves. Input-side only: aliases are never listed by
- * `/v1/models`; they exist so a caller may use the official spelling.
+ * Input-side aliases: names the Antigravity ecosystem uses that this channel
+ * does not serve verbatim.
  *
- * Measured on a live account: `gemini-3.8-flash-high` / `gemini-3.7-flash-high`
- * answer 404 NOT_FOUND upstream and `gemini-3.1-pro-high` answers 400
- * INVALID_ARGUMENT, while the `-tiered` ids take low/medium/high via
- * `thinkingLevel` — so each Flash tier maps to the tiered id plus a pinned
- * effort. The 3.6 family needs no entry: its high/medium/low ARE real ids.
+ * Rows mirror OmniRoute's `ANTIGRAVITY_MODEL_ALIASES`
+ * (`open-sse/config/antigravityModelAliases.ts` — the reference
+ * `docs/ANTIGRAVITY-API_zh.md` §6 names for exactly this job), restricted to
+ * chat models and re-measured raw on this account (2026-10-04, bypassing this
+ * map via the plugin's `account.test` RPC):
+ *
+ *   raw 404 -> 200 through the map: 3.7/3.8 flash tiers and bare ids,
+ *                                   `gpt-oss-120b`, the legacy `gemini-claude-*-4-5` ids
+ *   raw 400 -> 200 through the map: `gemini-3.1-pro-high`
+ *   served verbatim (no entry, matching the reference's own comments):
+ *                                   `gemini-3.1-pro-low`, the 3.6 family
+ *
+ * One measured correction to the reference: it assumes `gemini-3.8-flash-*`
+ * are served at their own ids (no alias); here all three answer 404 and
+ * `gemini-3.8-flash-tiered` is the family id — so the 3.8 tiers keep the
+ * 3.7-shaped mapping, and the bare id (the reference's "default-tier" alias,
+ * default `-high`) resolves to the tiered id + high.
  *
  * A tier encoded in the name beats the caller's `reasoning_effort` — the name
- * is the more specific statement of intent.
+ * is the more specific statement of intent (the reference steers the same
+ * choice via `generationConfig.thinkingConfig.thinkingBudget`). Aliases are
+ * input-side only: they never appear in `/v1/models`.
  */
 export const AGY_MODEL_ALIASES: Readonly<Record<string, { id: string; effort?: ReasoningEffortId }>> = {
-  'gemini-3.8-flash-high': { id: 'gemini-3.8-flash-tiered', effort: 'high' as ReasoningEffortId },
-  'gemini-3.8-flash-medium': { id: 'gemini-3.8-flash-tiered', effort: 'medium' as ReasoningEffortId },
-  'gemini-3.8-flash-low': { id: 'gemini-3.8-flash-tiered', effort: 'low' as ReasoningEffortId },
+  'gemini-3.7-flash': { id: 'gemini-3.7-flash-tiered' },
   'gemini-3.7-flash-high': { id: 'gemini-3.7-flash-tiered', effort: 'high' as ReasoningEffortId },
   'gemini-3.7-flash-medium': { id: 'gemini-3.7-flash-tiered', effort: 'medium' as ReasoningEffortId },
   'gemini-3.7-flash-low': { id: 'gemini-3.7-flash-tiered', effort: 'low' as ReasoningEffortId },
+  'gemini-3.8-flash': { id: 'gemini-3.8-flash-tiered', effort: 'high' as ReasoningEffortId },
+  'gemini-3.8-flash-high': { id: 'gemini-3.8-flash-tiered', effort: 'high' as ReasoningEffortId },
+  'gemini-3.8-flash-medium': { id: 'gemini-3.8-flash-tiered', effort: 'medium' as ReasoningEffortId },
+  'gemini-3.8-flash-low': { id: 'gemini-3.8-flash-tiered', effort: 'low' as ReasoningEffortId },
   'gemini-3.1-pro-high': { id: 'gemini-pro-agent' },
+  'gpt-oss-120b': { id: 'gpt-oss-120b-medium' },
+  'gemini-claude-sonnet-4-5': { id: 'claude-sonnet-4-6' },
+  'gemini-claude-sonnet-4-5-thinking': { id: 'claude-sonnet-4-6' },
+  'gemini-claude-opus-4-5-thinking': { id: 'claude-opus-4-6-thinking' },
 }
 
 /**

@@ -77,10 +77,20 @@ describe('OpenAI Relay translation helpers', () => {
     expect(resolveRelayModel('gemini-3.7-flash-medium')).toEqual({ id: 'gemini-3.7-flash-tiered', effort: 'medium' })
     expect(resolveRelayModel('gemini-3.7-flash-low')).toEqual({ id: 'gemini-3.7-flash-tiered', effort: 'low' })
     expect(resolveRelayModel('gemini-3.1-pro-high')).toEqual({ id: 'gemini-pro-agent' })
+    // Bare display ids and legacy ids, mirroring OmniRoute's reference table.
+    expect(resolveRelayModel('gemini-3.7-flash')).toEqual({ id: 'gemini-3.7-flash-tiered' })
+    expect(resolveRelayModel('gemini-3.8-flash')).toEqual({ id: 'gemini-3.8-flash-tiered', effort: 'high' })
+    expect(resolveRelayModel('gpt-oss-120b')).toEqual({ id: 'gpt-oss-120b-medium' })
+    expect(resolveRelayModel('gemini-claude-sonnet-4-5')).toEqual({ id: 'claude-sonnet-4-6' })
+    expect(resolveRelayModel('gemini-claude-sonnet-4-5-thinking')).toEqual({ id: 'claude-sonnet-4-6' })
+    expect(resolveRelayModel('gemini-claude-opus-4-5-thinking')).toEqual({ id: 'claude-opus-4-6-thinking' })
   })
 
   it('leaves real ids alone; alias resolution runs after prefix stripping', () => {
     expect(resolveRelayModel('gemini-3.6-flash-high')).toEqual({ id: 'gemini-3.6-flash-high' })
+    expect(resolveRelayModel('gemini-3.1-pro-low')).toEqual({ id: 'gemini-3.1-pro-low' })
+    expect(resolveRelayModel('gpt-oss-120b-medium')).toEqual({ id: 'gpt-oss-120b-medium' })
+    expect(resolveRelayModel('claude-sonnet-4-6')).toEqual({ id: 'claude-sonnet-4-6' })
     expect(resolveRelayModel('gemini-3.8-flash-tiered')).toEqual({ id: 'gemini-3.8-flash-tiered' })
     expect(resolveRelayModel('agy/gemini-3.8-flash-high')).toEqual({ id: 'gemini-3.8-flash-tiered', effort: 'high' })
     expect(resolveRelayModel(undefined)).toEqual({ id: 'gemini-3.8-flash-tiered' })
