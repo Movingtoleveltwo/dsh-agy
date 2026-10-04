@@ -11,6 +11,7 @@ import {
   createOpenAiRelayHandler,
   normalizeModelName,
   normalizeReasoningEffort,
+  resolveRelayModel,
   translateOpenAiMessages,
   translateOpenAiTools,
 } from '../src/web/openai-relay.ts'
@@ -66,6 +67,24 @@ describe('OpenAI Relay translation helpers', () => {
     expect(normalizeReasoningEffort('max')).toBe('high')
     expect(normalizeReasoningEffort('invalid')).toBeUndefined()
     expect(normalizeReasoningEffort(undefined)).toBeUndefined()
+  })
+
+  it('maps official CLI-style names onto account ids (tiered aliases pin the effort)', () => {
+    expect(resolveRelayModel('gemini-3.8-flash-high')).toEqual({ id: 'gemini-3.8-flash-tiered', effort: 'high' })
+    expect(resolveRelayModel('gemini-3.8-flash-medium')).toEqual({ id: 'gemini-3.8-flash-tiered', effort: 'medium' })
+    expect(resolveRelayModel('gemini-3.8-flash-low')).toEqual({ id: 'gemini-3.8-flash-tiered', effort: 'low' })
+    expect(resolveRelayModel('gemini-3.7-flash-high')).toEqual({ id: 'gemini-3.7-flash-tiered', effort: 'high' })
+    expect(resolveRelayModel('gemini-3.7-flash-medium')).toEqual({ id: 'gemini-3.7-flash-tiered', effort: 'medium' })
+    expect(resolveRelayModel('gemini-3.7-flash-low')).toEqual({ id: 'gemini-3.7-flash-tiered', effort: 'low' })
+    expect(resolveRelayModel('gemini-3.1-pro-high')).toEqual({ id: 'gemini-pro-agent' })
+  })
+
+  it('leaves real ids alone; alias resolution runs after prefix stripping', () => {
+    expect(resolveRelayModel('gemini-3.6-flash-high')).toEqual({ id: 'gemini-3.6-flash-high' })
+    expect(resolveRelayModel('gemini-3.8-flash-tiered')).toEqual({ id: 'gemini-3.8-flash-tiered' })
+    expect(resolveRelayModel('agy/gemini-3.8-flash-high')).toEqual({ id: 'gemini-3.8-flash-tiered', effort: 'high' })
+    expect(resolveRelayModel(undefined)).toEqual({ id: 'gemini-3.8-flash-tiered' })
+    expect(resolveRelayModel('')).toEqual({ id: 'gemini-3.8-flash-tiered' })
   })
 
   it('translates OpenAI tools schema', () => {
@@ -360,6 +379,29 @@ describe('OpenAI Relay HTTP endpoints', () => {
     const json = (await res.json()) as { id: string; object: string }
     expect(json.id).toBe('gemini-3.8-flash-tiered')
     expect(json.object).toBe('model')
+  })
+
+  it('routes official CLI-style names through the alias map (name tier beats body effort)', async () => {
+    mockStreamChunks = [
+      { type: 'text-delta', text: 'Hello' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]
+
+    const res = await fetch(`${baseUrl}/agy/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gemini-3.8-flash-medium',
+        messages: [{ role: 'user', content: 'Hi' }],
+        reasoning_effort: 'low',
+        stream: false,
+      }),
+    })
+
+    expect(res.status).toBe(200)
+    expect(lastCapturedOptions).toBeDefined()
+    expect(lastCapturedOptions!.model).toBe('gemini-3.8-flash-tiered')
+    expect(lastCapturedOptions!.reasoningEffort).toBe('medium')
   })
 
   it('forwards sampling options (stop, temperature, max_tokens, reasoning_effort) to adapter', async () => {

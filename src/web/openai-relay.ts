@@ -261,7 +261,8 @@ async function handleChatCompletions(
   }
 
   const registeredAttachmentIds: string[] = []
-  const model = normalizeModelName(body.model)
+  const resolved = resolveRelayModel(body.model)
+  const model = resolved.id
   let messages: RequestMessage[]
   try {
     messages = translateOpenAiMessages(body.messages, adapter, registeredAttachmentIds)
@@ -300,7 +301,7 @@ async function handleChatCompletions(
     temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
     maxTokens,
     stop: stopList,
-    reasoningEffort: normalizeReasoningEffort(body.reasoning_effort),
+    reasoningEffort: resolved.effort ?? normalizeReasoningEffort(body.reasoning_effort),
     signal: abortController.signal,
     sessionId: sessionId ? (sessionId as never) : undefined,
   }
@@ -632,6 +633,41 @@ export function normalizeModelName(raw?: string): string {
   else if (m.startsWith('antigravity/')) m = m.slice(12)
   else if (m.startsWith('openai/')) m = m.slice(7)
   return m || 'gemini-3.8-flash-tiered'
+}
+
+/**
+ * Official CLI-style model names (`agy models`) mapped onto the account ids
+ * the upstream actually serves. Input-side only: aliases are never listed by
+ * `/v1/models`; they exist so a caller may use the official spelling.
+ *
+ * Measured on a live account: `gemini-3.8-flash-high` / `gemini-3.7-flash-high`
+ * answer 404 NOT_FOUND upstream and `gemini-3.1-pro-high` answers 400
+ * INVALID_ARGUMENT, while the `-tiered` ids take low/medium/high via
+ * `thinkingLevel` — so each Flash tier maps to the tiered id plus a pinned
+ * effort. The 3.6 family needs no entry: its high/medium/low ARE real ids.
+ *
+ * A tier encoded in the name beats the caller's `reasoning_effort` — the name
+ * is the more specific statement of intent.
+ */
+export const AGY_MODEL_ALIASES: Readonly<Record<string, { id: string; effort?: ReasoningEffortId }>> = {
+  'gemini-3.8-flash-high': { id: 'gemini-3.8-flash-tiered', effort: 'high' as ReasoningEffortId },
+  'gemini-3.8-flash-medium': { id: 'gemini-3.8-flash-tiered', effort: 'medium' as ReasoningEffortId },
+  'gemini-3.8-flash-low': { id: 'gemini-3.8-flash-tiered', effort: 'low' as ReasoningEffortId },
+  'gemini-3.7-flash-high': { id: 'gemini-3.7-flash-tiered', effort: 'high' as ReasoningEffortId },
+  'gemini-3.7-flash-medium': { id: 'gemini-3.7-flash-tiered', effort: 'medium' as ReasoningEffortId },
+  'gemini-3.7-flash-low': { id: 'gemini-3.7-flash-tiered', effort: 'low' as ReasoningEffortId },
+  'gemini-3.1-pro-high': { id: 'gemini-pro-agent' },
+}
+
+/**
+ * Resolves a request's `model` into the id sent upstream plus an optional
+ * pinned tier. `normalizeModelName` runs first, so prefixed spellings
+ * (`agy/gemini-3.8-flash-high`) resolve too.
+ */
+export function resolveRelayModel(raw?: string): { id: string; effort?: ReasoningEffortId } {
+  const id = normalizeModelName(raw)
+  const alias = AGY_MODEL_ALIASES[id]
+  return alias ? { id: alias.id, effort: alias.effort } : { id }
 }
 
 /**
