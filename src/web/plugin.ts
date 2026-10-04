@@ -31,6 +31,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 // Type-only: merges the `llm/adapters-updated` event into the Cordis Events map.
 import type {} from '@deepseek-ai/dsh-llm/types'
+import { AGY_PROVIDER } from '../adapter/models.ts'
 import { createAgyRuntime } from '../plugin-common.ts'
 import { isAgyDisabled } from '../runtime/risk.ts'
 import { createAgyManagement } from './management.ts'
@@ -169,10 +170,14 @@ async function registerAgyWeb(ctx: Context, webServer: WebServerLike): Promise<(
     },
   }))
 
-  // OpenAI-compatible relay endpoint (e.g. for Hermes and local tools)
+  // OpenAI-compatible relay endpoint (e.g. for Hermes and local tools).
+  // Serves the FILTERED catalog: the model-visibility blacklist hides a model
+  // from every consumer of the relay, not just DSH's own selector. (The
+  // management list above deliberately keeps the unfiltered one — its
+  // switches need the hidden rows to stay visible.)
   const relayHandler = createOpenAiRelayHandler({
     adapter,
-    listAllModels: () => adapter.listAllModels(),
+    listAllModels: () => adapter.listModels(AGY_PROVIDER),
     logger: ctx.logger,
   })
 
