@@ -34,6 +34,7 @@ import type {} from '@deepseek-ai/dsh-llm/types'
 import { createAgyRuntime } from '../plugin-common.ts'
 import { isAgyDisabled } from '../runtime/risk.ts'
 import { createAgyManagement } from './management.ts'
+import { createOpenAiRelayHandler } from './openai-relay.ts'
 import { renderCallbackHtml } from './page.ts'
 
 export const name = 'dsh-agy-web'
@@ -44,9 +45,9 @@ export const inject = ['llm']
 /** The slice of the host's web-server service this entry uses. */
 interface WebServerLike {
   register(route: {
-    kind: 'exact'
+    kind: 'exact' | 'prefix'
     path: string
-    handler: (req: IncomingMessage, res: ServerResponse) => void
+    handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
   }): () => void
   host?: string
   /** The port actually listened on: the OS-assigned one when `--port 0`. */
@@ -168,6 +169,19 @@ async function registerAgyWeb(ctx: Context, webServer: WebServerLike): Promise<(
     },
   }))
 
+  // OpenAI-compatible relay endpoint (e.g. for Hermes and local tools)
+  const relayHandler = createOpenAiRelayHandler({
+    adapter,
+    listAllModels: () => adapter.listAllModels(),
+    logger: ctx.logger,
+  })
+
+  disposers.push(webServer.register({
+    kind: 'prefix',
+    path: '/agy/v1',
+    handler: relayHandler,
+  }))
+
   // Lazy injection: see the module docblock for why this is not static.
   ctx.inject(['connection'], (connectionCtx) => {
     const connection = connectionCtx.get('connection') as
@@ -257,3 +271,6 @@ function isFailure(value: unknown): value is {
     && typeof (value as { error?: unknown }).error === 'object'
     && (value as { error?: unknown }).error !== null
 }
+
+export { createOpenAiRelayHandler } from './openai-relay.js'
+
