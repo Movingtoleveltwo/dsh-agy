@@ -916,7 +916,9 @@ function handleError(res: ServerResponse, error: unknown): void {
       code = 'unsupported_content'
       type = 'invalid_request_error'
     }
-  } else if (error instanceof Error) {
+  }
+
+  if (status === 500 && error instanceof Error) {
     const msg = error.message
     if (/404|NOT_FOUND|not found/i.test(msg)) {
       status = 404
