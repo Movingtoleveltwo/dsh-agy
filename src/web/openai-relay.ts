@@ -15,6 +15,7 @@ import {
   type ReasoningEffortId,
   type ToolSchema,
   type TokenUsage,
+  type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { AGY_PROVIDER } from '../adapter/models.ts'
 import { AGY_PUBLIC_MODELS } from '../adapter/catalog.ts'
@@ -32,7 +33,7 @@ export interface OpenAiRelayOptions {
   }
 }
 
-interface OpenAiMessage {
+export interface OpenAiMessage {
   role?: string
   content?: unknown
   name?: string
@@ -46,9 +47,10 @@ interface OpenAiMessage {
   }>
   tool_call_id?: string
   reasoning_content?: string
+  thought?: string
 }
 
-interface OpenAiChatCompletionBody {
+export interface OpenAiChatCompletionBody {
   model?: string
   messages?: OpenAiMessage[]
   prompt?: string
@@ -65,6 +67,9 @@ interface OpenAiChatCompletionBody {
   }>
   stream?: boolean
   temperature?: number
+  /** Accepted from OpenAI format but ignored (not supported in DSH GenerateOptions) */
+  top_p?: number
+  stop?: string | string[]
   max_tokens?: number
   max_completion_tokens?: number
   reasoning_effort?: string
@@ -75,6 +80,77 @@ interface OpenAiChatCompletionBody {
   }
 }
 
+export interface ToolSlotKey {
+  index?: number
+  id?: string
+}
+
+/**
+ * Hermes-aligned tool call slot tracker.
+ *
+ * Maps streamed tool-call events to contiguous 0-based OpenAI indices (`0, 1, 2...`)
+ * regardless of whether the upstream engine sends global content indices or UUIDs.
+ */
+export class ToolSlotTracker {
+  private readonly slotByIndex = new Map<number, number>()
+  private readonly slotById = new Map<string, number>()
+  private readonly idBySlot = new Map<number, string>()
+  private nextSlotIndex = 0
+
+  /**
+   * Returns the contiguous 0-based OpenAI tool call index, whether this is the first
+   * time this tool call slot has been seen, and the stable ID for this tool call.
+   */
+  getSlot(ref: ToolSlotKey | string | number): { index: number; isFirst: boolean; id: string } {
+    let index: number | undefined
+    let id: string | undefined
+
+    if (typeof ref === 'number') {
+      index = ref
+    } else if (typeof ref === 'string') {
+      id = ref
+    } else if (ref && typeof ref === 'object') {
+      index = ref.index
+      id = ref.id
+    }
+
+    let slot: number | undefined
+    let isFirst = false
+
+    if (index !== undefined && this.slotByIndex.has(index)) {
+      slot = this.slotByIndex.get(index)
+    }
+
+    if (slot === undefined && id && this.slotById.has(id)) {
+      slot = this.slotById.get(id)
+    }
+
+    if (slot === undefined) {
+      slot = this.nextSlotIndex++
+      isFirst = true
+    }
+
+    if (index !== undefined) {
+      this.slotByIndex.set(index, slot)
+    }
+    if (id) {
+      this.slotById.set(id, slot)
+    }
+
+    let slotId = this.idBySlot.get(slot)
+    if (!slotId) {
+      slotId = id || `call_${randomUUID().slice(0, 8)}`
+      this.idBySlot.set(slot, slotId)
+    }
+
+    return { index: slot, isFirst, id: slotId }
+  }
+
+  get size(): number {
+    return this.nextSlotIndex
+  }
+}
+
 /**
  * Creates an HTTP request handler for the `/agy/v1` prefix route.
  */
@@ -82,11 +158,6 @@ export function createOpenAiRelayHandler(options: OpenAiRelayOptions) {
   const { adapter, listAllModels, logger } = options
 
   return async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    // CORS headers for all responses
-    res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, x-session-id')
-
     if (req.method === 'OPTIONS') {
       res.writeHead(204)
       res.end()
@@ -189,8 +260,15 @@ async function handleChatCompletions(
     return
   }
 
+  const registeredAttachmentIds: string[] = []
   const model = normalizeModelName(body.model)
-  const messages = translateOpenAiMessages(body.messages)
+  let messages: RequestMessage[]
+  try {
+    messages = translateOpenAiMessages(body.messages, adapter, registeredAttachmentIds)
+  } catch (err) {
+    sendError(res, 400, err instanceof Error ? err.message : String(err), 'invalid_request_error')
+    return
+  }
   const tools = translateOpenAiTools(body.tools)
 
   const abortController = new AbortController()
@@ -205,6 +283,14 @@ async function handleChatCompletions(
     ? sessionIdHeader
     : (typeof body.user === 'string' ? body.user : undefined)
 
+  const stopList = typeof body.stop === 'string'
+    ? [body.stop]
+    : (Array.isArray(body.stop) ? body.stop.filter((s): s is string => typeof s === 'string') : undefined)
+
+  const maxTokens = typeof body.max_tokens === 'number'
+    ? body.max_tokens
+    : (typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : undefined)
+
   const generateOptions: GenerateOptions = {
     provider: AGY_PROVIDER,
     model,
@@ -212,23 +298,28 @@ async function handleChatCompletions(
     tools,
     system: typeof body.system === 'string' ? body.system : undefined,
     temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
-    maxTokens: typeof body.max_tokens === 'number'
-      ? body.max_tokens
-      : (typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : undefined),
+    maxTokens,
+    stop: stopList,
     reasoningEffort: normalizeReasoningEffort(body.reasoning_effort),
     signal: abortController.signal,
     sessionId: sessionId ? (sessionId as never) : undefined,
   }
 
-  if (body.stream === true) {
-    await handleStreamingCompletion(req, res, adapter, generateOptions, model, body, logger)
-  } else {
-    await handleNonStreamingCompletion(req, res, adapter, generateOptions, model, body)
+  try {
+    if (body.stream === true) {
+      await handleStreamingCompletion(req, res, adapter, generateOptions, model, body, logger)
+    } else {
+      await handleNonStreamingCompletion(req, res, adapter, generateOptions, model, body)
+    }
+  } finally {
+    for (const attachmentId of registeredAttachmentIds) {
+      adapter.clearMemoryImage(attachmentId)
+    }
   }
 }
 
 /**
- * Streams chat completion chunks via SSE.
+ * Streams chat completion chunks via SSE with deferred HTTP headers and contiguous tool indexing.
  */
 async function handleStreamingCompletion(
   req: IncomingMessage,
@@ -242,150 +333,182 @@ async function handleStreamingCompletion(
   const completionId = `chatcmpl-${randomUUID()}`
   const created = Math.floor(Date.now() / 1000)
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-  })
-
-  // Initial role announcement
-  const initialChunk = {
-    id: completionId,
-    object: 'chat.completion.chunk',
-    created,
-    model: modelName,
-    choices: [
-      {
-        index: 0,
-        delta: { role: 'assistant', content: '' },
-        finish_reason: null,
-      },
-    ],
-  }
-  res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
-
-  const seenToolIndices = new Set<number>()
+  const toolSlotTracker = new ToolSlotTracker()
   let finishReason: string = 'stop'
   let lastUsage: TokenUsage | undefined
+  let headersSent = false
 
   try {
-    for await (const chunk of adapter.stream(options)) {
-      if (res.writableEnded || options.signal?.aborted) break
+    const streamIter = adapter.stream(options)[Symbol.asyncIterator]()
 
-      if (chunk.type === 'text-delta') {
-        const sseChunk = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model: modelName,
-          choices: [
-            {
-              index: 0,
-              delta: { content: chunk.text },
-              finish_reason: null,
-            },
-          ],
-        }
-        res.write(`data: ${JSON.stringify(sseChunk)}\n\n`)
-      } else if (chunk.type === 'reasoning-delta') {
-        const sseChunk = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model: modelName,
-          choices: [
-            {
-              index: 0,
-              delta: { reasoning_content: chunk.text },
-              finish_reason: null,
-            },
-          ],
-        }
-        res.write(`data: ${JSON.stringify(sseChunk)}\n\n`)
-      } else if (chunk.type === 'tool-call-delta') {
-        const isFirstForIndex = !seenToolIndices.has(chunk.index)
-        seenToolIndices.add(chunk.index)
-
-        const toolCallDelta: {
-          index: number
-          id?: string
-          type?: string
-          function: {
-            name?: string
-            arguments: string
-          }
-        } = {
-          index: chunk.index,
-          function: {
-            arguments: chunk.argumentsDelta,
-          },
-        }
-
-        if (isFirstForIndex) {
-          toolCallDelta.id = String(chunk.id)
-          toolCallDelta.type = 'function'
-          if (chunk.name) {
-            toolCallDelta.function.name = chunk.name
-          }
-        }
-
-        const sseChunk = {
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created,
-          model: modelName,
-          choices: [
-            {
-              index: 0,
-              delta: {
-                tool_calls: [toolCallDelta],
-              },
-              finish_reason: null,
-            },
-          ],
-        }
-        res.write(`data: ${JSON.stringify(sseChunk)}\n\n`)
-      } else if (chunk.type === 'usage') {
-        lastUsage = chunk.usage
-      } else if (chunk.type === 'finish') {
-        finishReason = mapFinishReason(chunk.reason, seenToolIndices.size > 0)
-      }
+    // Deferred header pattern: await the first chunk before committing HTTP 200 headers.
+    // If upstream rejects before yielding (e.g. 401 unauthenticated, 429 quota, 400 invalid model),
+    // handleError sends a proper JSON error response with correct HTTP status code.
+    let firstResult: IteratorResult<StreamChunk>
+    try {
+      firstResult = await streamIter.next()
+    } catch (initialError) {
+      handleError(res, initialError)
+      return
     }
 
-    // Trailing finish chunk
-    const finishChunk = {
-      id: completionId,
-      object: 'chat.completion.chunk',
-      created,
-      model: modelName,
-      choices: [
-        {
-          index: 0,
-          delta: {},
-          finish_reason: finishReason,
-        },
-      ],
-    }
-    res.write(`data: ${JSON.stringify(finishChunk)}\n\n`)
+    try {
+      // Stream connection confirmed -> commit SSE headers
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+      })
+      headersSent = true
 
-    if (lastUsage && body.stream_options?.include_usage) {
-      const usageChunk = {
+      // Initial role announcement chunk
+      const initialChunk = {
         id: completionId,
         object: 'chat.completion.chunk',
         created,
         model: modelName,
-        choices: [],
-        usage: formatUsage(lastUsage),
+        choices: [
+          {
+            index: 0,
+            delta: { role: 'assistant', content: '' },
+            finish_reason: null,
+          },
+        ],
       }
-      res.write(`data: ${JSON.stringify(usageChunk)}\n\n`)
-    }
+      res.write(`data: ${JSON.stringify(initialChunk)}\n\n`)
 
-    res.write('data: [DONE]\n\n')
-    res.end()
+      const processChunk = (chunk: StreamChunk) => {
+        if (chunk.type === 'text-delta') {
+          const sseChunk = {
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model: modelName,
+            choices: [
+              {
+                index: 0,
+                delta: { content: chunk.text },
+                finish_reason: null,
+              },
+            ],
+          }
+          res.write(`data: ${JSON.stringify(sseChunk)}\n\n`)
+        } else if (chunk.type === 'reasoning-delta') {
+          const sseChunk = {
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model: modelName,
+            choices: [
+              {
+                index: 0,
+                delta: { reasoning_content: chunk.text },
+                finish_reason: null,
+              },
+            ],
+          }
+          res.write(`data: ${JSON.stringify(sseChunk)}\n\n`)
+        } else if (chunk.type === 'tool-call-delta') {
+          const { index: slotIndex, isFirst, id: slotId } = toolSlotTracker.getSlot({
+            index: chunk.index,
+            id: chunk.id ? String(chunk.id) : undefined,
+          })
+
+          const toolCallDelta: {
+            index: number
+            id?: string
+            type?: string
+            function: {
+              name?: string
+              arguments: string
+            }
+          } = {
+            index: slotIndex,
+            function: {
+              arguments: chunk.argumentsDelta,
+            },
+          }
+
+          if (isFirst) {
+            toolCallDelta.id = slotId
+            toolCallDelta.type = 'function'
+            if (chunk.name) {
+              toolCallDelta.function.name = chunk.name
+            }
+          }
+
+          const sseChunk = {
+            id: completionId,
+            object: 'chat.completion.chunk',
+            created,
+            model: modelName,
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [toolCallDelta],
+                },
+                finish_reason: null,
+              },
+            ],
+          }
+          res.write(`data: ${JSON.stringify(sseChunk)}\n\n`)
+        } else if (chunk.type === 'usage') {
+          lastUsage = chunk.usage
+        } else if (chunk.type === 'finish') {
+          finishReason = mapFinishReason(chunk.reason, toolSlotTracker.size > 0)
+        }
+      }
+
+      if (!firstResult.done && firstResult.value) {
+        processChunk(firstResult.value)
+      }
+
+      while (!firstResult.done) {
+        if (res.writableEnded || options.signal?.aborted) break
+        const nextResult = await streamIter.next()
+        if (nextResult.done) break
+        processChunk(nextResult.value)
+      }
+
+      // Trailing finish chunk
+      const finishChunk = {
+        id: completionId,
+        object: 'chat.completion.chunk',
+        created,
+        model: modelName,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: finishReason,
+          },
+        ],
+      }
+      res.write(`data: ${JSON.stringify(finishChunk)}\n\n`)
+
+      if (lastUsage && body.stream_options?.include_usage) {
+        const usageChunk = {
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created,
+          model: modelName,
+          choices: [],
+          usage: formatUsage(lastUsage),
+        }
+        res.write(`data: ${JSON.stringify(usageChunk)}\n\n`)
+      }
+
+      res.write('data: [DONE]\n\n')
+      res.end()
+    } finally {
+      await streamIter.return?.()
+    }
   } catch (error) {
     logger?.warn?.(`[dsh-agy relay] streaming completion interrupted: ${String(error)}`)
-    if (!res.writableEnded) {
+    if (!headersSent) {
+      handleError(res, error)
+    } else if (!res.writableEnded) {
       const errPayload = {
         error: {
           message: error instanceof Error ? error.message : String(error),
@@ -416,6 +539,7 @@ async function handleNonStreamingCompletion(
 
   let content = ''
   let reasoningContent = ''
+  const toolSlotTracker = new ToolSlotTracker()
   const toolCallsByIndex = new Map<number, { id: string; type: 'function'; function: { name: string; arguments: string } }>()
   let finishReason: string = 'stop'
   let lastUsage: TokenUsage | undefined
@@ -429,17 +553,21 @@ async function handleNonStreamingCompletion(
       } else if (chunk.type === 'reasoning-delta') {
         reasoningContent += chunk.text
       } else if (chunk.type === 'tool-call-delta') {
-        let tc = toolCallsByIndex.get(chunk.index)
+        const { index: slotIndex, id: slotId } = toolSlotTracker.getSlot({
+          index: chunk.index,
+          id: chunk.id ? String(chunk.id) : undefined,
+        })
+        let tc = toolCallsByIndex.get(slotIndex)
         if (!tc) {
           tc = {
-            id: String(chunk.id),
+            id: slotId,
             type: 'function',
             function: {
               name: chunk.name ?? '',
               arguments: '',
             },
           }
-          toolCallsByIndex.set(chunk.index, tc)
+          toolCallsByIndex.set(slotIndex, tc)
         }
         if (chunk.name && !tc.function.name) {
           tc.function.name = chunk.name
@@ -448,11 +576,14 @@ async function handleNonStreamingCompletion(
       } else if (chunk.type === 'usage') {
         lastUsage = chunk.usage
       } else if (chunk.type === 'finish') {
-        finishReason = mapFinishReason(chunk.reason, toolCallsByIndex.size > 0)
+        finishReason = mapFinishReason(chunk.reason, toolSlotTracker.size > 0)
       }
     }
 
-    const toolCalls = Array.from(toolCallsByIndex.values())
+    const toolCalls = Array.from(toolCallsByIndex.entries())
+      .sort(([a], [b]) => a - b)
+      .map(([, tc]) => tc)
+
     const message: {
       role: string
       content: string | null
@@ -529,8 +660,13 @@ export function translateOpenAiTools(tools?: OpenAiChatCompletionBody['tools']):
 
 /**
  * Translates OpenAI message list into DSH RequestMessage[].
+ * Supports multimodal image_url (data URIs), assistant reasoning_content, tool_calls, and tool results.
  */
-export function translateOpenAiMessages(messages: OpenAiMessage[]): RequestMessage[] {
+export function translateOpenAiMessages(
+  messages: OpenAiMessage[],
+  adapter?: AgyAdapter,
+  registeredAttachmentIds?: string[],
+): RequestMessage[] {
   const result: RequestMessage[] = []
 
   for (const m of messages) {
@@ -545,15 +681,50 @@ export function translateOpenAiMessages(messages: OpenAiMessage[]): RequestMessa
         content: [{ type: 'text', text }],
       } as unknown as RequestMessage)
     } else if (role === 'user') {
-      const blocks: Array<{ type: 'text'; text: string }> = []
+      const blocks: Array<
+        | { type: 'text'; text: string }
+        | { type: 'image'; attachment: { attachmentId: string; mediaType: string } }
+      > = []
+
       if (typeof m.content === 'string') {
         blocks.push({ type: 'text', text: m.content })
       } else if (Array.isArray(m.content)) {
         for (const part of m.content) {
           if (typeof part === 'string') {
             blocks.push({ type: 'text', text: part })
-          } else if (part && typeof part === 'object' && 'text' in part && typeof (part as { text: unknown }).text === 'string') {
-            blocks.push({ type: 'text', text: (part as { text: string }).text })
+          } else if (part && typeof part === 'object') {
+            const p = part as Record<string, unknown>
+            if (p.type === 'text' && typeof p.text === 'string') {
+              blocks.push({ type: 'text', text: p.text })
+            } else if (p.type === 'image_url' || p.image_url) {
+              const imgUrlObj = (p.image_url ?? p) as { url?: unknown }
+              const url = typeof imgUrlObj.url === 'string' ? imgUrlObj.url : (typeof p.image_url === 'string' ? p.image_url : undefined)
+              if (url && typeof url === 'string') {
+                if (url.startsWith('data:')) {
+                  const match = url.match(/^data:([^;]+);base64,([\s\S]+)$/)
+                  if (match && match[2]!.trim().length > 0) {
+                    const mediaType = match[1]!
+                    const base64Data = match[2]!.replace(/\s+/g, '')
+                    const attachmentId = `relay-img-${randomUUID()}`
+                    adapter?.registerMemoryImage(attachmentId, { mediaType, data: base64Data })
+                    registeredAttachmentIds?.push(attachmentId)
+                    blocks.push({
+                      type: 'image',
+                      attachment: {
+                        attachmentId,
+                        mediaType,
+                      },
+                    })
+                  } else {
+                    throw new Error(`Malformed data URI for image (expected 'data:<media-type>;base64,<data>')`)
+                  }
+                } else {
+                  throw new Error(`Remote image URLs ('${url.slice(0, 32)}...') are not supported; please provide base64 data URIs ('data:<media-type>;base64,<data>')`)
+                }
+              }
+            } else if (typeof p.text === 'string') {
+              blocks.push({ type: 'text', text: p.text })
+            }
           }
         }
       }
@@ -568,11 +739,30 @@ export function translateOpenAiMessages(messages: OpenAiMessage[]): RequestMessa
     } else if (role === 'assistant') {
       const blocks: Array<
         | { type: 'text'; text: string }
+        | { type: 'reasoning'; text: string }
         | { type: 'tool-call'; id: string; name: string; arguments: string }
       > = []
 
+      const reasoning = m.reasoning_content || m.thought
+      if (typeof reasoning === 'string' && reasoning.length > 0) {
+        blocks.push({ type: 'reasoning', text: reasoning })
+      }
+
       if (typeof m.content === 'string' && m.content.length > 0) {
         blocks.push({ type: 'text', text: m.content })
+      } else if (Array.isArray(m.content)) {
+        for (const part of m.content) {
+          if (typeof part === 'string') {
+            blocks.push({ type: 'text', text: part })
+          } else if (part && typeof part === 'object') {
+            const p = part as Record<string, unknown>
+            if ((p.type === 'reasoning' || p.type === 'thinking') && (typeof p.reasoning === 'string' || typeof p.text === 'string')) {
+              blocks.push({ type: 'reasoning', text: String(p.reasoning || p.text) })
+            } else if (p.type === 'text' && typeof p.text === 'string') {
+              blocks.push({ type: 'text', text: p.text })
+            }
+          }
+        }
       }
 
       if (Array.isArray(m.tool_calls)) {
@@ -662,12 +852,16 @@ function formatUsage(usage?: TokenUsage) {
   const cached = usage.cacheReadTokens ?? 0
   const prompt = usage.inputTokens + cached
   const completion = usage.outputTokens
+  const reasoningTokens = usage.reasoningTokens ?? 0
   return {
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: prompt + completion,
     prompt_tokens_details: {
       cached_tokens: cached,
+    },
+    completion_tokens_details: {
+      reasoning_tokens: reasoningTokens,
     },
   }
 }
@@ -677,7 +871,6 @@ function sendJson(res: ServerResponse, status: number, data: unknown): void {
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(json),
-    'Access-Control-Allow-Origin': '*',
   })
   res.end(json)
 }
@@ -722,6 +915,25 @@ function handleError(res: ServerResponse, error: unknown): void {
       status = 400
       code = 'unsupported_content'
       type = 'invalid_request_error'
+    }
+  } else if (error instanceof Error) {
+    const msg = error.message
+    if (/404|NOT_FOUND|not found/i.test(msg)) {
+      status = 404
+      code = 'model_not_found'
+      type = 'invalid_request_error'
+    } else if (/400|INVALID_ARGUMENT|invalid argument/i.test(msg)) {
+      status = 400
+      code = 'invalid_request_error'
+      type = 'invalid_request_error'
+    } else if (/401|403|UNAUTHENTICATED|PERMISSION_DENIED|invalid credential/i.test(msg)) {
+      status = 401
+      code = 'invalid_api_key'
+      type = 'invalid_request_error'
+    } else if (/429|RESOURCE_EXHAUSTED|quota/i.test(msg)) {
+      status = 429
+      code = 'insufficient_quota'
+      type = 'insufficient_quota'
     }
   }
 

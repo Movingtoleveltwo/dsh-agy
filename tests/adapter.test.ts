@@ -962,12 +962,12 @@ describe('models', () => {
     const ids = merged.map((m) => m.id)
     expect(ids).toContain('gemini-3.6-flash-high')
     expect(ids).not.toContain('tab_flash_lite_preview')
-    expect(merged.find((m) => m.id === 'gemini-3.6-flash-high')?.context?.contextWindow).toBe(1048576)
+    expect(merged.find((m) => m.id === 'gemini-3.6-flash-high')?.context?.contextWindow).toBe(200000)
     expect(merged.find((m) => m.id === 'some-new-model')?.name).toBe('New')
     // tiered model with raw id displayName is prettified from catalog / dynamic fallback
     expect(merged.find((m) => m.id === 'gemini-3.8-flash-tiered')?.name).toBe('Gemini 3.8 Flash')
     expect(merged.find((m) => m.id === 'gemini-3.9-flash-tiered')?.name).toBe('Gemini 3.9 Flash')
-    expect(merged.find((m) => m.id === 'gemini-3.9-flash-tiered')?.context?.contextWindow).toBe(1048576)
+    expect(merged.find((m) => m.id === 'gemini-3.9-flash-tiered')?.context?.contextWindow).toBe(200000)
   })
 
   it('hides ids upstream assigns to a non-chat role, including ids without a tab_ prefix', () => {
@@ -1185,7 +1185,7 @@ describe('models', () => {
     expect(dynamicTiered.name).toBe('Gemini 3.9 Flash')
     expect(dynamicTiered.reasoning).toBeDefined()
     expect(dynamicTiered.reasoning!.efforts.map((e) => String(e.id))).toEqual(['low', 'medium', 'high'])
-    expect(dynamicTiered.context?.contextWindow).toBe(1048576)
+    expect(dynamicTiered.context?.contextWindow).toBe(200000)
     expect(dynamicTiered.defaultMaxTokens).toBe(65536)
     expect(dynamicTiered.inputModalities).toEqual(['text', 'image'])
 

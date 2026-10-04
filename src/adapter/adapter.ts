@@ -207,7 +207,9 @@ export function buildRequestHeaders(session: AgyAccountSession): Record<string, 
 export const MODEL_LIST_CACHE_TTL_MS = 10 * 60 * 1000
 
 export class AgyAdapter extends LlmAdapter {
+  private static readonly MAX_MEMORY_IMAGES = 200
   private readonly options: AgyAdapterOptions
+  private readonly memoryImages = new Map<string, AgyResolvedImage>()
   private cachedModels: { models: readonly LlmModelInfo[]; at: number } | null = null
   private inFlightModels: Promise<readonly LlmModelInfo[]> | null = null
 
@@ -216,11 +218,29 @@ export class AgyAdapter extends LlmAdapter {
     this.options = options
   }
 
+  /**
+   * Register an in-memory base64 image (e.g. from an OpenAI relay request).
+   */
+  registerMemoryImage(attachmentId: string, image: AgyResolvedImage): void {
+    if (this.memoryImages.size >= AgyAdapter.MAX_MEMORY_IMAGES) {
+      const oldestKey = this.memoryImages.keys().next().value
+      if (oldestKey) this.memoryImages.delete(oldestKey)
+    }
+    this.memoryImages.set(attachmentId, image)
+  }
+
+  /**
+   * Remove an in-memory image when request finishes.
+   */
+  clearMemoryImage(attachmentId: string): void {
+    this.memoryImages.delete(attachmentId)
+  }
+
   override providerInfo(_provider: string): LlmProviderInfo {
     return { id: AGY_PROVIDER, name: 'Antigravity (agy)' }
   }
 
-  imageRequestPricing(_provider: string, _model: string): undefined {
+  override imageRequestPricing(_provider: string, _model: string): undefined {
     return undefined
   }
 
@@ -316,6 +336,21 @@ export class AgyAdapter extends LlmAdapter {
     const refs = collectImageRefs(options)
     const images = new Map<string, AgyResolvedImage>()
     if (refs.length === 0) return images
+
+    // Check in-memory registered images first (e.g. from OpenAI-compatible relay)
+    const missingFromMemory = refs.filter((ref) => {
+      const memoryImage = this.memoryImages.get(ref.attachmentId)
+      if (memoryImage) {
+        images.set(ref.attachmentId, memoryImage)
+        return false
+      }
+      return true
+    })
+
+    if (missingFromMemory.length === 0) {
+      return images
+    }
+
     const store = this.options.resolveAttachments?.()
     if (!store) {
       throw new LlmError(
@@ -329,7 +364,7 @@ export class AgyAdapter extends LlmAdapter {
     // of whichever concurrent read happened to reject first — and no rejection
     // may escape as unhandled.
     const settled = await Promise.allSettled(
-      refs.map(async (ref) => {
+      missingFromMemory.map(async (ref) => {
         const stored = await store.readImage(ref)
         return {
           attachmentId: ref.attachmentId,
@@ -342,7 +377,7 @@ export class AgyAdapter extends LlmAdapter {
     )
     const failedIndex = settled.findIndex((outcome) => outcome.status === 'rejected')
     if (failedIndex !== -1) {
-      const ref = refs[failedIndex]!
+      const ref = missingFromMemory[failedIndex]!
       const cause: unknown = (settled[failedIndex] as PromiseRejectedResult).reason
       throw new LlmError(
         `agy image attachment "${ref.attachmentId}" could not be loaded: ${cause instanceof Error ? cause.message : String(cause)}`,
