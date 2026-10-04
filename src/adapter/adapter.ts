@@ -220,6 +220,10 @@ export class AgyAdapter extends LlmAdapter {
     return { id: AGY_PROVIDER, name: 'Antigravity (agy)' }
   }
 
+  imageRequestPricing(_provider: string, _model: string): undefined {
+    return undefined
+  }
+
   /**
    * The catalog as DSH's model selector sees it: discovered models minus the
    * user's hidden set. Filtering here is what makes "turn a model off" hide it

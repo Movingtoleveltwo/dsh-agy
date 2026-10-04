@@ -267,7 +267,7 @@ export function resolveAgyModel(provider: string, model: string): LlmResolvedMod
       id: model,
       name: meta?.name ?? model,
       inputModalities: inputModalitiesFor(meta),
-      context: { contextWindow: meta?.contextLength ?? 1048576 },
+      context: { contextWindow: meta?.contextLength ?? 200000 },
       defaultMaxTokens: meta?.maxOutputTokens ?? 65536,
       // Return a shallow copy so callers cannot mutate the frozen singleton.
       reasoning: { ...LEVEL_REASONING, efforts: [...LEVEL_REASONING.efforts] },

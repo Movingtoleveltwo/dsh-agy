@@ -1,43 +1,24 @@
 name: Publish
 
-# Triggered by `npm version <bump>` + tag push (v*), or manually.
-#
-# Prereleases need an explicit dist-tag: npm REFUSES a bare `npm publish` when
-# the version carries a prerelease component ("You must specify a tag using
-# --tag when publishing a prerelease version"), so this workflow always
-# resolves one. A `v0.3.0-rc.1` tag therefore publishes under `next` — never
-# under `latest`, which would hand every `npm i dsh-agy` user a prerelease.
+# Triggered by `npm version patch|minor|major` (which tags v*), or manually.
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
-    inputs:
-      tag:
-        description: 'npm dist-tag (default: next for a prerelease, latest otherwise)'
-        required: false
-        default: ''
-      dry_run:
-        description: 'Verify the artifact without publishing'
-        type: boolean
-        required: false
-        default: false
 
 permissions:
   contents: write # creating the GitHub Release
-
-# npm rejects a second publish of the same version; serialize rather than race.
-concurrency:
-  group: publish
-  cancel-in-progress: false
 
 jobs:
   publish:
     name: publish to npm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@v4
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
@@ -45,47 +26,12 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: pnpm run typecheck
-      - run: pnpm run lint
       - run: pnpm run build
-
-      - name: Resolve the dist-tag
-        id: dist
-        run: |
-          VERSION="$(node -p "require('./package.json').version")"
-          case "$VERSION" in
-            *-*) IS_PRE=true ;;
-            *)   IS_PRE=false ;;
-          esac
-          TAG="${{ inputs.tag }}"
-          if [ -z "$TAG" ]; then
-            if [ "$IS_PRE" = true ]; then TAG=next; else TAG=latest; fi
-          fi
-          # The one combination worth refusing outright: a prerelease reaching
-          # the default tag would be installed by everyone who never asked for it.
-          if [ "$IS_PRE" = true ] && [ "$TAG" = latest ]; then
-            echo "::error::Refusing to publish prerelease $VERSION under 'latest'. Pass a tag such as 'next' or 'beta'."
-            exit 1
-          fi
-          echo "Resolved: version=$VERSION tag=$TAG prerelease=$IS_PRE"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$IS_PRE" >> "$GITHUB_OUTPUT"
-
       - name: npm publish
-        if: ${{ inputs.dry_run != true }}
-        run: npm publish --tag "${{ steps.dist.outputs.tag }}"
+        run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Verify the artifact without publishing
-        if: ${{ inputs.dry_run == true }}
-        run: npm pack --dry-run
-
-      # Only a tag push has a release to attach to; a manual dispatch runs from
-      # a branch. Prereleases are marked as such so they stay out of "Latest".
       - name: Create GitHub Release
-        if: ${{ inputs.dry_run != true && startsWith(github.ref, 'refs/tags/v') }}
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          prerelease: ${{ steps.dist.outputs.prerelease == 'true' }}

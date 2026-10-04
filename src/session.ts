@@ -19,7 +19,6 @@ import {
   isCoolingDown,
   isFamilyRateLimited,
   parseFutureResetMs,
-  pickNextAccountIndex,
   recordRateLimit,
 } from './runtime/rotation.ts'
 import {
@@ -31,7 +30,6 @@ import {
   isLimitsStale,
   isQuotaStale,
   modelFamilyOf,
-  rankPoolCandidates,
 } from './runtime/quota.ts'
 import {
   generateFingerprint,
@@ -782,95 +780,15 @@ export class AgySessionManager {
    */
   private async pickAccount(
     storage: AccountStorageV4,
-    model?: string,
-    conversationKey?: string,
+    _model?: string,
+    _conversationKey?: string,
   ): Promise<{ account: ManagedAccount; index: number } | undefined> {
-    const now = Date.now()
-    for (const account of storage.accounts) clearExpiredState(account, now)
-
-    const family = modelFamilyOf(model)
-    const familyKey = familyKeyOf(model)
-    // Conversation affinity: reuse the account this conversation is already
-    // pinned to while it is fresh and healthy, so one conversation stays on one
-    // account. A quota-exhausted family or a cooldown breaks the pin and
-    // re-ranks, mirroring OMP's pinned-until-unusable: the pin holds until the
-    // account is actually spent (a measured zero, not the soft-drain threshold
-    // `isFamilyDrained` applies when ranking), so the pin and the active-account
-    // preference below agree on when to let go.
-    const pinnedKey = this.affinityFor(conversationKey, now)
-    if (pinnedKey !== null) {
-      const lastIndex = storage.accounts.findIndex((a) => this.accountKey(a) === pinnedKey)
-      if (lastIndex !== -1) {
-        const last = storage.accounts[lastIndex]!
-        if (
-          last.enabled !== false &&
-          !isCoolingDown(last, now) &&
-          !isFamilyRateLimited(last, familyKey, now) &&
-          !isFamilyQuotaExhausted(last, family, now)
-        ) {
-          return { account: last, index: lastIndex }
-        }
-      }
-    }
-    const eligible = storage.accounts
-      .map((account, index) => ({ account, index }))
-      .filter(({ account }) => account.enabled !== false)
-    if (eligible.length === 0) return undefined
-
-    // Prioritize the active account as long as it is enabled, not cooling down,
-    // not family rate-limited, and not quota-exhausted.
-    const active = storage.accounts[storage.activeIndex]
-    const isActiveUsable = (acc: ManagedAccount | undefined): acc is ManagedAccount =>
-      acc !== undefined
-      && acc.enabled !== false
-      && !isCoolingDown(acc, now)
-      && !isFamilyRateLimited(acc, familyKey, now)
-      && !isFamilyQuotaExhausted(acc, family, now)
-
-    if (isActiveUsable(active) && this.inFlightCount(this.accountKey(active), now) < MAX_IN_FLIGHT_PER_ACCOUNT) {
-      return { account: active, index: storage.activeIndex }
-    }
-
-    const ranked = rankPoolCandidates(eligible, model, now, storage.activeIndex)
-    // Prefer an account with in-flight headroom so concurrent conversations
-    // spread across the pool; fall back to plain ranking when every candidate is
-    // saturated (see `inFlight` for why this is a preference, not a gate).
-    const picked =
-      ranked.find((candidate) =>
-        candidate.blockedUntil === null
-        && this.inFlightCount(this.accountKey(candidate.account), now) < MAX_IN_FLIGHT_PER_ACCOUNT)
-      ?? ranked.find((candidate) => candidate.blockedUntil === null)
-    if (!picked) {
-      const quotaExhausted = (account: ManagedAccount): boolean => {
-        if (account.cooldownReason === 'quota-exhausted' && (account.coolingDownUntil ?? 0) > now) return true
-        const quota = familyQuotaFor(account, family, now)
-        if (!quota) return false
-        // BOTH windows, matching `rankPoolCandidates`, which blocks on a spent week
-        // as well as on a spent 5-hour bucket. Reading only `remainingFraction`
-        // here classified a weekly-decided block as retryable, and that path ends
-        // at `RATE_LIMIT` + a ~5-day `providerRetryAfterMs`, which DSH's 10s retry
-        // cap turns into giving up on the turn — a quota condition reported to the
-        // user as a rate limit.
-        const spent = (fraction: number | undefined, resetTime: string | undefined): boolean => {
-          if (typeof fraction !== 'number' || fraction > 0 || !resetTime) return false
-          const resetAt = Date.parse(resetTime)
-          return !Number.isNaN(resetAt) && resetAt > now
-        }
-        return spent(quota.remainingFraction, quota.resetTime)
-          || spent(quota.weeklyFraction, quota.weeklyResetTime)
-      }
-      const retryable = ranked.filter((candidate) => !quotaExhausted(candidate.account))
-      const blocked = retryable.length > 0 ? retryable : ranked
-      const blockedUntil = Math.min(...blocked.map((candidate) => candidate.blockedUntil ?? now))
-      throw new AgyPoolBlockedError(retryable.length > 0 ? 'retryable' : 'quota-exhausted', blockedUntil)
-    }
-    if (picked.index !== storage.activeIndex) {
-      storage.activeIndex = picked.index
-      await this.store.mutate((s) => {
-        s.activeIndex = picked.index
-      })
-    }
-    return { account: picked.account, index: picked.index }
+    const activeIdx = typeof storage.activeIndex === 'number' && storage.activeIndex >= 0 && storage.activeIndex < storage.accounts.length
+      ? storage.activeIndex
+      : 0
+    const account = storage.accounts[activeIdx]
+    if (!account) return undefined
+    return { account, index: activeIdx }
   }
   /**
    * Adapter hook: resolve the active session (refresh if needed), healing a
@@ -901,9 +819,7 @@ export class AgySessionManager {
       if (!account) throw new Error(`account #${accountIndex} not found`)
       if (account.enabled === false) throw new Error(`account #${accountIndex} is disabled`)
     }
-    const maxAttempts = accountIndex === undefined
-      ? storage.accounts.filter((account) => account.enabled !== false).length
-      : 1
+    const maxAttempts = 1
     let proxyUnreachableCount = 0
     /**
      * Last transport failure seen on a *proxyless* account. Such an account is
@@ -916,11 +832,6 @@ export class AgySessionManager {
     let lastTransportError: unknown
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const eligible = storage.accounts.filter((account) => account.enabled !== false)
-      if (accountIndex === undefined && eligible.length > 1) {
-        await this.refreshQuotaCache(storage)
-        // In-memory overlay on storage already took place in refreshQuotaCache.
-      }
       const picked = accountIndex === undefined
         ? await this.pickAccount(storage, model, conversationKey)
         : (() => {
@@ -935,35 +846,14 @@ export class AgySessionManager {
         auth = await this.accessTokenFor(picked.account)
       } catch (error) {
         if (Boolean(picked.account.proxy) && isProxyUnreachableError(error)) {
-          // Fail-closed for per-account proxy: skip this account for this request
-          // without a cooldown (the proxy may recover; a cooldown would also hide
-          // the real cause and block a solo proxied pool).
           proxyUnreachableCount++
-          // A pinned caller asked about ONE account: falling over to a different
-          // one would answer a question nobody asked, and mutating the pool
-          // cursor for a diagnostic probe would be a side effect the user did
-          // not request. Surface the failure instead.
-          if (accountIndex !== undefined) throw error
-          storage = await this.skipAccount(storage, picked.account)
-          continue
+          throw error
         }
-        // Otherwise the same socket codes describe the connection, not a proxy
-        // (issue #29): fall over to the next enabled account, remembering the
-        // failure in case none of them succeeds.
         lastTransportError = error
-        if (accountIndex !== undefined) throw error
-        storage = await this.skipAccount(storage, picked.account)
-        continue
+        throw error
       }
       if (!auth) {
-        // The selected credential was revoked and disabled by accessTokenFor.
-        if (accountIndex !== undefined) {
-          throw new Error(`account #${accountIndex} credential is no longer valid — run \`dsh-agy login\``)
-        }
-        // Re-read and select another enabled account within this same request.
-        this.clearAffinityForAccount(this.accountKey(picked.account))
-        storage = await this.store.load()
-        continue
+        throw new Error(`account #${picked.index} credential is no longer valid — run \`dsh-agy login\``)
       }
 
       const key = this.accountKey(picked.account)
@@ -1047,15 +937,6 @@ export class AgySessionManager {
    */
   private async skipAccount(storage: AccountStorageV4, account: ManagedAccount): Promise<AccountStorageV4> {
     this.clearAffinityForAccount(this.accountKey(account))
-    const key = this.accountKey(account)
-    const deadIndex = storage.accounts.findIndex((candidate) => this.accountKey(candidate) === key)
-    if (deadIndex !== -1) {
-      const next = pickNextAccountIndex(storage.accounts, deadIndex, Date.now())
-      if (next !== storage.activeIndex) {
-        storage.activeIndex = next
-        await this.store.mutate((s) => { s.activeIndex = next }).catch(() => {})
-      }
-    }
     return this.store.load()
   }
 
@@ -1119,12 +1000,6 @@ export class AgySessionManager {
       if (decision.action === 'revoke') {
         this.tokenCache.delete(key)
         this.failureCounts.delete(key)
-        const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
-        const nextIndex = pickNextAccountIndex(storage.accounts, currentIndex >= 0 ? currentIndex : storage.activeIndex, Date.now())
-        if (nextIndex !== storage.activeIndex) {
-          storage.activeIndex = nextIndex
-          nextIndexToRotate = nextIndex
-        }
         this.clearAffinityForAccount(key)
         return
       }
@@ -1164,15 +1039,7 @@ export class AgySessionManager {
       }
 
       if (decision.action === 'rotate' || decision.action === 'cool') {
-        const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
-        const familyKey = familyKeyOf(info?.model)
-        const nextIndex = pickNextAccountIndex(storage.accounts, currentIndex >= 0 ? currentIndex : storage.activeIndex, Date.now(), familyKey)
-        if (nextIndex !== storage.activeIndex) {
-          storage.activeIndex = nextIndex
-          nextIndexToRotate = nextIndex
-        }
-        // Only conversations pinned to the failed account are freed; a pin on
-        // another account was never this failure's business.
+        // Pure manual mode: do not automatically rotate activeIndex to another account.
         this.clearAffinityForAccount(key)
       }
     })

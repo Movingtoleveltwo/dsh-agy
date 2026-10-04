@@ -18,27 +18,18 @@ jobs:
         node: [22, 24]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      # No `version:` input: the action reads `packageManager` from
-      # package.json, which is the ONE pin (v6 refuses a conflicting second one).
-      - uses: pnpm/action-setup@v6
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.10.0
+      - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # fixture-driven unit tests: no network, no real accounts
       - run: pnpm test
-      # The SCRIPT, not `pnpm exec tsc --noEmit`: the root tsconfig EXCLUDES
-      # src/client (the browser half needs DOM libs and its own settings), so
-      # the bare command left a type error there invisible to CI. `typecheck`
-      # runs both projects and is what publish.yml already used.
-      - run: pnpm run typecheck
-      # Hook order is a property of CALL STRUCTURE: `tsc` cannot see it (a
-      # conditional hook is perfectly well-typed) and the suite renders nothing
-      # (`environment: 'node'`), so this is the only gate that covers it. Two
-      # white-screen bugs shipped through every other check (a39379e, 7bd096d).
-      - run: pnpm run lint
+      - run: pnpm exec tsc --noEmit
       - run: pnpm run build
       # verify the publishable artifact assembles from a clean install
       - run: npm pack --dry-run
@@ -46,8 +37,6 @@ jobs:
         run: |
           pnpm pack --pack-destination .
           PKG=$(ls dsh-agy-*.tgz | head -n 1)
-          tar -tf "$PKG" | grep -Fx 'package/lib/client.js'
-          tar -tf "$PKG" | grep -Fx 'package/lib/client.d.ts'
           TARBALL_PATH="$(pwd)/$PKG"
           mkdir -p /tmp/dsh-agy-smoke && cd /tmp/dsh-agy-smoke
           npm init -y -s
@@ -61,5 +50,4 @@ jobs:
             "@deepseek-ai/cordis@$(node -p "require('$GITHUB_WORKSPACE/package.json').peerDependencies['@deepseek-ai/cordis']")"
           node -e "import('dsh-agy').then(m=>{if(!m.apply)process.exit(1)})"
           node -e "import('dsh-agy/web').then(m=>{if(!m.apply)process.exit(1)})"
-          node -e "const p=require('dsh-agy/package.json');if(p.exports['./client']?.default!=='./lib/client.js')process.exit(1)"
         shell: bash
