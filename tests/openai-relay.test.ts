@@ -821,4 +821,119 @@ describe('OpenAI Relay HTTP endpoints', () => {
     const res = await fetch(`${baseUrl}/agy/v1/nonexistent`)
     expect(res.status).toBe(404)
   })
+
+  it('does not hit Object prototype properties in resolveRelayModel', () => {
+    expect(resolveRelayModel('__proto__')).toEqual({ id: '__proto__' })
+    expect(resolveRelayModel('constructor')).toEqual({ id: 'constructor' })
+    expect(resolveRelayModel('toString')).toEqual({ id: 'toString' })
+  })
+
+  it('maps QUOTA code and 403 quota exhaustion to 429 insufficient_quota', async () => {
+    const quotaAdapter = {
+      async *stream() {
+        throw new LlmError('RESOURCE_EXHAUSTED', 'QUOTA')
+      },
+    } as unknown as AgyAdapter
+
+    const server2 = createServer(createOpenAiRelayHandler({ adapter: quotaAdapter }))
+    await new Promise<void>((resolve) => server2.listen(0, resolve))
+    const port2 = (server2.address() as { port: number }).port
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port2}/agy/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'test' }] }),
+      })
+      expect(res.status).toBe(429)
+      const json = (await res.json()) as { error: { code: string; type: string } }
+      expect(json.error.code).toBe('insufficient_quota')
+      expect(json.error.type).toBe('insufficient_quota')
+    } finally {
+      server2.close()
+    }
+  })
+
+  it('preserves length finish_reason when tool call is truncated by max-tokens', async () => {
+    const truncAdapter = {
+      async *stream() {
+        yield {
+          type: 'tool-call-delta',
+          index: 0,
+          id: 'call_1' as any,
+          name: 'bash',
+          argumentsDelta: '{"cmd":',
+        } as StreamChunk
+        yield {
+          type: 'finish',
+          reason: { kind: 'max-tokens' },
+        } as StreamChunk
+      },
+    } as unknown as AgyAdapter
+
+    const server2 = createServer(createOpenAiRelayHandler({ adapter: truncAdapter }))
+    await new Promise<void>((resolve) => server2.listen(0, resolve))
+    const port2 = (server2.address() as { port: number }).port
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port2}/agy/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'test' }], stream: false }),
+      })
+      expect(res.status).toBe(200)
+      const json = (await res.json()) as { choices: Array<{ finish_reason: string; message: { tool_calls: unknown[] } }> }
+      expect(json.choices[0].finish_reason).toBe('length')
+      expect(json.choices[0].message.tool_calls).toHaveLength(1)
+    } finally {
+      server2.close()
+    }
+  })
+
+  it('does not merge multiple tool calls with fallback IDs across distinct indices', async () => {
+    const multiToolAdapter = {
+      async *stream() {
+        // Two consecutive tool calls with identical fallback id "0" but distinct indices 0 and 1
+        yield {
+          type: 'tool-call-delta',
+          index: 0,
+          id: '0' as any,
+          name: 'first_tool',
+          argumentsDelta: '{"a":1}',
+        } as StreamChunk
+        yield {
+          type: 'tool-call-delta',
+          index: 1,
+          id: '0' as any,
+          name: 'second_tool',
+          argumentsDelta: '{"b":2}',
+        } as StreamChunk
+        yield {
+          type: 'finish',
+          reason: { kind: 'stop' },
+        } as StreamChunk
+      },
+    } as unknown as AgyAdapter
+
+    const server2 = createServer(createOpenAiRelayHandler({ adapter: multiToolAdapter }))
+    await new Promise<void>((resolve) => server2.listen(0, resolve))
+    const port2 = (server2.address() as { port: number }).port
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port2}/agy/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'test' }], stream: false }),
+      })
+      expect(res.status).toBe(200)
+      const json = (await res.json()) as { choices: Array<{ message: { tool_calls: Array<{ id: string; function: { name: string; arguments: string } }> } }> }
+      expect(json.choices[0].message.tool_calls).toHaveLength(2)
+      expect(json.choices[0].message.tool_calls[0].function.name).toBe('first_tool')
+      expect(json.choices[0].message.tool_calls[0].function.arguments).toBe('{"a":1}')
+      expect(json.choices[0].message.tool_calls[1].function.name).toBe('second_tool')
+      expect(json.choices[0].message.tool_calls[1].function.arguments).toBe('{"b":2}')
+    } finally {
+      server2.close()
+    }
+  })
 })

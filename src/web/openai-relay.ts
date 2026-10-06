@@ -122,7 +122,12 @@ export class ToolSlotTracker {
     }
 
     if (slot === undefined && id && this.slotById.has(id)) {
-      slot = this.slotById.get(id)
+      // Only join existing slot by ID if index is unspecified.
+      // If a new distinct index is provided, treat it as a distinct slot to prevent
+      // accidental merging of consecutive tool calls that share fallback IDs.
+      if (index === undefined) {
+        slot = this.slotById.get(id)
+      }
     }
 
     if (slot === undefined) {
@@ -264,52 +269,58 @@ async function handleChatCompletions(
   }
 
   const registeredAttachmentIds: string[] = []
-  const resolved = resolveRelayModel(body.model)
-  const model = resolved.id
-  let messages: RequestMessage[]
   try {
-    messages = translateOpenAiMessages(body.messages, adapter, registeredAttachmentIds)
-  } catch (err) {
-    sendError(res, 400, err instanceof Error ? err.message : String(err), 'invalid_request_error')
-    return
-  }
-  const tools = translateOpenAiTools(body.tools)
-
-  const abortController = new AbortController()
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      abortController.abort()
+    const resolved = resolveRelayModel(body.model)
+    const model = resolved.id
+    let messages: RequestMessage[]
+    try {
+      messages = translateOpenAiMessages(body.messages, adapter, registeredAttachmentIds)
+    } catch (err) {
+      sendError(res, 400, err instanceof Error ? err.message : String(err), 'invalid_request_error')
+      return
     }
-  })
+    let tools: ToolSchema[] | undefined
+    try {
+      tools = translateOpenAiTools(body.tools)
+    } catch (err) {
+      sendError(res, 400, err instanceof Error ? err.message : String(err), 'invalid_request_error')
+      return
+    }
 
-  const sessionIdHeader = req.headers['x-session-id']
-  const sessionId = typeof sessionIdHeader === 'string'
-    ? sessionIdHeader
-    : (typeof body.user === 'string' ? body.user : undefined)
+    const abortController = new AbortController()
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        abortController.abort()
+      }
+    })
 
-  const stopList = typeof body.stop === 'string'
-    ? [body.stop]
-    : (Array.isArray(body.stop) ? body.stop.filter((s): s is string => typeof s === 'string') : undefined)
+    const sessionIdHeader = req.headers['x-session-id']
+    const sessionId = typeof sessionIdHeader === 'string'
+      ? sessionIdHeader
+      : (typeof body.user === 'string' ? `user_${body.user}` : `relay_${randomUUID().slice(0, 8)}`)
 
-  const maxTokens = typeof body.max_tokens === 'number'
-    ? body.max_tokens
-    : (typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : undefined)
+    const stopList = typeof body.stop === 'string'
+      ? [body.stop]
+      : (Array.isArray(body.stop) ? body.stop.filter((s): s is string => typeof s === 'string') : undefined)
 
-  const generateOptions: GenerateOptions = {
-    provider: AGY_PROVIDER,
-    model,
-    messages,
-    tools,
-    system: typeof body.system === 'string' ? body.system : undefined,
-    temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
-    maxTokens,
-    stop: stopList,
-    reasoningEffort: resolved.effort ?? normalizeReasoningEffort(body.reasoning_effort),
-    signal: abortController.signal,
-    sessionId: sessionId ? (sessionId as never) : undefined,
-  }
+    const maxTokens = typeof body.max_tokens === 'number'
+      ? body.max_tokens
+      : (typeof body.max_completion_tokens === 'number' ? body.max_completion_tokens : undefined)
 
-  try {
+    const generateOptions: GenerateOptions = {
+      provider: AGY_PROVIDER,
+      model,
+      messages,
+      tools,
+      system: typeof body.system === 'string' ? body.system : undefined,
+      temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
+      maxTokens,
+      stop: stopList,
+      reasoningEffort: resolved.effort ?? normalizeReasoningEffort(body.reasoning_effort),
+      signal: abortController.signal,
+      sessionId: sessionId ? (sessionId as never) : undefined,
+    }
+
     if (body.stream === true) {
       await handleStreamingCompletion(req, res, adapter, generateOptions, model, body, logger)
     } else {
@@ -708,7 +719,7 @@ export const AGY_MODEL_ALIASES: Readonly<Record<string, { id: string; effort?: R
  */
 export function resolveRelayModel(raw?: string): { id: string; effort?: ReasoningEffortId } {
   const id = normalizeModelName(raw)
-  const alias = AGY_MODEL_ALIASES[id]
+  const alias = Object.hasOwn(AGY_MODEL_ALIASES, id) ? AGY_MODEL_ALIASES[id] : undefined
   return alias ? { id: alias.id, effort: alias.effort } : { id }
 }
 
@@ -908,17 +919,10 @@ function extractTextContent(content: unknown): string {
 }
 
 function mapFinishReason(reason?: { kind: string }, hasToolCalls = false): string {
-  if (hasToolCalls) return 'tool_calls'
-  if (!reason) return 'stop'
-  switch (reason.kind) {
-    case 'tool-calls':
-      return 'tool_calls'
-    case 'max-tokens':
-      return 'length'
-    case 'stop':
-    default:
-      return 'stop'
-  }
+  if (reason?.kind === 'max-tokens') return 'length'
+  if (hasToolCalls || reason?.kind === 'tool-calls') return 'tool_calls'
+  if (!reason || reason.kind === 'stop') return 'stop'
+  return 'stop'
 }
 
 function formatUsage(usage?: TokenUsage) {
@@ -983,7 +987,7 @@ function handleError(res: ServerResponse, error: unknown): void {
   let type = 'api_error'
 
   if (error instanceof LlmError) {
-    if (error.code === 'RATE_LIMIT' || error.code === 'QUOTA_EXCEEDED') {
+    if (error.code === 'RATE_LIMIT' || error.code === 'QUOTA_EXCEEDED' || error.code === 'QUOTA') {
       status = 429
       code = 'insufficient_quota'
       type = 'insufficient_quota'
@@ -1000,7 +1004,7 @@ function handleError(res: ServerResponse, error: unknown): void {
 
   // Structured HTTP status code if present on the error object
   if (status === 500 && error && typeof error === 'object') {
-    const errObj = error as { status?: unknown; statusCode?: unknown; httpStatus?: unknown }
+    const errObj = error as { status?: unknown; statusCode?: unknown; httpStatus?: unknown; message?: unknown }
     const rawStatus = typeof errObj.status === 'number'
       ? errObj.status
       : (typeof errObj.statusCode === 'number'
@@ -1015,9 +1019,19 @@ function handleError(res: ServerResponse, error: unknown): void {
       } else if (status === 400) {
         code = 'invalid_request_error'
         type = 'invalid_request_error'
-      } else if (status === 401 || status === 403) {
+      } else if (status === 401) {
         code = 'invalid_api_key'
         type = 'invalid_request_error'
+      } else if (status === 403) {
+        const msg = String(errObj.message || '')
+        if (/quota|resource_exhausted|exhausted/i.test(msg)) {
+          status = 429
+          code = 'insufficient_quota'
+          type = 'insufficient_quota'
+        } else {
+          code = 'invalid_api_key'
+          type = 'invalid_request_error'
+        }
       } else if (status === 429) {
         code = 'insufficient_quota'
         type = 'insufficient_quota'
@@ -1027,7 +1041,11 @@ function handleError(res: ServerResponse, error: unknown): void {
 
   if (status === 500 && error instanceof Error) {
     const msg = error.message
-    if (/404|NOT_FOUND|not found/i.test(msg)) {
+    if (/429|RESOURCE_EXHAUSTED|quota/i.test(msg)) {
+      status = 429
+      code = 'insufficient_quota'
+      type = 'insufficient_quota'
+    } else if (/404|NOT_FOUND|not found/i.test(msg)) {
       status = 404
       code = 'model_not_found'
       type = 'invalid_request_error'
@@ -1039,10 +1057,6 @@ function handleError(res: ServerResponse, error: unknown): void {
       status = 401
       code = 'invalid_api_key'
       type = 'invalid_request_error'
-    } else if (/429|RESOURCE_EXHAUSTED|quota/i.test(msg)) {
-      status = 429
-      code = 'insufficient_quota'
-      type = 'insufficient_quota'
     }
   }
 

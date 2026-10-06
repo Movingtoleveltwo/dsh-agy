@@ -271,18 +271,20 @@ export async function* parseAgySse(
           open!.text += part.text
           out.push({ type: 'reasoning-delta', index: blockIndex, text: part.text })
         } else if (part.functionCall) {
-          // Use the upstream functionCall id when present so the signature
-          // captured on this part can be replayed for the same id next turn.
-          const upstreamId = part.functionCall.id || String(blockIndex)
           // Each functionCall part is an ATOMIC block: a stream can carry
           // several functionCall parts in one turn (multi-tool responses),
           // and they share kind "tool-call" — ensureBlock alone would not
           // switch between them, concatenating their args JSON into one
           // invalid string. Close any open block (yielding its end) first.
+          // Note: closeBlock MUST run before computing the fallback upstreamId,
+          // so blockIndex increments and each functionCall gets a unique ID.
           if (open) {
             const end = closeBlock()
             if (end) out.push(end)
           }
+          // Use the upstream functionCall id when present so the signature
+          // captured on this part can be replayed for the same id next turn.
+          const upstreamId = part.functionCall.id || String(blockIndex)
           const start = ensureBlock('tool-call', {
             id: upstreamId,
             name: part.functionCall.name,

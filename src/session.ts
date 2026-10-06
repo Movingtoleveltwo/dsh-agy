@@ -788,6 +788,7 @@ export class AgySessionManager {
       : 0
     const account = storage.accounts[activeIdx]
     if (!account) return undefined
+    if (account.enabled === false) return undefined
     return { account, index: activeIdx }
   }
   /**
