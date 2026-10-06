@@ -259,7 +259,7 @@ export interface AgyRpcMethods {
      * Absent (the default) keeps the TTL, so an automatic reload never spends an
      * upstream call it did not need.
      */
-    payload: { force?: boolean }
+    payload: { force?: boolean, index?: number }
     result: {
       limits: Array<{
         index: number

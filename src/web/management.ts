@@ -368,13 +368,17 @@ export function createAgyManagement(options: AgyManagementOptions): AgyManagemen
      */
     'account.limits': async (payload) => {
       const force = (payload as { force?: unknown } | undefined)?.force === true
+      const rawIndex = (payload as { index?: unknown } | undefined)?.index
+      const accountIndex = typeof rawIndex === 'number' && Number.isInteger(rawIndex) ? rawIndex : undefined
       const storage = await store.load()
+      const refreshOptions: { force: boolean; accountIndex?: number } = { force }
+      if (accountIndex !== undefined) refreshOptions.accountIndex = accountIndex
       // Best-effort: a failed refresh leaves whatever was cached, so this reply
       // is always the current best knowledge rather than an error. The OUTCOME
       // is still reported, because "probed and failed" and "was still fresh"
       // both leave the numbers identical and the user needs to know which.
       const result = await sessions
-        .refreshLimits(storage, { force })
+        .refreshLimits(storage, refreshOptions)
         .catch(() => ({ measured: [], failed: [], skipped: 0 }))
       const fresh = await store.load()
       // Burn rates ride the same reply (the sampling path runs inside

@@ -255,6 +255,18 @@ describe('solo-account limits', () => {
     expect(after.accounts.every((a) => a.cachedQuota?.google?.remainingFraction === 0.16)).toBe(true)
   })
 
+  it('in manual mode refreshLimits probes ONLY active account, never fan-out to all accounts', async () => {
+    const calls: string[] = []
+    stubSummary(calls)
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const loaded = await store.load()
+    const result = await sessions.refreshLimits(loaded, { force: true })
+    const summaryCalls = calls.filter((url) => url.includes('retrieveUserQuotaSummary')).length
+    expect(summaryCalls).toBe(1)
+    expect(result.measured).toEqual([loaded.accounts[0]!.id])
+  })
+
   it('treats an absent or non-numeric snapshot as stale', () => {
     expect(isLimitsStale(account())).toBe(true)
     expect(isLimitsStale({ ...account(), cachedLimits: { groups: [], updatedAt: Number.NaN } })).toBe(true)

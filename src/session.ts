@@ -617,15 +617,20 @@ export class AgySessionManager {
    */
   async refreshLimits(
     storage: AccountStorageV4,
-    options: { force?: boolean } = {},
+    options: { force?: boolean; accountIndex?: number } = {},
   ): Promise<LimitsRefreshResult> {
     const now = Date.now()
-    // A separate staleness rule: `isQuotaStale` is driven by the SCHEDULING
-    // cache, which a solo account never fills, so reusing it would report
-    // "stale" on every call and re-probe continuously. `force` bypasses it for
-    // an explicit user request, which is the only thing that may spend an
-    // upstream call inside the TTL.
-    const candidates = storage.accounts.filter((account) => account.enabled !== false)
+    // Pure manual mode (mirroring v0.2.5 custom behavior): strictly probe ONLY
+    // the active account (or explicitly specified accountIndex). Never fan-out
+    // to all pool accounts concurrently to avoid multi-account IP correlation.
+    const activeIdx = typeof storage.activeIndex === 'number' && storage.activeIndex >= 0 && storage.activeIndex < storage.accounts.length
+      ? storage.activeIndex
+      : 0
+    const targetIdx = typeof options.accountIndex === 'number' && options.accountIndex >= 0 && options.accountIndex < storage.accounts.length
+      ? options.accountIndex
+      : activeIdx
+    const targetAccount = storage.accounts[targetIdx]
+    const candidates = targetAccount && targetAccount.enabled !== false ? [targetAccount] : []
     const targets = options.force === true
       ? candidates
       : candidates.filter((account) => isLimitsStale(account, now))
