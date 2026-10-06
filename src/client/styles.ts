@@ -130,6 +130,7 @@ const CSS = `
 @container (min-width: 700px) {
   .agy-split { grid-template-columns: minmax(0, 300px) minmax(0, 1fr); }
 }
+.agy-col-left { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 /* Cap the master list so a large pool cannot push the detail it opens below the
    fold — the reason the split exists at all. Scoped to the split: the Models tab
    shares .agy-rows for its own long list and must keep growing freely. */

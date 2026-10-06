@@ -660,70 +660,6 @@ function AccountDetail(props: {
     button(t('actionRegenerateFingerprint'), () => { handlers.onRegenerateFingerprint(account.index) }, { disabled: busy }),
     button(t('actionDelete'), () => { handlers.onDelete(account.index) }, { variant: 'danger', disabled: busy })))
 
-  /**
-   * The 5-hour / weekly windows, placed ABOVE the cumulative usage card.
-   *
-   * Ordering is deliberate: these are the figures a user actually acts on
-   * (the rolling budget still available), while cumulative usage is a
-   * retrospective total that only grows. Putting the actionable number first is
-   * the whole point of the panel.
-   *
-   * A window with no reported fraction renders its bar empty and its percentage
-   * as an em dash — "unknown" must not look like "0% left". A null `limits` means
-   * the account has not been measured YET, and says so rather than showing an
-   * empty card. That is reachable at any pool size: `refreshLimits` runs for a
-   * solo account too (unlike the scheduling quota refresh, which a pool of one
-   * skips because measuring it could block the only account).
-   */
-  const limitsBlock = card(t('limitsTitle'),
-    account.limits === null || account.limits.length === 0
-      ? h('div', { className: 'agy-empty' }, t('limitsUnavailable'))
-      // The snapshot's age is shown, not just its values. These windows come from
-      // a TTL cache and a FAILED refresh keeps the previous numbers rather than
-      // clearing them, so an unlabelled figure could be arbitrarily old with
-      // nothing on screen to say so — the same trap as an undated cooldown reason.
-      : h('div', { className: 'agy-limits' },
-        account.limitsUpdatedAt === null
-          ? null
-          : h('div', { className: 'agy-limit-age' },
-            t('limitsMeasured', { ago: agoText(new Date(account.limitsUpdatedAt).toISOString(), t, now) })),
-        ...account.limits.map((group) => h('div', { className: 'agy-limit-group', key: group.name },
-          h('div', { className: 'agy-limit-group-name' }, group.name),
-          ...group.windows.map((window) => {
-            const fraction = window.remainingFraction
-            // Burn projection: rate (fraction/hour) over remaining fraction
-            // gives hours-to-empty. Spoken ONLY when that lands BEFORE the
-            // window's reset — otherwise the reset time this row already shows
-            // is the answer, and a "won't run dry" line is noise.
-            const burn = account.limitBurn?.[window.bucketId]
-            const hoursLeft = fraction !== null && burn !== undefined && burn > 0
-              ? fraction / burn
-              : null
-            const resetHours = window.resetTime === null
-              ? null
-              : (new Date(window.resetTime).getTime() - now) / HOUR_MS
-            const exhaustsFirst = hoursLeft !== null && resetHours !== null
-              && hoursLeft < resetHours
-            return h('div', { key: window.bucketId },
-              h('div', { className: 'agy-limit-row' },
-                h('span', { className: 'agy-limit-k' }, windowLabel(window.window, t)),
-                h('span', { className: 'agy-limit-track' },
-                  fraction === null
-                    ? null
-                    : h('i', { style: { width: `${Math.round(fraction * 100)}%`, background: quotaColor(fraction) } })),
-                // An unreported fraction is an em dash, never "0%": unknown
-                // headroom and no headroom are opposite facts. A dedicated key
-                // rather than reusing `noProject`, whose NAME would then be wrong
-                // for the value it renders.
-                h('span', { className: 'agy-limit-p' }, fraction === null ? t('valueUnknown') : `${Math.round(fraction * 100)}%`),
-                h('span', { className: 'agy-limit-reset' },
-                  window.resetTime === null ? null : untilText(window.resetTime, t, now))),
-              exhaustsFirst
-                ? h('div', { className: 'agy-limit-burn' },
-                  t('limitBurnWarn', { value: burnHorizon(hoursLeft!, t) }))
-                : null)
-          })))))
-
   const usageBlock = usage === null ? null : card(
     t('usageCumulative'),
     metrics([
@@ -772,7 +708,64 @@ function AccountDetail(props: {
         { disabled: busy || noTarget, ...(noTarget ? { title: t('proxyTestNoTarget') } : {}) })
     })()))
 
-  return h('div', { className: 'agy-detail' }, identity, actions, limitsBlock, usageBlock, proxyBlock)
+  return h('div', { className: 'agy-detail' }, identity, actions, usageBlock, proxyBlock)
+}
+
+/** One account's 5h / weekly quota limits card. */
+function LimitsCard(props: {
+  account: AccountView
+  now: number
+  t: T
+}): ReactNode {
+  const { account, now, t } = props
+  return card(t('limitsTitle'),
+    account.limits === null || account.limits.length === 0
+      ? h('div', { className: 'agy-empty' }, t('limitsUnavailable'))
+      // The snapshot's age is shown, not just its values. These windows come from
+      // a TTL cache and a FAILED refresh keeps the previous numbers rather than
+      // clearing them, so an unlabelled figure could be arbitrarily old with
+      // nothing on screen to say so — the same trap as an undated cooldown reason.
+      : h('div', { className: 'agy-limits' },
+        account.limitsUpdatedAt === null
+          ? null
+          : h('div', { className: 'agy-limit-age' },
+            t('limitsMeasured', { ago: agoText(new Date(account.limitsUpdatedAt).toISOString(), t, now) })),
+        ...account.limits.map((group) => h('div', { className: 'agy-limit-group', key: group.name },
+          h('div', { className: 'agy-limit-group-name' }, group.name),
+          ...group.windows.map((window) => {
+            const fraction = window.remainingFraction
+            // Burn projection: rate (fraction/hour) over remaining fraction
+            // gives hours-to-empty. Spoken ONLY when that lands BEFORE the
+            // window's reset — otherwise the reset time this row already shows
+            // is the answer, and a "won't run dry" line is noise.
+            const burn = account.limitBurn?.[window.bucketId]
+            const hoursLeft = fraction !== null && burn !== undefined && burn > 0
+              ? fraction / burn
+              : null
+            const resetHours = window.resetTime === null
+              ? null
+              : (new Date(window.resetTime).getTime() - now) / HOUR_MS
+            const exhaustsFirst = hoursLeft !== null && resetHours !== null
+              && hoursLeft < resetHours
+            return h('div', { key: window.bucketId },
+              h('div', { className: 'agy-limit-row' },
+                h('span', { className: 'agy-limit-k' }, windowLabel(window.window, t)),
+                h('span', { className: 'agy-limit-track' },
+                  fraction === null
+                    ? null
+                    : h('i', { style: { width: `${Math.round(fraction * 100)}%`, background: quotaColor(fraction) } })),
+                // An unreported fraction is an em dash, never "0%": unknown
+                // headroom and no headroom are opposite facts. A dedicated key
+                // rather than reusing `noProject`, whose NAME would then be wrong
+                // for the value it renders.
+                h('span', { className: 'agy-limit-p' }, fraction === null ? t('valueUnknown') : `${Math.round(fraction * 100)}%`),
+                h('span', { className: 'agy-limit-reset' },
+                  window.resetTime === null ? null : untilText(window.resetTime, t, now))),
+              exhaustsFirst
+                ? h('div', { className: 'agy-limit-burn' },
+                  t('limitBurnWarn', { value: burnHorizon(hoursLeft!, t) }))
+                : null)
+          })))))
 }
 
 /**
@@ -807,7 +800,7 @@ export function resolveSelectedAccountIndex(
   return activePos >= 0 ? activePos : 0
 }
 
-function AccountsTab(props: {
+export function AccountsTab(props: {
   accounts: AccountView[]
   busy: boolean
   /** Accounts with upstream requests in flight, from the latest pool.status. */
@@ -917,11 +910,13 @@ function AccountsTab(props: {
     // styles.ts for why this is a container query rather than a viewport one.
     h('div', { className: 'agy-split-wrap' },
       h('div', { className: 'agy-split' },
-        card(t('colAccount'),
-          h('div', null,
-            liveLine,
-            h('div', { className: 'agy-rows' }, ...rows)),
-          `${accounts.length}`),
+        h('div', { className: 'agy-col-left' },
+          card(t('colAccount'),
+            h('div', null,
+              liveLine,
+              h('div', { className: 'agy-rows' }, ...rows)),
+            `${accounts.length}`),
+          current === undefined ? null : h(LimitsCard, { account: current, now, t })),
         // `key` remounts the detail per account so its proxy draft cannot carry
         // over: without it React reuses the instance and a draft typed for one
         // account was still in the box after selecting another, one Save away
