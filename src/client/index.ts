@@ -355,7 +355,7 @@ function untilText(iso: string | null, t: T, now: number): string {
   const at = new Date(iso).getTime()
   if (Number.isNaN(at)) return '—'
   const diff = at - now
-  if (diff <= 0) return t('relNow')
+  if (diff <= 0) return t('quotaResetPassed')
   const value = diff < MINUTE_MS
     ? t('relNow')
     : diff < HOUR_MS
