@@ -309,10 +309,10 @@ const CSS = `
 }
 .agy-limit-item { display: flex; flex-direction: column; gap: 6px; padding: 2px 0; }
 .agy-limit-header { display: flex; justify-content: space-between; align-items: center; font: var(--dsw-font-xxs-12); }
-.agy-limit-k { color: var(--dsw-alias-label-secondary, #61666b); font-weight: 500; }
+.agy-limit-k { color: var(--dsw-alias-label-secondary, #61666b); font: var(--dsw-font-xxs-strong-12); }
 .agy-limit-status { display: flex; align-items: center; gap: 8px; }
 .agy-limit-reset { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
-.agy-limit-p { font-variant-numeric: tabular-nums; font-weight: 600; }
+.agy-limit-p { font: var(--dsw-font-xxs-strong-12); font-variant-numeric: tabular-nums; }
 .agy-limit-track { width: 100%; height: 5px; border-radius: 3px; overflow: hidden;
   background: var(--dsw-alias-border-l2, rgba(0,0,0,.12)); }
 .agy-limit-track i { display: block; height: 100%; border-radius: 3px; transition: width 0.3s ease; }

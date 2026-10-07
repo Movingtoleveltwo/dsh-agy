@@ -323,6 +323,75 @@ describe('rotation state machine', () => {
     expect(acc.cooldownReason).toBeUndefined()
   })
 
+  it('does NOT unfreeze if cachedLimits snapshot predates the cooldownSetAt failure', () => {
+    const now = Date.now()
+    const acc = account()
+    acc.coolingDownUntil = now + 5 * 60 * 60 * 1000
+    acc.cooldownReason = 'quota-exhausted'
+    acc.cooldownSetAt = now - 1000 // failed 1 second ago
+    acc.cachedLimits = {
+      updatedAt: now - 3600000, // snapshot from 1 hour ago (before failure)
+      groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1, resetTime: new Date(now - 10000).toISOString() },
+            { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 1, resetTime: new Date(now + 500000).toISOString() },
+          ],
+        },
+      ],
+    }
+    clearExpiredState(acc, now)
+    expect(acc.coolingDownUntil).toBeDefined()
+    expect(acc.cooldownReason).toBe('quota-exhausted')
+  })
+
+  it('does NOT unfreeze if weekly quota is unknown (null fraction and future reset)', () => {
+    const now = Date.now()
+    const acc = account()
+    acc.coolingDownUntil = now + 5 * 60 * 60 * 1000
+    acc.cooldownReason = 'quota-exhausted'
+    acc.cooldownSetAt = now - 1000
+    acc.cachedLimits = {
+      updatedAt: now,
+      groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1, resetTime: new Date(now - 10000).toISOString() },
+            { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: null, resetTime: new Date(now + 500000).toISOString() },
+          ],
+        },
+      ],
+    }
+    clearExpiredState(acc, now)
+    expect(acc.coolingDownUntil).toBeDefined()
+    expect(acc.cooldownReason).toBe('quota-exhausted')
+  })
+
+  it('unfreezes when both 5h and weekly reset times have elapsed, even with 0 fraction', () => {
+    const now = Date.now()
+    const acc = account()
+    acc.coolingDownUntil = now + 5 * 60 * 60 * 1000
+    acc.cooldownReason = 'quota-exhausted'
+    acc.cooldownSetAt = now - 5000
+    acc.cachedLimits = {
+      updatedAt: now - 4000,
+      groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0, resetTime: new Date(now - 1000).toISOString() },
+            { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0, resetTime: new Date(now - 500).toISOString() },
+          ],
+        },
+      ],
+    }
+    clearExpiredState(acc, now)
+    expect(acc.coolingDownUntil).toBeUndefined()
+    expect(acc.cooldownReason).toBeUndefined()
+  })
+
   it('revokes on auth-failure and disables the account', () => {
     const acc = account()
     const decision = decideRotation('auth-failure', acc, 2)

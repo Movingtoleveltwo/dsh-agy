@@ -113,20 +113,34 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
     account.rateLimitResetTimes = Object.keys(fresh).length > 0 ? fresh : undefined
   }
   let expired = account.coolingDownUntil !== undefined && account.coolingDownUntil <= now
-  // If the cooldown was due to quota exhaustion, but the account's measured quota
-  // limits show that all 5h windows have reset (resetTime <= now or fraction = 1)
-  // and weekly quota is available, it has naturally refreshed — unfreeze automatically.
+
+  // If the cooldown was due to quota exhaustion, evaluate whether the quota has affirmatively recovered:
   if (!expired && account.cooldownReason === 'quota-exhausted' && account.cachedLimits?.groups) {
-    const all5hReset = account.cachedLimits.groups.every((group) =>
-      group.windows.every((w) => {
-        if (w.window === '5h') {
+    const groups = account.cachedLimits.groups
+    const hasWindows = groups.length > 0 && groups.some((g) => g.windows.length > 0)
+    const cooldownSetAt = account.cooldownSetAt ?? 0
+    const measuredAfterFailure = typeof account.cachedLimits.updatedAt === 'number' && account.cachedLimits.updatedAt >= cooldownSetAt
+
+    if (hasWindows) {
+      // Every window across all groups must affirmatively establish availability or elapsed reset
+      const allWindowsHealthy = groups.every((group) =>
+        group.windows.every((w) => {
           const resetAt = w.resetTime ? Date.parse(w.resetTime) : Number.NaN
-          return (!Number.isNaN(resetAt) && resetAt <= now) || w.remainingFraction === 1
-        }
-        return (w.remainingFraction ?? 1) > 0
-      }),
-    )
-    if (all5hReset) expired = true
+          // A window with a valid resetTime: if that reset occurred after the failure and <= now, the window has reset!
+          if (!Number.isNaN(resetAt) && resetAt <= now && (cooldownSetAt === 0 || resetAt >= cooldownSetAt)) {
+            return true
+          }
+          // If measured after failure and fraction > 0, it's positive fresh evidence
+          if (measuredAfterFailure && w.remainingFraction !== null && w.remainingFraction > 0) {
+            return true
+          }
+          return false
+        }),
+      )
+      if (allWindowsHealthy) {
+        expired = true
+      }
+    }
   }
 
   if (expired) {

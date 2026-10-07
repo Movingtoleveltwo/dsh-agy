@@ -14,7 +14,6 @@ import {
   MAX_IN_FLIGHT_PER_ACCOUNT,
   MAX_RATE_LIMIT_COOLDOWN_MS,
   RATE_LIMIT_COOLDOWN_MS,
-  clearExpiredState,
   decideRotation,
   isCoolingDown,
   isFamilyRateLimited,

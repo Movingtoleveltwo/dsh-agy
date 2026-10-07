@@ -356,17 +356,16 @@ function untilText(iso: string | null, t: T, now: number): string {
   if (Number.isNaN(at)) return '—'
   const diff = at - now
   if (diff <= 0) return t('quotaResetPassed')
-  const value = diff < MINUTE_MS
-    ? t('relNow')
-    : diff < HOUR_MS
-      ? t('relMinutes', { n: Math.floor(diff / MINUTE_MS) })
-      : diff < DAY_MS
-        ? t('relHours', { n: Math.floor(diff / HOUR_MS) })
-        : diff < 30 * DAY_MS
-          ? t('relDays', { n: Math.floor(diff / DAY_MS) })
-          : diff < 365 * DAY_MS
-            ? t('relMonths', { n: Math.floor(diff / (30 * DAY_MS)) })
-            : t('relYears', { n: Math.floor(diff / (365 * DAY_MS)) })
+  if (diff < MINUTE_MS) return t('quotaResetSoon')
+  const value = diff < HOUR_MS
+    ? t('relMinutes', { n: Math.floor(diff / MINUTE_MS) })
+    : diff < DAY_MS
+      ? t('relHours', { n: Math.floor(diff / HOUR_MS) })
+      : diff < 30 * DAY_MS
+        ? t('relDays', { n: Math.floor(diff / DAY_MS) })
+        : diff < 365 * DAY_MS
+          ? t('relMonths', { n: Math.floor(diff / (30 * DAY_MS)) })
+          : t('relYears', { n: Math.floor(diff / (365 * DAY_MS)) })
   return t('quotaResetIn', { value })
 }
 
