@@ -102,7 +102,7 @@ export const zh = {
   latencyAverage: '平均 {value}',
   latencyTtft: '首 token {value}',
   sourcesSummary: '对话 {chat} · CLI {cli} · 验证 {verify} · 测试 {test}',
-  quotaResetIn: '重置 {value}',
+  quotaResetIn: '将在 {value} 后重置',
   quotaResetPassed: '重置周期已过',
   relNow: '即将',
   relJustNow: '刚刚',
