@@ -8,6 +8,7 @@ import {
   isSessionAccumulationOverflow,
 } from '../src/runtime/classify.ts'
 import {
+  clearExpiredState,
   computeSoftQuotaCacheTtlMs,
   decideRotation,
   isCoolingDown,
@@ -292,11 +293,34 @@ describe('rotation state machine', () => {
     expect(acc.coolingDownUntil).toBeUndefined()
   })
 
-  it('applies a 24h cooldown on daily quota exhaustion', () => {
+  it('applies a 5h cooldown on quota exhaustion by default', () => {
     const acc = account()
     const decision = decideRotation('rate-limit', acc, 0, undefined, 'quota_exhausted')
     expect(decision.action).toBe('cool')
-    expect(acc.coolingDownUntil! - Date.now()).toBeGreaterThan(23 * 60 * 60 * 1000)
+    expect(acc.coolingDownUntil! - Date.now()).toBeGreaterThan(4 * 60 * 60 * 1000)
+    expect(acc.coolingDownUntil! - Date.now()).toBeLessThanOrEqual(5 * 60 * 60 * 1000)
+  })
+
+  it('automatically unfreezes quota-exhausted account when measured limits have reset', () => {
+    const acc = account()
+    acc.coolingDownUntil = Date.now() + 10 * 60 * 60 * 1000
+    acc.cooldownReason = 'quota-exhausted'
+    acc.cooldownSetAt = Date.now() - 1000
+    acc.cachedLimits = {
+      updatedAt: Date.now(),
+      groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1, resetTime: new Date(Date.now() - 10000).toISOString() },
+            { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.8, resetTime: new Date(Date.now() + 500000).toISOString() },
+          ],
+        },
+      ],
+    }
+    clearExpiredState(acc, Date.now())
+    expect(acc.coolingDownUntil).toBeUndefined()
+    expect(acc.cooldownReason).toBeUndefined()
   })
 
   it('revokes on auth-failure and disables the account', () => {
@@ -348,7 +372,7 @@ describe('rotation state machine', () => {
     expect(d5.backoffMs).toBeGreaterThan(d0.backoffMs)
   })
 
-  it('cools daily quota until the real reset time (capped at 24h)', () => {
+  it('cools quota until the real reset time (e.g. 2h or multi-day weekly, capped at 7d)', () => {
     const before = Date.now()
     const acc = account()
     const decision = decideRotation('rate-limit', acc, 0, undefined, 'quota_exhausted', new Date(before + 2 * 60 * 60 * 1000).toISOString())
@@ -358,7 +382,8 @@ describe('rotation state machine', () => {
 
     const far = account()
     decideRotation('rate-limit', far, 0, undefined, 'quota_exhausted', new Date(before + 48 * 60 * 60 * 1000).toISOString())
-    expect(far.coolingDownUntil! - before).toBeLessThan(24 * 60 * 60 * 1000 + 5000)
+    expect(far.coolingDownUntil! - before).toBeGreaterThan(47 * 60 * 60 * 1000)
+    expect(far.coolingDownUntil! - before).toBeLessThan(49 * 60 * 60 * 1000)
   })
 
   it('cools per-minute limits until the real reset (capped at 30min), ignoring past resets', () => {

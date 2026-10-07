@@ -112,7 +112,24 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
     )
     account.rateLimitResetTimes = Object.keys(fresh).length > 0 ? fresh : undefined
   }
-  if (account.coolingDownUntil && account.coolingDownUntil <= now) {
+  let expired = account.coolingDownUntil !== undefined && account.coolingDownUntil <= now
+  // If the cooldown was due to quota exhaustion, but the account's measured quota
+  // limits show that all 5h windows have reset (resetTime <= now or fraction = 1)
+  // and weekly quota is available, it has naturally refreshed — unfreeze automatically.
+  if (!expired && account.cooldownReason === 'quota-exhausted' && account.cachedLimits?.groups) {
+    const all5hReset = account.cachedLimits.groups.every((group) =>
+      group.windows.every((w) => {
+        if (w.window === '5h') {
+          const resetAt = w.resetTime ? Date.parse(w.resetTime) : Number.NaN
+          return (!Number.isNaN(resetAt) && resetAt <= now) || w.remainingFraction === 1
+        }
+        return (w.remainingFraction ?? 1) > 0
+      }),
+    )
+    if (all5hReset) expired = true
+  }
+
+  if (expired) {
     account.coolingDownUntil = undefined
     account.cooldownReason = undefined
     // The age is only meaningful while the window it describes is live; leaving
@@ -121,8 +138,12 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
   }
 }
 
-/** 24h cooldown for a fully exhausted daily quota (single-account: stop hitting the wall). */
-export const FULL_QUOTA_COOLDOWN_MS = 24 * 60 * 60 * 1000
+/** Default 5h cooldown for quota exhaustion (aligned with Antigravity 5h rolling window). */
+export const DEFAULT_QUOTA_COOLDOWN_MS = 5 * 60 * 60 * 1000
+/** Max 7 days cooldown cap for weekly quota exhaustion. */
+export const MAX_QUOTA_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
+/** Alias for backwards compatibility. */
+export const FULL_QUOTA_COOLDOWN_MS = DEFAULT_QUOTA_COOLDOWN_MS
 /** 5min cooldown for per-minute rate limits. */
 export const RATE_LIMIT_COOLDOWN_MS = 5 * 60 * 1000
 /** Cap for a server-reported reset time on per-minute limits (guards against bogus far-future values). */
@@ -172,13 +193,13 @@ export function decideRotation(
         return { action: 'retry', backoffMs: Math.min(retryAfterMs ?? backoffMs, 3000) }
       }
       if (category === 'quota_exhausted') {
-        // Daily/plan quota gone: cool until the real reset when the backend
-        // reported one (capped at 24h), else the fixed daily window.
+        // Quota exhausted: cool until the real reset reported by upstream (5h rolling or weekly window, capped at 7 days).
+        // Defaults to 5h window when unspecified (never a blind 24h).
         const resetMs = parseFutureResetMs(resetTime, now)
         const cooldownMs = resetMs !== undefined
-          ? Math.min(resetMs - now, FULL_QUOTA_COOLDOWN_MS)
-          : FULL_QUOTA_COOLDOWN_MS
-        account.coolingDownUntil = now + Math.max(cooldownMs, 60_000)
+          ? Math.min(Math.max(resetMs - now, 60_000), MAX_QUOTA_COOLDOWN_MS)
+          : DEFAULT_QUOTA_COOLDOWN_MS
+        account.coolingDownUntil = now + cooldownMs
         account.cooldownReason = 'quota-exhausted'
         account.cooldownSetAt = now
         return { action: 'cool', backoffMs: Math.max(cooldownMs, 60_000) }
