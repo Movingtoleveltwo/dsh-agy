@@ -1944,6 +1944,9 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
       // failed changed nothing on screen — no new numbers, no new timestamp —
       // so the click looked inert. "Still fresh" and "probe failed" are
       // different facts and must not read the same.
+      if (result.measured > 0) {
+        void refresh()
+      }
       if (report) {
         if (result.failed > 0) setActionError(t('limitsRefreshFailed', { failed: result.failed }))
         else if (result.measured > 0) setNotice(t('limitsRefreshOk', { measured: result.measured }))

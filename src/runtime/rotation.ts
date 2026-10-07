@@ -118,10 +118,12 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
   if (!expired && account.cooldownReason === 'quota-exhausted' && account.cachedLimits?.groups) {
     const groups = account.cachedLimits.groups
     const hasWindows = groups.length > 0 && groups.some((g) => g.windows.length > 0)
-    const cooldownSetAt = account.cooldownSetAt ?? 0
-    const measuredAfterFailure = typeof account.cachedLimits.updatedAt === 'number' && account.cachedLimits.updatedAt >= cooldownSetAt
+    const cooldownSetAt = account.cooldownSetAt
 
-    if (hasWindows) {
+    if (cooldownSetAt !== undefined && hasWindows) {
+      const updatedAt = account.cachedLimits.updatedAt
+      const measuredAfterFailure = typeof updatedAt === 'number' && updatedAt >= cooldownSetAt
+
       // Every group must have both 5h and weekly windows present, and every window
       // across all groups must affirmatively establish availability or elapsed reset
       const allWindowsHealthy = groups.every((group) => {
@@ -132,8 +134,12 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
 
         return group.windows.every((w) => {
           const resetAt = w.resetTime ? Date.parse(w.resetTime) : Number.NaN
+          // If we took a measurement AFTER resetAt and remainingFraction is 0, it's explicitly STILL exhausted:
+          if (measuredAfterFailure && typeof updatedAt === 'number' && !Number.isNaN(resetAt) && updatedAt > resetAt && w.remainingFraction === 0) {
+            return false
+          }
           // A window with a valid resetTime: if that reset occurred after the failure and <= now, the window has reset!
-          if (!Number.isNaN(resetAt) && resetAt <= now && (cooldownSetAt === 0 || resetAt >= cooldownSetAt)) {
+          if (!Number.isNaN(resetAt) && resetAt <= now && resetAt >= cooldownSetAt) {
             return true
           }
           // If measured after failure and fraction > 0, it's positive fresh evidence
