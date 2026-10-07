@@ -369,6 +369,28 @@ describe('rotation state machine', () => {
     expect(acc.cooldownReason).toBe('quota-exhausted')
   })
 
+  it('does NOT unfreeze if weekly quota window is omitted from the snapshot', () => {
+    const now = Date.now()
+    const acc = account()
+    acc.coolingDownUntil = now + 5 * 60 * 60 * 1000
+    acc.cooldownReason = 'quota-exhausted'
+    acc.cooldownSetAt = now - 1000
+    acc.cachedLimits = {
+      updatedAt: now,
+      groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1, resetTime: new Date(now - 10000).toISOString() },
+          ],
+        },
+      ],
+    }
+    clearExpiredState(acc, now)
+    expect(acc.coolingDownUntil).toBeDefined()
+    expect(acc.cooldownReason).toBe('quota-exhausted')
+  })
+
   it('unfreezes when both 5h and weekly reset times have elapsed, even with 0 fraction', () => {
     const now = Date.now()
     const acc = account()

@@ -123,8 +123,13 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
 
     if (hasWindows) {
       // Every window across all groups must affirmatively establish availability or elapsed reset
-      const allWindowsHealthy = groups.every((group) =>
-        group.windows.every((w) => {
+      const allWindowsHealthy = groups.every((group) => {
+        const has5h = group.windows.some((w) => w.window === '5h')
+        const hasWeekly = group.windows.some((w) => w.window === 'weekly')
+        // If 5h is present, weekly must also be present to prove full quota health (avoid partial-snapshot bypass)
+        if (has5h && !hasWeekly) return false
+
+        return group.windows.every((w) => {
           const resetAt = w.resetTime ? Date.parse(w.resetTime) : Number.NaN
           // A window with a valid resetTime: if that reset occurred after the failure and <= now, the window has reset!
           if (!Number.isNaN(resetAt) && resetAt <= now && (cooldownSetAt === 0 || resetAt >= cooldownSetAt)) {
@@ -135,8 +140,8 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
             return true
           }
           return false
-        }),
-      )
+        })
+      })
       if (allWindowsHealthy) {
         expired = true
       }

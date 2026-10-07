@@ -1965,17 +1965,16 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
     const timer = setInterval(tick, POOL_POLL_INTERVAL_MS)
     return () => { clearInterval(timer) }
   }, [rpc])
+  const activeKey = accounts.find((a) => a.active)?.email ?? accounts.find((a) => a.active)?.index
   useEffect(() => {
     // Only on the tab that shows them, and after the rows exist so the merge has
     // something to write into.
     //
-    // TTL-respecting (no `force`): this fires on mount and whenever the account
-    // COUNT changes, and neither is a request for fresh numbers. Note the
-    // dependency is the LENGTH, so a plain `refresh()` — which replaces the
-    // array without changing its length — does not re-run this. That is why the
-    // toolbar's Refresh calls `refreshAll` rather than relying on this effect.
+    // TTL-respecting (no `force`): this fires on mount, whenever the account
+    // COUNT changes, or when the ACTIVE account changes (so switching active
+    // account automatically loads that account's cached limits).
     if (tab === 'accounts' && accounts.length > 0) void loadLimits()
-  }, [tab, accounts.length, loadLimits])
+  }, [tab, accounts.length, activeKey, loadLimits])
 
   /**
    * The toolbar's Refresh: reload the page AND force the quota windows.
