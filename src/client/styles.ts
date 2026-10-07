@@ -297,34 +297,28 @@ const CSS = `
 
 /* ── 5h / weekly limits ────────────────────────────────────────────────────
    One group per upstream group (Gemini, Claude+GPT), each with its windows.
-   The rows are a fixed 4-column grid so the bars and the percentages line up
-   across groups: label / bar / percentage / reset countdown. */
-.agy-limits { display: flex; flex-direction: column; gap: 10px; padding: 4px 0; }
+   Stacked 2-tier layout:
+     Top: label (left) and countdown + percentage (right)
+     Bottom: full-width progress bar track */
+.agy-limits { display: flex; flex-direction: column; gap: 12px; padding: 4px 0; }
 .agy-limit-age { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
-.agy-limit-group { display: flex; flex-direction: column; gap: 2px; }
+.agy-limit-group { display: flex; flex-direction: column; gap: 8px; }
 .agy-limit-group-name {
   font: var(--dsw-font-xxs-strong-12); color: var(--dsw-alias-label-secondary, #61666b);
   padding-bottom: 2px;
 }
-.agy-limit-row {
-  display: grid; grid-template-columns: 58px minmax(0,1fr) 40px minmax(0,auto);
-  align-items: center; gap: 10px; padding: 4px 0;
-  font: var(--dsw-font-xxs-12);
-}
-.agy-limit-k { color: var(--dsw-alias-label-secondary, #61666b); }
-.agy-limit-track { height: 6px; border-radius: 3px; overflow: hidden;
+.agy-limit-item { display: flex; flex-direction: column; gap: 6px; padding: 2px 0; }
+.agy-limit-header { display: flex; justify-content: space-between; align-items: center; font: var(--dsw-font-xxs-12); }
+.agy-limit-k { color: var(--dsw-alias-label-secondary, #61666b); font-weight: 500; }
+.agy-limit-status { display: flex; align-items: center; gap: 8px; }
+.agy-limit-reset { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
+.agy-limit-p { font-variant-numeric: tabular-nums; font-weight: 600; }
+.agy-limit-track { width: 100%; height: 5px; border-radius: 3px; overflow: hidden;
   background: var(--dsw-alias-border-l2, rgba(0,0,0,.12)); }
-.agy-limit-track i { display: block; height: 100%; border-radius: 3px; }
-.agy-limit-p { text-align: right; font-variant-numeric: tabular-nums;
-  color: var(--dsw-alias-label-primary, #1f2329); }
-.agy-limit-reset { text-align: right; font: var(--dsw-font-xxxs-11);
-  color: var(--dsw-alias-label-tertiary, #8f959e); }
-/* The burn projection: indented to align with the bar (58px label + 10px gap),
-   warn-tinted because "this window runs dry before it resets" is the one
-   projection that asks the reader to act. */
-.agy-limit-burn { padding: 0 0 4px 68px;
-  font: var(--dsw-font-xxxs-11);
-  color: var(--dsw-alias-state-warn-primary, #f59e0b); }
+.agy-limit-track i { display: block; height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+/* The burn projection: warn-tinted because "this window runs dry before it resets"
+   is the one projection that asks the reader to act. */
+.agy-limit-burn { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-state-warn-primary, #f59e0b); }
 
 /* ── Dense breakdown tables (Usage tab only) ─────────────────────────────── */
 .agy-table-wrap { padding: 6px 0 2px; }

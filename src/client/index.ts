@@ -747,20 +747,20 @@ function LimitsCard(props: {
               : (new Date(window.resetTime).getTime() - now) / HOUR_MS
             const exhaustsFirst = hoursLeft !== null && resetHours !== null
               && hoursLeft < resetHours
-            return h('div', { key: window.bucketId },
-              h('div', { className: 'agy-limit-row' },
+            return h('div', { key: window.bucketId, className: 'agy-limit-item' },
+              h('div', { className: 'agy-limit-header' },
                 h('span', { className: 'agy-limit-k' }, windowLabel(window.window, t)),
-                h('span', { className: 'agy-limit-track' },
-                  fraction === null
-                    ? null
-                    : h('i', { style: { width: `${Math.round(fraction * 100)}%`, background: quotaColor(fraction) } })),
-                // An unreported fraction is an em dash, never "0%": unknown
-                // headroom and no headroom are opposite facts. A dedicated key
-                // rather than reusing `noProject`, whose NAME would then be wrong
-                // for the value it renders.
-                h('span', { className: 'agy-limit-p' }, fraction === null ? t('valueUnknown') : `${Math.round(fraction * 100)}%`),
-                h('span', { className: 'agy-limit-reset' },
-                  window.resetTime === null ? null : untilText(window.resetTime, t, now))),
+                h('div', { className: 'agy-limit-status' },
+                  window.resetTime === null ? null : h('span', { className: 'agy-limit-reset' }, untilText(window.resetTime, t, now)),
+                  h('span', {
+                    className: 'agy-limit-p',
+                    style: fraction === null ? undefined : { color: quotaColor(fraction) },
+                  }, fraction === null ? t('valueUnknown') : `${Math.round(fraction * 100)}%`),
+                )),
+              h('div', { className: 'agy-limit-track' },
+                fraction === null
+                  ? null
+                  : h('i', { style: { width: `${Math.round(fraction * 100)}%`, background: quotaColor(fraction) } })),
               exhaustsFirst
                 ? h('div', { className: 'agy-limit-burn' },
                   t('limitBurnWarn', { value: burnHorizon(hoursLeft!, t) }))
