@@ -716,8 +716,9 @@ function LimitsCard(props: {
   account: AccountView
   now: number
   t: T
+  onRefresh?: (index: number) => void
 }): ReactNode {
-  const { account, now, t } = props
+  const { account, now, t, onRefresh } = props
   return card(t('limitsTitle'),
     account.limits === null || account.limits.length === 0
       ? h('div', { className: 'agy-empty' }, t('limitsUnavailable'))
@@ -765,7 +766,8 @@ function LimitsCard(props: {
                 ? h('div', { className: 'agy-limit-burn' },
                   t('limitBurnWarn', { value: burnHorizon(hoursLeft!, t) }))
                 : null)
-          })))))
+          })))),
+    onRefresh ? button(t('refresh'), () => { onRefresh(account.index) }, { size: 'sm' }) : undefined)
 }
 
 /**
@@ -811,8 +813,9 @@ export function AccountsTab(props: {
   /** UI language for locale-sensitive date formatting ('zh' | 'en'). */
   lang?: string
   t: T
+  onRefreshLimits?: (index: number) => void
 }): ReactNode {
-  const { accounts, busy, handlers, t } = props
+  const { accounts, busy, handlers, t, onRefreshLimits } = props
   const [selected, setSelected] = useState<number | null>(null)
   const selectedRef = useRef<HTMLDivElement | null>(null)
   // One clock reading per render: the row metas' relative "active N ago"
@@ -916,7 +919,12 @@ export function AccountsTab(props: {
               liveLine,
               h('div', { className: 'agy-rows' }, ...rows)),
             `${accounts.length}`),
-          current === undefined ? null : h(LimitsCard, { account: current, now, t })),
+          current === undefined ? null : h(LimitsCard, {
+            account: current,
+            now,
+            t,
+            onRefresh: onRefreshLimits ? () => { onRefreshLimits(current.index) } : undefined,
+          })),
         // `key` remounts the detail per account so its proxy draft cannot carry
         // over: without it React reuses the instance and a draft typed for one
         // account was still in the box after selecting another, one Save away
@@ -1914,9 +1922,12 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
    * @param report - whether to surface the outcome. Set only when the user asked
    *   for the refresh, since an automatic one must stay silent.
    */
-  const loadLimits = useCallback(async (force = false, report = false) => {
+  const loadLimits = useCallback(async (force = false, report = false, index?: number) => {
     try {
-      const result = await rpc.call('account.limits', force ? { force: true } : {})
+      const payload: { force?: boolean, index?: number } = {}
+      if (force) payload.force = true
+      if (typeof index === 'number') payload.index = index
+      const result = await rpc.call('account.limits', payload)
       if (!alive.current) return
       const byIndex = new Map(result.limits.map((entry) => [entry.index, entry]))
       setAccounts((current) => current.map((account) => {
@@ -2185,7 +2196,16 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
     }, label, count === undefined ? null : h('span', { className: 'agy-count' }, String(count)))
 
   const body = tab === 'accounts'
-    ? h(AccountsTab, { accounts, busy, busyNow: poolBusy, handlers, lang: props.lang, rpc, t })
+    ? h(AccountsTab, {
+      accounts,
+      busy,
+      busyNow: poolBusy,
+      handlers,
+      lang: props.lang,
+      rpc,
+      t,
+      onRefreshLimits: (index: number) => { void loadLimits(true, true, index) },
+    })
     : tab === 'models'
       ? modelError === undefined
         ? h(ModelsTab, {
