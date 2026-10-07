@@ -1914,12 +1914,9 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
    * @param report - whether to surface the outcome. Set only when the user asked
    *   for the refresh, since an automatic one must stay silent.
    */
-  const loadLimits = useCallback(async (force = false, report = false, index?: number) => {
+  const loadLimits = useCallback(async (force = false, report = false) => {
     try {
-      const payload: { force?: boolean, index?: number } = {}
-      if (force) payload.force = true
-      if (typeof index === 'number') payload.index = index
-      const result = await rpc.call('account.limits', payload)
+      const result = await rpc.call('account.limits', force ? { force: true } : {})
       if (!alive.current) return
       const byIndex = new Map(result.limits.map((entry) => [entry.index, entry]))
       setAccounts((current) => current.map((account) => {

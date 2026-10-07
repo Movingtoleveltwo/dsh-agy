@@ -617,19 +617,16 @@ export class AgySessionManager {
    */
   async refreshLimits(
     storage: AccountStorageV4,
-    options: { force?: boolean; accountIndex?: number } = {},
+    options: { force?: boolean } = {},
   ): Promise<LimitsRefreshResult> {
     const now = Date.now()
     // Pure manual mode (mirroring v0.2.5 custom behavior): strictly probe ONLY
-    // the active account (or explicitly specified accountIndex). Never fan-out
-    // to all pool accounts concurrently to avoid multi-account IP correlation.
+    // the active account. Never fan-out to all pool accounts concurrently to avoid
+    // multi-account IP correlation.
     const activeIdx = typeof storage.activeIndex === 'number' && storage.activeIndex >= 0 && storage.activeIndex < storage.accounts.length
       ? storage.activeIndex
       : 0
-    const targetIdx = typeof options.accountIndex === 'number' && options.accountIndex >= 0 && options.accountIndex < storage.accounts.length
-      ? options.accountIndex
-      : activeIdx
-    const targetAccount = storage.accounts[targetIdx]
+    const targetAccount = storage.accounts[activeIdx]
     const candidates = targetAccount && targetAccount.enabled !== false ? [targetAccount] : []
     const targets = options.force === true
       ? candidates
