@@ -360,9 +360,17 @@ function untilText(iso: string | null, t: T, now: number): string {
   const value = diff < HOUR_MS
     ? t('relMinutes', { n: Math.floor(diff / MINUTE_MS) })
     : diff < DAY_MS
-      ? t('relHours', { n: Math.floor(diff / HOUR_MS) })
+      ? (() => {
+          const h = Math.floor(diff / HOUR_MS)
+          const m = Math.floor((diff % HOUR_MS) / MINUTE_MS)
+          return m > 0 ? t('relHoursMinutes', { h, m }) : t('relHours', { n: h })
+        })()
       : diff < 30 * DAY_MS
-        ? t('relDays', { n: Math.floor(diff / DAY_MS) })
+        ? (() => {
+            const d = Math.floor(diff / DAY_MS)
+            const h = Math.floor((diff % DAY_MS) / HOUR_MS)
+            return h > 0 ? t('relDaysHours', { d, h }) : t('relDays', { n: d })
+          })()
         : diff < 365 * DAY_MS
           ? t('relMonths', { n: Math.floor(diff / (30 * DAY_MS)) })
           : t('relYears', { n: Math.floor(diff / (365 * DAY_MS)) })

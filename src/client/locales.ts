@@ -102,7 +102,7 @@ export const zh = {
   latencyAverage: '平均 {value}',
   latencyTtft: '首 token {value}',
   sourcesSummary: '对话 {chat} · CLI {cli} · 验证 {verify} · 测试 {test}',
-  quotaResetIn: '将在 {value} 后重置',
+  quotaResetIn: '将在 {value}后重置',
   quotaResetPassed: '重置周期已过',
   quotaResetSoon: '即将重置',
   relJustNow: '刚刚',
@@ -110,7 +110,9 @@ export const zh = {
   relAgo: '{value}前',
   relMinutes: '{n} 分钟',
   relHours: '{n} 小时',
+  relHoursMinutes: '{h} 小时 {m} 分钟',
   relDays: '{n} 天',
+  relDaysHours: '{d} 天 {h} 小时',
   relMonths: '{n} 个月',
   relYears: '{n} 年',
 
@@ -315,7 +317,9 @@ export const en: Record<AgyLocaleKey, string> = {
   relAgo: '{value} ago',
   relMinutes: '{n} min',
   relHours: '{n} h',
+  relHoursMinutes: '{h} h {m} min',
   relDays: '{n} d',
+  relDaysHours: '{d} d {h} h',
   relMonths: '{n} mo',
   relYears: '{n} y',
 
