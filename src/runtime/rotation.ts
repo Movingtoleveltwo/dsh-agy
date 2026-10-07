@@ -122,12 +122,13 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
     const measuredAfterFailure = typeof account.cachedLimits.updatedAt === 'number' && account.cachedLimits.updatedAt >= cooldownSetAt
 
     if (hasWindows) {
-      // Every window across all groups must affirmatively establish availability or elapsed reset
+      // Every group must have both 5h and weekly windows present, and every window
+      // across all groups must affirmatively establish availability or elapsed reset
       const allWindowsHealthy = groups.every((group) => {
         const has5h = group.windows.some((w) => w.window === '5h')
         const hasWeekly = group.windows.some((w) => w.window === 'weekly')
-        // If 5h is present, weekly must also be present to prove full quota health (avoid partial-snapshot bypass)
-        if (has5h && !hasWeekly) return false
+        // Both 5h and weekly must be present to prove full quota health (avoid partial-snapshot bypass)
+        if (!has5h || !hasWeekly) return false
 
         return group.windows.every((w) => {
           const resetAt = w.resetTime ? Date.parse(w.resetTime) : Number.NaN
