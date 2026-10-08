@@ -88,6 +88,43 @@ export function stripTrailingModelTurn(contents: AgyContent[]): AgyContent[] {
 }
 
 /**
+ * Compacted/OpenAI histories need not start at a user turn. Normalize only
+ * Gemini here: Claude has a separate prefill/empty-part contract. Merge role
+ * runs first so parallel tool replies remain one response turn. An orphaned
+ * reply is retained as context text, never paired with an invented tool call.
+ */
+function normalizeGeminiContents(contents: AgyContent[]): AgyContent[] {
+  const turns: AgyContent[] = []
+  for (const content of contents) {
+    const previous = turns.at(-1)
+    if (previous?.role === content.role) previous.parts.push(...content.parts)
+    else turns.push({ role: content.role, parts: [...content.parts] })
+  }
+  if (turns.length === 0) return [{ role: 'user', parts: [{ text: '' }] }]
+  if (turns[0]?.role === 'model') {
+    turns.unshift({ role: 'user', parts: [{ text: '[Context continuation]' }] })
+  }
+  for (let i = 0; i < turns.length; i++) {
+    const turn = turns[i]!
+    if (turn.role !== 'user') continue
+    const calls = new Map<string, string>()
+    for (const part of turns[i - 1]?.parts ?? []) {
+      if ('functionCall' in part) calls.set(part.functionCall.id, part.functionCall.name)
+    }
+    turn.parts = turn.parts.map((part) => {
+      if (!('functionResponse' in part)) return part
+      const response = part.functionResponse
+      if (calls.get(response.id) === response.name) {
+        calls.delete(response.id)
+        return part
+      }
+      return { text: `[Tool result from earlier context] ${JSON.stringify(response)}` }
+    })
+  }
+  return turns
+}
+
+/**
  * The Antigravity backend parses tool `parameters` as a strict protobuf
  * schema and rejects ANY unknown keyword with 400 (verified empirically:
  * `$schema`, `propertyNames`, `pattern`, `minLength`, ... each fail in turn).
@@ -464,6 +501,8 @@ export function toAgyRequestBody(
     .filter((c): c is AgyContent => c !== null)
   if (claude) {
     contents = stripTrailingModelTurn(contents)
+  } else {
+    contents = normalizeGeminiContents(contents)
   }
 
   // `options.system` is the one-shot channel and is undefined for a loop-built

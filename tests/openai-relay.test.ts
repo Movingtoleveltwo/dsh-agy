@@ -15,6 +15,7 @@ import {
   translateOpenAiMessages,
   translateOpenAiTools,
 } from '../src/web/openai-relay.ts'
+import { toAgyRequestBody } from '../src/adapter/translate.ts'
 import type { AgyAdapter } from '../src/adapter/adapter.ts'
 
 describe('ToolSlotTracker', () => {
@@ -935,5 +936,85 @@ describe('OpenAI Relay HTTP endpoints', () => {
     } finally {
       server2.close()
     }
+  })
+})
+
+
+describe('OpenAI history to Gemini turn normalization', () => {
+  const call = (id: string) => ({
+    id, type: 'function', function: { name: 'lookup', arguments: '{"q":"test"}' },
+  })
+  const assistant = { role: 'assistant', content: null, tool_calls: [call('a')] }
+  const reply = { role: 'tool', tool_call_id: 'a', content: 'result' }
+  function request(messages: unknown[]) {
+    return toAgyRequestBody({
+      provider: 'agy', model: 'gemini-3.6-flash-high',
+      messages: translateOpenAiMessages(messages),
+    } as GenerateOptions, {}).request
+  }
+
+  it('repairs Hermes compaction leaving a leading assistant tool call', () => {
+    const { contents } = request([{ role: 'system', content: 'system' }, assistant, reply])
+    expect(contents.map(c => c.role)).toEqual(['user', 'model', 'user'])
+    expect(contents[0].parts).toEqual([{ text: '[Context continuation]' }])
+    expect(contents[1].parts[0]).toMatchObject({ functionCall: { id: 'a', name: 'lookup' } })
+    expect(contents[2].parts[0]).toMatchObject({ functionResponse: { id: 'a', name: 'lookup' } })
+  })
+
+  it('repairs a leading assistant text turn without discarding it', () => {
+    expect(request([{ role: 'assistant', content: 'summary' }]).contents).toEqual([
+      { role: 'user', parts: [{ text: '[Context continuation]' }] },
+      { role: 'model', parts: [{ text: 'summary' }] },
+    ])
+  })
+
+  it('preserves orphan tool results as user context, not unmatched responses', () => {
+    const { contents } = request([reply, assistant])
+    expect(contents.map(c => c.role)).toEqual(['user', 'model'])
+    expect(contents[0].parts[0]).toMatchObject({ text: expect.stringContaining('result') })
+    expect(contents[0].parts[0]).not.toHaveProperty('functionResponse')
+  })
+
+  it('supplies an empty user placeholder for system-only and empty histories', () => {
+    const system = request([{ role: 'system', content: 'instructions' }])
+    expect(system.systemInstruction).toEqual({ parts: [{ text: 'instructions' }] })
+    expect(system.contents).toEqual([{ role: 'user', parts: [{ text: '' }] }])
+    expect(request([]).contents).toEqual(system.contents)
+  })
+
+  it('leaves regular user/model/tool conversations unchanged', () => {
+    const { contents } = request([
+      { role: 'user', content: 'question' }, assistant, reply,
+      { role: 'assistant', content: 'answer' }, { role: 'user', content: 'next' },
+    ])
+    expect(contents.map(c => c.role)).toEqual(['user', 'model', 'user', 'model', 'user'])
+    expect(contents[0].parts).toEqual([{ text: 'question' }])
+    expect(contents[2].parts[0]).toMatchObject({ functionResponse: { id: 'a', name: 'lookup' } })
+    expect(contents[3].parts).toEqual([{ text: 'answer' }])
+    expect(contents[4].parts).toEqual([{ text: 'next' }])
+  })
+
+  it('coalesces consecutive roles and parallel tool responses in order', () => {
+    const { contents } = request([
+      { role: 'user', content: 'first' }, { role: 'user', content: 'second' },
+      { role: 'assistant', content: 'thinking' },
+      { ...assistant, tool_calls: [call('a'), call('b')] },
+      reply, { role: 'tool', tool_call_id: 'b', content: 'second result' },
+    ])
+    expect(contents.map(c => c.role)).toEqual(['user', 'model', 'user'])
+    expect(contents[0].parts).toEqual([{ text: 'first' }, { text: 'second' }])
+    expect(contents[1].parts).toHaveLength(3)
+    expect(contents[2].parts).toHaveLength(2)
+    expect(contents[2].parts.every(p => 'functionResponse' in p)).toBe(true)
+  })
+
+  it('does not match stale or duplicate results against an earlier call', () => {
+    const { contents } = request([
+      { role: 'user', content: 'question' }, assistant, reply, reply,
+      { role: 'assistant', content: 'done' }, reply,
+    ])
+    expect(contents[2].parts[0]).toHaveProperty('functionResponse')
+    expect(contents[2].parts[1]).toHaveProperty('text')
+    expect(contents[4].parts[0]).toHaveProperty('text')
   })
 })
