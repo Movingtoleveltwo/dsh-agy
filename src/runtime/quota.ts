@@ -582,6 +582,7 @@ export function isFamilyQuotaExhausted(account: ManagedAccount, family?: ModelFa
   if (account.cooldownReason === 'quota-exhausted' && (account.coolingDownUntil ?? 0) > now) {
     return true
   }
+  if (isQuotaStale(account, now)) return false
   const quota = familyQuotaFor(account, family)
   if (!quota) return false
   const spent = (fraction: number | undefined, resetTime: string | undefined, threshold = 0): boolean => {

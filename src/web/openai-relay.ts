@@ -354,16 +354,31 @@ async function handleStreamingCompletion(
   let headersSent = false
 
   try {
-    const streamIter = adapter.stream(options)[Symbol.asyncIterator]()
+    let streamIter: AsyncIterator<StreamChunk> | undefined
+    let firstResult: IteratorResult<StreamChunk> | undefined
+    const maxRelayAttempts = 2
 
-    // Deferred header pattern: await the first chunk before committing HTTP 200 headers.
-    // If upstream rejects before yielding (e.g. 401 unauthenticated, 429 quota, 400 invalid model),
-    // handleError sends a proper JSON error response with correct HTTP status code.
-    let firstResult: IteratorResult<StreamChunk>
-    try {
-      firstResult = await streamIter.next()
-    } catch (initialError) {
-      handleError(res, initialError)
+    for (let attempt = 0; attempt < maxRelayAttempts; attempt++) {
+      try {
+        const iter = adapter.stream(options)[Symbol.asyncIterator]()
+        const first = await iter.next()
+        streamIter = iter
+        firstResult = first
+        break
+      } catch (initialError) {
+        const isQuotaOrRateLimit = initialError instanceof LlmError &&
+          (initialError.code === 'RATE_LIMIT' || initialError.code === 'QUOTA_EXCEEDED' || initialError.code === 'QUOTA')
+        if (attempt === 0 && isQuotaOrRateLimit) {
+          logger?.warn?.('[dsh-agy relay] upstream rate-limited/quota-exhausted on initial attempt, failing over to next sequential account')
+          continue
+        }
+        handleError(res, initialError)
+        return
+      }
+    }
+
+    if (!streamIter || !firstResult) {
+      handleError(res, new Error('Relay stream failed to initialize'))
       return
     }
 
@@ -549,90 +564,101 @@ async function handleNonStreamingCompletion(
   modelName: string,
   _body: OpenAiChatCompletionBody,
 ): Promise<void> {
-  const completionId = `chatcmpl-${randomUUID()}`
-  const created = Math.floor(Date.now() / 1000)
+  const maxRelayAttempts = 2
 
-  let content = ''
-  let reasoningContent = ''
-  const toolSlotTracker = new ToolSlotTracker()
-  const toolCallsByIndex = new Map<number, { id: string; type: 'function'; function: { name: string; arguments: string } }>()
-  let finishReason: string = 'stop'
-  let lastUsage: TokenUsage | undefined
+  for (let attempt = 0; attempt < maxRelayAttempts; attempt++) {
+    const completionId = `chatcmpl-${randomUUID()}`
+    const created = Math.floor(Date.now() / 1000)
 
-  try {
-    for await (const chunk of adapter.stream(options)) {
-      if (res.writableEnded || options.signal?.aborted) break
+    let content = ''
+    let reasoningContent = ''
+    const toolSlotTracker = new ToolSlotTracker()
+    const toolCallsByIndex = new Map<number, { id: string; type: 'function'; function: { name: string; arguments: string } }>()
+    let finishReason: string = 'stop'
+    let lastUsage: TokenUsage | undefined
 
-      if (chunk.type === 'text-delta') {
-        content += chunk.text
-      } else if (chunk.type === 'reasoning-delta') {
-        reasoningContent += chunk.text
-      } else if (chunk.type === 'tool-call-delta') {
-        const { index: slotIndex, id: slotId } = toolSlotTracker.getSlot({
-          index: chunk.index,
-          id: chunk.id ? String(chunk.id) : undefined,
-        })
-        let tc = toolCallsByIndex.get(slotIndex)
-        if (!tc) {
-          tc = {
-            id: slotId,
-            type: 'function',
-            function: {
-              name: chunk.name ?? '',
-              arguments: '',
-            },
+    try {
+      for await (const chunk of adapter.stream(options)) {
+        if (res.writableEnded || options.signal?.aborted) break
+
+        if (chunk.type === 'text-delta') {
+          content += chunk.text
+        } else if (chunk.type === 'reasoning-delta') {
+          reasoningContent += chunk.text
+        } else if (chunk.type === 'tool-call-delta') {
+          const { index: slotIndex, id: slotId } = toolSlotTracker.getSlot({
+            index: chunk.index,
+            id: chunk.id ? String(chunk.id) : undefined,
+          })
+          let tc = toolCallsByIndex.get(slotIndex)
+          if (!tc) {
+            tc = {
+              id: slotId,
+              type: 'function',
+              function: {
+                name: chunk.name ?? '',
+                arguments: '',
+              },
+            }
+            toolCallsByIndex.set(slotIndex, tc)
           }
-          toolCallsByIndex.set(slotIndex, tc)
+          if (chunk.name && !tc.function.name) {
+            tc.function.name = chunk.name
+          }
+          tc.function.arguments += chunk.argumentsDelta
+        } else if (chunk.type === 'usage') {
+          lastUsage = chunk.usage
+        } else if (chunk.type === 'finish') {
+          finishReason = mapFinishReason(chunk.reason, toolSlotTracker.size > 0)
         }
-        if (chunk.name && !tc.function.name) {
-          tc.function.name = chunk.name
-        }
-        tc.function.arguments += chunk.argumentsDelta
-      } else if (chunk.type === 'usage') {
-        lastUsage = chunk.usage
-      } else if (chunk.type === 'finish') {
-        finishReason = mapFinishReason(chunk.reason, toolSlotTracker.size > 0)
       }
-    }
 
-    const toolCalls = Array.from(toolCallsByIndex.entries())
-      .sort(([a], [b]) => a - b)
-      .map(([, tc]) => tc)
+      const toolCalls = Array.from(toolCallsByIndex.entries())
+        .sort(([a], [b]) => a - b)
+        .map(([, tc]) => tc)
 
-    const message: {
-      role: string
-      content: string | null
-      reasoning_content?: string
-      tool_calls?: typeof toolCalls
-    } = {
-      role: 'assistant',
-      content: content.length > 0 ? content : (toolCalls.length > 0 ? null : ''),
-    }
-    if (reasoningContent.length > 0) {
-      message.reasoning_content = reasoningContent
-    }
-    if (toolCalls.length > 0) {
-      message.tool_calls = toolCalls
-    }
+      const message: {
+        role: string
+        content: string | null
+        reasoning_content?: string
+        tool_calls?: typeof toolCalls
+      } = {
+        role: 'assistant',
+        content: content.length > 0 ? content : (toolCalls.length > 0 ? null : ''),
+      }
+      if (reasoningContent.length > 0) {
+        message.reasoning_content = reasoningContent
+      }
+      if (toolCalls.length > 0) {
+        message.tool_calls = toolCalls
+      }
 
-    const response = {
-      id: completionId,
-      object: 'chat.completion',
-      created,
-      model: modelName,
-      choices: [
-        {
-          index: 0,
-          message,
-          finish_reason: finishReason,
-        },
-      ],
-      usage: formatUsage(lastUsage),
-    }
+      const response = {
+        id: completionId,
+        object: 'chat.completion',
+        created,
+        model: modelName,
+        choices: [
+          {
+            index: 0,
+            message,
+            finish_reason: finishReason,
+          },
+        ],
+        usage: formatUsage(lastUsage),
+      }
 
-    sendJson(res, 200, response)
-  } catch (error) {
-    handleError(res, error)
+      sendJson(res, 200, response)
+      return
+    } catch (error) {
+      const isQuotaOrRateLimit = error instanceof LlmError &&
+        (error.code === 'RATE_LIMIT' || error.code === 'QUOTA_EXCEEDED' || error.code === 'QUOTA')
+      if (attempt === 0 && isQuotaOrRateLimit) {
+        continue
+      }
+      handleError(res, error)
+      return
+    }
   }
 }
 

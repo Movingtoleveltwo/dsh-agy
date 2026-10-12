@@ -14,6 +14,8 @@ import {
   MAX_IN_FLIGHT_PER_ACCOUNT,
   MAX_RATE_LIMIT_COOLDOWN_MS,
   RATE_LIMIT_COOLDOWN_MS,
+  WEEKLY_QUOTA_THRESHOLD,
+  clearExpiredState,
   decideRotation,
   isCoolingDown,
   isFamilyRateLimited,
@@ -774,23 +776,136 @@ export class AgySessionManager {
   }
 
   /**
-   * Pick the account for one request: the affinity pin wins while it is fresh,
-   * healthy, and not quota-exhausted for the requested model; the explicitly
-   * activated account wins next while it is usable; otherwise the pool is
-   * ranked by family-scoped usage (OMP-aligned) and the best candidate wins.
+   * Sequentially inspect accounts starting after `currentIndex` in circular order.
+   * Returns the first enabled account that is not cooling down, not family rate-limited,
+   * and not family quota-exhausted.
+   */
+  private pickNextSequentialAccount(
+    storage: AccountStorageV4,
+    currentIndex: number,
+    now: number,
+    model?: string,
+  ): { account: ManagedAccount; index: number } | undefined {
+    if (storage.accounts.length === 0) return undefined
+    const family = modelFamilyOf(model)
+    const familyKey = familyKeyOf(model)
+
+    const isUsable = (acc: ManagedAccount | undefined): acc is ManagedAccount =>
+      acc !== undefined &&
+      acc.enabled !== false &&
+      !isCoolingDown(acc, now) &&
+      !isFamilyRateLimited(acc, familyKey, now) &&
+      !isFamilyQuotaExhausted(acc, family, now)
+
+    const total = storage.accounts.length
+    for (let offset = 1; offset < total; offset++) {
+      const idx = (currentIndex + offset) % total
+      const candidate = storage.accounts[idx]
+      if (isUsable(candidate)) {
+        return { account: candidate!, index: idx }
+      }
+    }
+    return undefined
+  }
+
+  /**
+   * Pick the account for one request:
+   * 1. Prioritize active account (storage.activeIndex) as long as it is usable.
+   * 2. If active account is in cooldown/rate-limited/exhausted, sequentially advance
+   *    to the next usable account in circular order (A -> B -> C -> A) and update activeIndex.
+   * 3. If all enabled accounts are temporarily blocked, throw AgyPoolBlockedError.
    */
   private async pickAccount(
     storage: AccountStorageV4,
-    _model?: string,
-    _conversationKey?: string,
+    model?: string,
+    conversationKey?: string,
   ): Promise<{ account: ManagedAccount; index: number } | undefined> {
+    const now = Date.now()
+    for (const account of storage.accounts) clearExpiredState(account, now)
+
+    const family = modelFamilyOf(model)
+    const familyKey = familyKeyOf(model)
+
+    const isUsable = (acc: ManagedAccount | undefined): acc is ManagedAccount =>
+      acc !== undefined &&
+      acc.enabled !== false &&
+      !isCoolingDown(acc, now) &&
+      !isFamilyRateLimited(acc, familyKey, now) &&
+      !isFamilyQuotaExhausted(acc, family, now)
+
+    const pinnedKey = this.affinityFor(conversationKey, now)
+    if (pinnedKey !== null) {
+      const pinnedIdx = storage.accounts.findIndex((a) => this.accountKey(a) === pinnedKey)
+      if (pinnedIdx !== -1) {
+        const pinned = storage.accounts[pinnedIdx]!
+        if (isUsable(pinned)) {
+          return { account: pinned, index: pinnedIdx }
+        }
+      }
+    }
+
+    const eligible = storage.accounts
+      .map((account, index) => ({ account, index }))
+      .filter(({ account }) => account.enabled !== false)
+    if (eligible.length === 0) return undefined
+
     const activeIdx = typeof storage.activeIndex === 'number' && storage.activeIndex >= 0 && storage.activeIndex < storage.accounts.length
       ? storage.activeIndex
       : 0
-    const account = storage.accounts[activeIdx]
-    if (!account) return undefined
-    if (account.enabled === false) return undefined
-    return { account, index: activeIdx }
+    const active = storage.accounts[activeIdx]
+
+    if (isUsable(active)) {
+      return { account: active, index: activeIdx }
+    }
+
+    // Active account is unusable. Find next sequential usable account:
+    const next = this.pickNextSequentialAccount(storage, activeIdx, now, model)
+    if (next) {
+      if (next.index !== storage.activeIndex) {
+        storage.activeIndex = next.index
+        await this.store.mutate((s) => {
+          s.activeIndex = next.index
+        }).catch(() => {})
+      }
+      return next
+    }
+
+    // All enabled accounts are unusable/blocked
+    const quotaExhausted = (account: ManagedAccount): { exhausted: boolean; resetMs?: number } => {
+      if (account.cooldownReason === 'quota-exhausted' && (account.coolingDownUntil ?? 0) > now) {
+        return { exhausted: true, resetMs: account.coolingDownUntil }
+      }
+      const quota = familyQuotaFor(account, family, now)
+      if (!quota) return { exhausted: false }
+      const spent = (fraction: number | undefined, resetTime: string | undefined, threshold = 0): number | undefined => {
+        if (typeof fraction !== 'number' || fraction > threshold || !resetTime) return undefined
+        return parseFutureResetMs(resetTime, now)
+      }
+      const r1 = spent(quota.remainingFraction, quota.resetTime, 0)
+      const r2 = spent(quota.weeklyFraction, quota.weeklyResetTime, WEEKLY_QUOTA_THRESHOLD)
+      if (r1 !== undefined || r2 !== undefined) {
+        const resetMs = Math.max(r1 ?? 0, r2 ?? 0)
+        return { exhausted: true, resetMs: resetMs > 0 ? resetMs : undefined }
+      }
+      return { exhausted: false }
+    }
+
+    const exhaustionMap = new Map(eligible.map((e) => [e.index, quotaExhausted(e.account)]))
+    const retryable = eligible.filter((e) => !exhaustionMap.get(e.index)?.exhausted)
+    const isExhaustedPool = retryable.length === 0
+    const candidates = isExhaustedPool ? eligible : retryable
+
+    const blockedTimes = candidates.map((e) => {
+      const qRes = exhaustionMap.get(e.index)
+      if (qRes?.resetMs && qRes.resetMs > now) return qRes.resetMs
+      if (e.account.coolingDownUntil && e.account.coolingDownUntil > now) return e.account.coolingDownUntil
+      const familyLimit = e.account.rateLimitResetTimes?.[familyKey]
+      if (familyLimit && familyLimit > now) return familyLimit
+      return now + 5 * 60 * 1000
+    })
+
+    const blockedUntil = Math.min(...blockedTimes)
+    throw new AgyPoolBlockedError(isExhaustedPool ? 'quota-exhausted' : 'retryable', blockedUntil)
   }
   /**
    * Adapter hook: resolve the active session (refresh if needed), healing a
@@ -1002,6 +1117,13 @@ export class AgySessionManager {
       if (decision.action === 'revoke') {
         this.tokenCache.delete(key)
         this.failureCounts.delete(key)
+        const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
+        const effectiveIndex = currentIndex >= 0 ? currentIndex : storage.activeIndex
+        const next = this.pickNextSequentialAccount(storage, effectiveIndex, Date.now())
+        if (next && next.index !== storage.activeIndex) {
+          storage.activeIndex = next.index
+          nextIndexToRotate = next.index
+        }
         this.clearAffinityForAccount(key)
         return
       }
@@ -1041,7 +1163,15 @@ export class AgySessionManager {
       }
 
       if (decision.action === 'rotate' || decision.action === 'cool') {
-        // Pure manual mode: do not automatically rotate activeIndex to another account.
+        const now = Date.now()
+        for (const a of storage.accounts) clearExpiredState(a, now)
+        const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
+        const effectiveIndex = currentIndex >= 0 ? currentIndex : storage.activeIndex
+        const next = this.pickNextSequentialAccount(storage, effectiveIndex, now, info?.model)
+        if (next && next.index !== storage.activeIndex) {
+          storage.activeIndex = next.index
+          nextIndexToRotate = next.index
+        }
         this.clearAffinityForAccount(key)
       }
     })

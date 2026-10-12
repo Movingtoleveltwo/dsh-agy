@@ -79,8 +79,7 @@ describe('AgySessionManager', () => {
     expect(session!.impersonation['X-Goog-Api-Client']).toBe('fixed-client')
   })
 
-  // Skipped: custom manual account mode intentionally preserves activeIndex on rate limit
-  it.skip('rotates the active index on rate-limit and creates a fingerprint', async () => {
+  it('rotates the active index on rate-limit and creates a fingerprint', async () => {
     stubTokenEndpoint()
     const a = account('a@x')
     const b = account('b@x')
@@ -179,8 +178,7 @@ describe('AgySessionManager', () => {
     expect(second!.index).toBe(1)
   })
 
-  // Skipped: custom manual account mode intentionally preserves activeIndex on quota exhaustion
-  it.skip('rotates active index on 429 quota_exhausted', async () => {
+  it('rotates active index on 429 quota_exhausted', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
     const rotations: string[] = []
@@ -364,8 +362,7 @@ describe('usage-driven selection', () => {
     }
   }
 
-  // Skipped: custom manual account mode does not auto-rotate pool candidates on quota exhaustion
-  it.skip('prioritizes the activated account while it has quota, and rotates when exhausted', async () => {
+  it('prioritizes the activated account while it has quota, and rotates when exhausted', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([
       quotaAccount('a@x', { google: { remainingFraction: 0.9 } }),
@@ -1214,8 +1211,7 @@ describe('usage-driven selection', () => {
     } satisfies Partial<AgyAuthError>)
   })
 
-  // Skipped: custom manual account mode routes to activeIndex directly without candidate pool blocking
-  it.skip('throws quota-exhausted AgyPoolBlockedError when all accounts are quota-exhausted', async () => {
+  it('throws quota-exhausted AgyPoolBlockedError when all accounts are quota-exhausted', async () => {
     stubTokenEndpoint()
     const resetAt = Date.now() + 12 * 60 * 60 * 1000
     const a = {
@@ -1238,8 +1234,7 @@ describe('usage-driven selection', () => {
     })
   })
 
-  // Skipped: custom manual account mode routes to activeIndex directly without candidate pool blocking
-  it.skip('classifies a weekly-decided block as quota-exhausted, not retryable', async () => {
+  it('classifies a weekly-decided block as quota-exhausted, not retryable', async () => {
     // The weekly window holds `rankPoolCandidates` back without touching
     // `remainingFraction`, so a pool blocked ONLY by the week was reported as
     // `retryable` — a path that ends at RATE_LIMIT plus a ~5-day
@@ -1668,4 +1663,78 @@ describe('fingerprint version freshness', () => {
       expect(probed[0]).toBe(await dispatcherForAsync(proxyUrl))
     })
   }, 5_000)
+
+  describe('sequential exhaust-and-shift relay (串行接力模式)', () => {
+    it('exhausts account sequentially A -> B -> C -> A and stays on active account even after previous account recovers', async () => {
+      stubTokenEndpoint()
+      const a = account('a@x')
+      const b = account('b@x')
+      const c = account('c@x')
+      const store = new InMemoryAccountStore(storage([a, b, c], 0))
+      const rotations: string[] = []
+      const sessions = new AgySessionManager({
+        store,
+        onRotate: (from, to) => rotations.push(`${from}->${to}`),
+      })
+
+      // 1. Initial turn picks active account 0 (A)
+      const s0 = await sessions.getSession()
+      expect(s0!.index).toBe(0)
+      expect((await store.load()).activeIndex).toBe(0)
+
+      // 2. Account 0 hits 429 quota exhaustion with a 5h reset
+      const resetTimeA = new Date(Date.now() + 5 * 3600 * 1000).toISOString()
+      await sessions.reportFailure('rate-limit', s0!, {
+        status: 429,
+        rateLimitCategory: 'quota_exhausted',
+        resetTime: resetTimeA,
+      })
+
+      // Rotated to B (1)
+      expect((await store.load()).activeIndex).toBe(1)
+      expect(rotations).toEqual(['0->1'])
+
+      // 3. Next turns use account 1 (B)
+      const s1 = await sessions.getSession()
+      expect(s1!.index).toBe(1)
+
+      // 4. Time passes: Account 0 (A) recovers (unfreezes)
+      await store.mutate((s) => {
+        s.accounts[0]!.coolingDownUntil = Date.now() - 1000 // expired
+        s.accounts[0]!.rateLimitResetTimes = undefined
+        s.accounts[0]!.cooldownReason = undefined
+      })
+
+      // Greedy retention check: Even though A is healthy again, system MUST STAY ON B (1)!
+      const s1Still = await sessions.getSession()
+      expect(s1Still!.index).toBe(1)
+      expect((await store.load()).activeIndex).toBe(1)
+
+      // 5. Account 1 (B) hits 429 quota exhaustion
+      await sessions.reportFailure('rate-limit', s1Still!, {
+        status: 429,
+        rateLimitCategory: 'quota_exhausted',
+      })
+
+      // Rotated to C (2)
+      expect((await store.load()).activeIndex).toBe(2)
+      expect(rotations).toEqual(['0->1', '1->2'])
+
+      const s2 = await sessions.getSession()
+      expect(s2!.index).toBe(2)
+
+      // 6. Account 2 (C) hits 429 quota exhaustion
+      await sessions.reportFailure('rate-limit', s2!, {
+        status: 429,
+        rateLimitCategory: 'quota_exhausted',
+      })
+
+      // Wraps around back to A (0) because A has unfrozen!
+      expect((await store.load()).activeIndex).toBe(0)
+      expect(rotations).toEqual(['0->1', '1->2', '2->0'])
+
+      const s0Recovered = await sessions.getSession()
+      expect(s0Recovered!.index).toBe(0)
+    })
+  })
 })

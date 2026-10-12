@@ -937,6 +937,57 @@ describe('OpenAI Relay HTTP endpoints', () => {
       server2.close()
     }
   })
+
+  it('fails over to next account attempt when first attempt hits 429 RATE_LIMIT before headers sent', async () => {
+    let callCount = 0
+    const failoverAdapter = {
+      stream: async function* () {
+        callCount++
+        if (callCount === 1) {
+          throw new LlmError('account 0 rate limited', 'RATE_LIMIT')
+        }
+        yield {
+          type: 'text-delta',
+          text: 'failover success from account 1',
+        } as StreamChunk
+        yield {
+          type: 'finish',
+          reason: { kind: 'stop' },
+        } as StreamChunk
+      },
+    } as unknown as AgyAdapter
+
+    const server = createServer(createOpenAiRelayHandler({ adapter: failoverAdapter }))
+    await new Promise<void>((resolve) => server.listen(0, resolve))
+    const port = (server.address() as { port: number }).port
+
+    try {
+      // 1. Streaming completion failover
+      const streamRes = await fetch(`http://127.0.0.1:${port}/agy/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'test' }], stream: true }),
+      })
+      expect(streamRes.status).toBe(200)
+      const streamText = await streamRes.text()
+      expect(streamText).toContain('failover success from account 1')
+      expect(callCount).toBe(2)
+
+      // 2. Non-streaming completion failover
+      callCount = 0
+      const nonStreamRes = await fetch(`http://127.0.0.1:${port}/agy/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'test' }], stream: false }),
+      })
+      expect(nonStreamRes.status).toBe(200)
+      const json = (await nonStreamRes.json()) as { choices: Array<{ message: { content: string } }> }
+      expect(json.choices[0].message.content).toBe('failover success from account 1')
+      expect(callCount).toBe(2)
+    } finally {
+      server.close()
+    }
+  })
 })
 
 
