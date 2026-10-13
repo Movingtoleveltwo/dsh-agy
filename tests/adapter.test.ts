@@ -86,7 +86,7 @@ describe('translate', () => {
       ]},
     ]
     const body = toAgyRequestBody(generateOptions({ messages }), {})
-    const parts = body.request.contents[1]!.parts
+    const parts = body.request.contents[0]!.parts
     expect(parts).toEqual([
       { thought: true, text: 'thinking...' },
       { text: 'answer' },
@@ -118,7 +118,7 @@ describe('translate', () => {
       ]},
     ]
     const body = toAgyRequestBody(generateOptions({ messages }), {})
-    expect(body.request.contents[1]!.parts).toEqual([{ text: 'answer' }])
+    expect(body.request.contents[0]!.parts).toEqual([{ text: 'answer' }])
   })
 
   it('throws instead of silently dropping an image missing from the resolved map', () => {
@@ -140,10 +140,10 @@ describe('translate', () => {
       ]},
     ]
     const body = toAgyRequestBody(generateOptions({ messages }), {})
-    expect(body.request.contents[1]!.parts).toEqual([
+    expect(body.request.contents[0]!.parts).toEqual([
       { thoughtSignature: 'skip_thought_signature_validator', functionCall: { id: 'call-1', name: 'web_search', args: { q: 'x' } } },
     ])
-    expect(body.request.contents[2]!.parts).toEqual([
+    expect(body.request.contents[1]!.parts).toEqual([
       { functionResponse: { id: 'call-1', name: 'web_search', response: { result: 'result!', is_error: false } } },
     ])
   })
@@ -191,10 +191,9 @@ describe('translate', () => {
       generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }),
       {},
     )
-    expect(body.request.contents.map((content) => content.role)).toEqual(['user', 'model', 'user'])
-    expect(body.request.contents[2]!.parts).toEqual([
+    expect(body.request.contents.map((content) => content.role)).toEqual(['model', 'user', 'user'])
+    expect(body.request.contents[1]!.parts).toEqual([
       { functionResponse: { id: 'call-1', name: 'web_search', response: { result: 'result!', is_error: false } } },
-      { text: 'thanks' },
     ])
   })
 
@@ -209,7 +208,7 @@ describe('translate', () => {
       generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }),
       {},
     )
-    expect(body.request.contents[2]!.parts).toEqual([
+    expect(body.request.contents[1]!.parts).toEqual([
       { functionResponse: { id: 'call-9', name: 'read', response: { result: 'boom', is_error: true } } },
     ])
   })
@@ -1022,7 +1021,7 @@ describe('translate', () => {
       ]},
     ]
     const body = toAgyRequestBody(generateOptions({ messages }), {})
-    const parts = body.request.contents[1]!.parts
+    const parts = body.request.contents[0]!.parts
     expect(parts).toEqual([
       { thoughtSignature: 'skip_thought_signature_validator', functionCall: { id: 'call-1', name: 'web_search', args: {} } },
       { thoughtSignature: 'skip_thought_signature_validator', functionCall: { id: 'call-2', name: 'read_file', args: { path: '/x' } } },
@@ -1038,7 +1037,7 @@ describe('translate', () => {
     const claude = toAgyRequestBody(generateOptions({ model: 'claude-opus-4-6-thinking', messages }), {})
     expect(claude.request.contents.map((c) => c.role)).toEqual(['model', 'user'])
     const gemini = toAgyRequestBody(generateOptions({ model: 'gemini-2.5-flash', messages }), {})
-    expect(gemini.request.contents.map((c) => c.role)).toEqual(['user', 'model', 'user', 'model'])
+    expect(gemini.request.contents.map((c) => c.role)).toEqual(['model', 'user', 'model'])
   })
 
   // Claude-family ceiling is 64000, not the Gemini 65536 the catalog pinned:
@@ -1224,7 +1223,7 @@ describe('parseAgySse', () => {
       ]},
     ]
     const body = toAgyRequestBody(generateOptions({ messages }), {})
-    expect(body.request.contents[1]!.parts).toEqual([
+    expect(body.request.contents[0]!.parts).toEqual([
       { thoughtSignature: 'sig-from-previous-turn', functionCall: { id: 'call-1', name: 'web_search', args: { q: 'x' } } },
     ])
   })
@@ -1540,12 +1539,12 @@ describe('models', () => {
     const ids = merged.map((m) => m.id)
     expect(ids).toContain('gemini-3.6-flash-high')
     expect(ids).not.toContain('tab_flash_lite_preview')
-    expect(merged.find((m) => m.id === 'gemini-3.6-flash-high')?.context?.contextWindow).toBe(200000)
+    expect(merged.find((m) => m.id === 'gemini-3.6-flash-high')?.context?.contextWindow).toBe(1048576)
     expect(merged.find((m) => m.id === 'some-new-model')?.name).toBe('New')
     // tiered model with raw id displayName is prettified from catalog / dynamic fallback
     expect(merged.find((m) => m.id === 'gemini-3.8-flash-tiered')?.name).toBe('Gemini 3.8 Flash')
     expect(merged.find((m) => m.id === 'gemini-3.9-flash-tiered')?.name).toBe('Gemini 3.9 Flash')
-    expect(merged.find((m) => m.id === 'gemini-3.9-flash-tiered')?.context?.contextWindow).toBe(200000)
+    expect(merged.find((m) => m.id === 'gemini-3.9-flash-tiered')?.context?.contextWindow).toBe(1048576)
   })
 
   it('hides ids upstream assigns to a non-chat role, including ids without a tab_ prefix', () => {
@@ -1780,7 +1779,7 @@ describe('models', () => {
     expect(dynamicTiered.name).toBe('Gemini 3.9 Flash')
     expect(dynamicTiered.reasoning).toBeDefined()
     expect(dynamicTiered.reasoning!.efforts.map((e) => String(e.id))).toEqual(['low', 'medium', 'high'])
-    expect(dynamicTiered.context?.contextWindow).toBe(200000)
+    expect(dynamicTiered.context?.contextWindow).toBe(1048576)
     expect(dynamicTiered.defaultMaxTokens).toBe(65536)
     expect(dynamicTiered.inputModalities).toEqual(['text', 'image'])
 

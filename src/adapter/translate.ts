@@ -669,6 +669,8 @@ export function toAgyRequestBody(
      * `thinkingLevel` — the tiered model's adaptive entry, given an explicit cap.
      */
     tieredBudgetFor?: () => number | undefined
+    /** Whether to normalize Gemini contents to satisfy turn-alternation constraints */
+    normalizeTurns?: boolean
   },
 ): AgyRequestBody {
   const messages = normalizeMessages(options.messages)
@@ -683,7 +685,7 @@ export function toAgyRequestBody(
   )
   if (claude) {
     contents = stripTrailingModelTurn(contents)
-  } else {
+  } else if (context.normalizeTurns) {
     contents = normalizeGeminiContents(contents)
   }
 

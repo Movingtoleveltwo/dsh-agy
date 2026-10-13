@@ -116,9 +116,9 @@ export function untilText(iso: string | null, t: QuotaTranslate, now: number): s
   const at = new Date(iso).getTime()
   if (Number.isNaN(at)) return '—'
   const diff = at - now
-  if (diff <= 0) return t('quotaResetPassed')
+  if (diff <= 0) return t('relNow')
   const value = diff < MINUTE_MS
-    ? t('quotaResetSoon')
+    ? t('relNow')
     : diff < HOUR_MS
       ? t('relMinutes', { n: Math.floor(diff / MINUTE_MS) })
       : diff < DAY_MS

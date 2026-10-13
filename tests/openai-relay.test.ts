@@ -1001,7 +1001,7 @@ describe('OpenAI history to Gemini turn normalization', () => {
     return toAgyRequestBody({
       provider: 'agy', model: 'gemini-3.6-flash-high',
       messages: translateOpenAiMessages(messages),
-    } as GenerateOptions, {}).request
+    } as GenerateOptions, { normalizeTurns: true }).request
   }
 
   it('repairs Hermes compaction leaving a leading assistant tool call', () => {
