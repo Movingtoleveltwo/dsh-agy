@@ -139,6 +139,19 @@ function normalizeGeminiContents(contents: AgyContent[]): AgyContent[] {
  * `["string","number"]` are rejected) and every `enum` item must be a
  * non-empty string (booleans/numbers/empty strings are rejected). Values are
  * normalized to the nearest valid form instead of being dropped wholesale.
+ *
+ * Schema SHAPE is constrained too: an `array` schema with no `items` is
+ * rejected outright — `GenerateContentRequest.tools[0].functionDeclarations
+ * [N].parameters.properties[steps].items: missing field` — because protobuf
+ * Schema has no "any item" form, so the field cannot be absent. JSON Schema
+ * itself allows it (DSH's enforced subset documents `items` as optional), and
+ * a hand-written tool parameter map drops it as easily as it writes it, so
+ * the sanitizer supplies `{"type":"string"}` for a missing `items` — the
+ * shape the register already declares by hand whenever an author spells it
+ * out (`{type:'array', items:{type:'string'}}`), and permissive in the same
+ * way a missing `items` is: the tool's own argument validation never depends
+ * on it. An `items` that EXISTS but carries no `type` is equally rejected, so
+ * a nested schema with neither `type` nor `properties` is typed `string` too.
  */
 // Exported for the contract invariant test (tests/adapter.test.ts); not part of
 // the package public API (translate.ts is an internal module).
@@ -149,6 +162,50 @@ export const AGY_SCHEMA_ALLOWLIST = new Set([
 const AGY_SCHEMA_MAP_KEYS = new Set(['properties'])
 const AGY_SCHEMA_NESTED_KEYS = new Set(['items', 'additionalProperties'])
 const AGY_SCHEMA_LIST_KEYS = new Set(['required', 'enum'])
+
+/** The item schema substituted for an `array` whose author declared no `items`. */
+const AGY_MISSING_ITEMS_SCHEMA: Record<string, unknown> = { type: 'string' }
+
+/**
+ * Give an `array` schema an `items` the protobuf parser accepts, and give a
+ * nested schema that declares neither `type` nor `properties` one it accepts
+ * (see the shape paragraph on the contract above). Purely additive: a schema
+ * that already carries either stays byte-identical.
+ *
+ * The guard is a VALUE check, not a key-presence one: `items: undefined` keeps
+ * the key on the in-memory object and still serializes to nothing, so
+ * `'items' in node` would wave it through to the exact `missing field` 400 this
+ * function exists to prevent. `null` and a non-schema scalar take the same
+ * path. A JSON-Schema tuple (`items: [a, b]`) has no wire form at all —
+ * protobuf `Schema.items` is a single message, never repeated — so it degrades
+ * to its first element rather than going up as an array.
+ */
+function ensureItemSchema(node: Record<string, unknown>): void {
+  if (node.type !== 'array') return
+  const items = node.items
+  if (Array.isArray(items)) {
+    const first = items[0]
+    node.items = first !== null && typeof first === 'object' && !Array.isArray(first)
+      ? first
+      : { ...AGY_MISSING_ITEMS_SCHEMA }
+    return
+  }
+  if (items !== null && typeof items === 'object') return
+  node.items = { ...AGY_MISSING_ITEMS_SCHEMA }
+}
+
+/**
+ * The `items` (or typed `additionalProperties`) slot must itself be typed;
+ * `{}`, `{description:'x'}` and a keywords-only union carrier all arrive here
+ * and are rejected as `missing field`. A `properties`-bearing schema is left
+ * alone — its `type` is inferred by the same rule that lets an untyped object
+ * schema through elsewhere. `additionalProperties: true|false` is a boolean
+ * and never reaches this function.
+ */
+function ensureNestedType(node: Record<string, unknown>): void {
+  if ('type' in node || 'properties' in node) return
+  node.type = 'string'
+}
 
 function sanitizeToolSchema(schema: unknown): unknown {
   if (!schema || typeof schema !== 'object') return schema
@@ -175,7 +232,13 @@ function sanitizeToolSchema(schema: unknown): unknown {
       continue
     }
     if (AGY_SCHEMA_NESTED_KEYS.has(key)) {
-      result[key] = sanitizeToolSchema(value)
+      const nested = sanitizeToolSchema(value)
+      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+        const nestedRecord = nested as Record<string, unknown>
+        ensureNestedType(nestedRecord)
+        if (key === 'items') ensureItemSchema(nestedRecord)
+      }
+      result[key] = nested
       continue
     }
     if (AGY_SCHEMA_LIST_KEYS.has(key)) {
@@ -191,20 +254,81 @@ function sanitizeToolSchema(schema: unknown): unknown {
     }
     result[key] = value
   }
+  ensureItemSchema(result)
   return result
 }
 
-/** Collect tool-call names by id so tool results can name their function. */
-function buildToolNameIndex(messages: readonly AgyMessageView[]): Map<string, string> {
-  const index = new Map<string, string>()
+/**
+ * Every name a tool-call id was ever seen with, in document order, plus how
+ * many of them have already been answered.
+ *
+ * A tool-call id is NOT unique across a conversation: `parse.ts` falls back to
+ * `String(blockIndex)` when the upstream omits `functionCall.id` and that block
+ * counter restarts at 0 for every stream, so two distant turns routinely answer
+ * the same id (issue #99). A single `Map<string, string>` therefore had to
+ * declare a winner with last-write-wins, and an earlier turn's result was
+ * emitted with a LATER turn's tool name — which Google rejects with 400
+ * `INVALID_ARGUMENT`, permanently, because retrying replays the same history.
+ *
+ * The cursor rather than a `shift()`: consuming from the front of a shared array
+ * would destroy the record the drained fallback below needs.
+ */
+interface ToolNameIndexEntry {
+  readonly names: readonly string[]
+  /** How many of `names` have been handed to a result already. */
+  cursor: number
+}
+
+type ToolNameIndex = Map<string, ToolNameIndexEntry>
+
+/**
+ * Collect tool-call names by id so tool results can name their function.
+ *
+ * Names are PUSHED rather than set, so a repeated id keeps every occurrence in
+ * document order; resolution consumes them FIFO (see {@link resolveToolName}).
+ */
+function buildToolNameIndex(messages: readonly AgyMessageView[]): ToolNameIndex {
+  const index: ToolNameIndex = new Map()
   for (const message of messages) {
     for (const block of message.content) {
       if (block.type === 'tool-call') {
-        index.set(block.id, block.name)
+        const entry = index.get(block.id)
+        if (entry) (entry.names as string[]).push(block.name)
+        else index.set(block.id, { names: [block.name], cursor: 0 })
       }
     }
   }
   return index
+}
+
+/**
+ * The name one `functionResponse` must carry, or undefined when the id answers
+ * no recorded call (the caller then falls back to the raw id, as it always did).
+ *
+ * FIFO per id: the calls recorded under an id are consumed in the order the
+ * results arrive in, so each result meets its OWN call even when the id
+ * repeats. Distinct ids never interact — the two cases a single-valued index
+ * conflated (a repeated id across distant turns, and two calls sharing one id
+ * inside one assistant turn) are handled by the same queue.
+ *
+ * Drained (more results than calls — a call dropped from the history while its
+ * result survived) is the one case with nothing left to pair: guessing the LAST
+ * name recorded for the id beats the pre-fix behaviour in both directions. The
+ * old lookup answered every extra result with that same last name, which was
+ * right whenever the repeated calls were the same tool and wrong the moment
+ * they were not; answering with the raw id instead would be wrong EVERY time,
+ * because an id is not a function name and upstream rejects it outright. So the
+ * last name is kept, and only a never-recorded id falls through to the raw id.
+ */
+function resolveToolName(toolNames: ToolNameIndex, toolCallId: string): string | undefined {
+  const entry = toolNames.get(toolCallId)
+  if (entry === undefined) return undefined
+  if (entry.cursor < entry.names.length) {
+    const name = entry.names[entry.cursor]
+    entry.cursor += 1
+    return name
+  }
+  return entry.names[entry.names.length - 1]
 }
 
 /**
@@ -218,9 +342,9 @@ function toolResultPart(
   toolCallId: string,
   isError: boolean,
   content: readonly AgyBlockView[],
-  toolNames: Map<string, string>,
+  toolNames: ToolNameIndex,
 ): AgyPart {
-  const name = toolNames.get(toolCallId) ?? toolCallId
+  const name = resolveToolName(toolNames, toolCallId) ?? toolCallId
   const text = content
     .filter((block): block is Extract<AgyBlockView, { type: 'text' }> => block.type === 'text')
     .map((block) => block.text)
@@ -240,7 +364,7 @@ function toolResultPart(
 
 function blockToParts(
   block: AgyBlockView,
-  toolNames: Map<string, string>,
+  toolNames: ToolNameIndex,
   images: Map<string, AgyResolvedImage>,
   /** Claude path: replayed thought blocks are rejected outright (see below). */
   dropThoughts = false,
@@ -327,7 +451,7 @@ function blockToParts(
 
 function messageToContent(
   message: AgyMessageView,
-  toolNames: Map<string, string>,
+  toolNames: ToolNameIndex,
   images: Map<string, AgyResolvedImage>,
   multimodalFiles?: Map<string, AgyResolvedMultimodalFile[]>,
   messageIndex?: number,
@@ -375,6 +499,62 @@ function messageToContent(
   if (parts.length === 0) return null
   const role = message.role === 'assistant' ? 'model' : 'user'
   return { role, parts }
+}
+
+/**
+ * Whether a part makes its turn a tool-result turn (`functionResponse` family).
+ * Every other part kind — text, media, thought, functionCall — belongs to the
+ * ordinary-content family.
+ */
+function isFrPart(part: AgyPart): boolean {
+  return 'functionResponse' in part
+}
+
+/**
+ * Merge adjacent same-role contents into single turns, functionResponse-family
+ * aware.
+ *
+ * The harness emits a fragmented per-step vocabulary — prompt, runtime-context
+ * snapshot, and injected `<system-reminder>` messages as separate `user`
+ * messages, one message per tool result — and its own first-party serializer
+ * coalesces adjacent same-role messages at the wire boundary. Forwarding the
+ * fragments 1:1 instead opened every request with a run of `user` turns that
+ * all belong to one logical prompt, and sent parallel tool results as separate
+ * one-`functionResponse` turns where the official Gemini tooling groups them
+ * into a single user turn.
+ *
+ * Family rule: a turn carrying `functionResponse` parts never merges with (or
+ * receives) other part kinds, so a mixed content is segmented in part order.
+ * The harness's serializer instead re-sorts tool results to the front of one
+ * merged message, but the Gemini-family validator is measured to reject a user
+ * content mixing `functionResponse` with text (400; langchainjs#11445, on the
+ * model family), and this channel's tolerance for the mixed shape is
+ * unmeasured. Separate adjacent turns keep every part while keeping each turn
+ * unmixed; parts are never reordered.
+ *
+ * Known boundary loss (pinned in tests): a model turn whose parts all drop
+ * (thoughts-only turn replayed on the Claude path) is filtered to null before
+ * this point, so the user turns around it fuse into one content. A text
+ * placeholder would fabricate a model utterance, and the acceptance of a
+ * structural empty turn (`parts: []`) is unmeasured here — so the fusion
+ * stands (issue #93).
+ */
+export function coalesceContents(contents: AgyContent[]): AgyContent[] {
+  const result: AgyContent[] = []
+  let lastFamily: boolean | undefined
+  for (const content of contents) {
+    for (const part of content.parts) {
+      const family = isFrPart(part)
+      const last = result[result.length - 1]
+      if (last && lastFamily === family && last.role === content.role) {
+        last.parts.push(part)
+      } else {
+        result.push({ role: content.role, parts: [part] })
+        lastFamily = family
+      }
+    }
+  }
+  return result
 }
 
 /**
@@ -496,9 +676,11 @@ export function toAgyRequestBody(
   const images = context.images ?? new Map<string, AgyResolvedImage>()
   const multimodalFiles = supportsMultimodalFiles(options.model) ? context.multimodalFiles : undefined
   const claude = isClaudeModel(options.model)
-  let contents = conversationMessages(messages)
-    .map((message, index) => messageToContent(message, toolNames, images, multimodalFiles, index, claude))
-    .filter((c): c is AgyContent => c !== null)
+  let contents = coalesceContents(
+    conversationMessages(messages)
+      .map((message, index) => messageToContent(message, toolNames, images, multimodalFiles, index, claude))
+      .filter((c): c is AgyContent => c !== null),
+  )
   if (claude) {
     contents = stripTrailingModelTurn(contents)
   } else {

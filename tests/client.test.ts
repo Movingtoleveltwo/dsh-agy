@@ -1,22 +1,80 @@
-import { readFileSync } from 'node:fs'
-import { expect, it, describe } from 'vitest'
+import { readdirSync, readFileSync } from 'node:fs'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { expect, it, describe, vi } from 'vitest'
 import { apply, canActivateAccount, orderModels, resolveSelectedAccountIndex, throughputTokenPerSecond, tokenText, truncateIdentity } from '../src/client/index.ts'
-import { installAgyStyles } from '../src/client/styles.ts'
+import { AgyQuotaBadge } from '../src/client/quota-badge.ts'
+import { h } from '../src/client/element.ts'
+import { installAgyStyles, AGY_STYLES_CSS, ALIAS_FALLBACKS } from '../src/client/styles.ts'
 import { en, zh } from '../src/client/locales.ts'
+import type { QuotaTranslate } from '../src/client/quota-view.ts'
 import { zeroCounters } from '../src/usage-types.ts'
-import type { AccountView, ModelView } from '../src/rpc-contract.ts'
+import type { AccountView, AgyRpcClient, ModelView } from '../src/rpc-contract.ts'
 import type { UsageCounters } from '../src/usage-types.ts'
 
+// The primitives catalog is a frozen module table the HOST shares at runtime
+// (dsh.client.external); the npm package carries no renderable implementation,
+// so any render test stubs it at the module boundary. The stubs pass children
+// through so the snapshot shows the badge's own tree; the primitives' own DOM
+// is the host's business. Type-only exports (StateDotState, TagTone) need no
+// stub.
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => {
+  const passthrough = () => function Primitive({ children }: { children?: unknown }) {
+    return children ?? null
+  }
+  return {
+    Button: passthrough(),
+    Input: passthrough(),
+    Pill: passthrough(),
+    StateDot: passthrough(),
+    Switch: passthrough(),
+    Tag: passthrough(),
+    useAnchoredPosition: () => ({ top: 0, left: 0 }),
+    useDismissOnOutsidePointer: () => undefined,
+  }
+})
+
+/**
+ * The browser half's TypeScript sources.
+ *
+ * The i18n scans below are about the UI as a whole, not one file: the header
+ * badge lives in its own modules, and a scan pinned to `index.ts` would call
+ * every key it uses "unused" and every literal it holds "invisible".
+ */
+function clientFiles(): Array<{ name: string, source: string }> {
+  const dir = new URL('../src/client/', import.meta.url)
+  return readdirSync(dir)
+    .filter((name) => name.endsWith('.ts'))
+    .sort()
+    .map((name) => ({ name, source: readFileSync(new URL(name, dir), 'utf8') }))
+}
+
 /** Minimal client context: locale, connection (RPC transport), and the slot registry. */
-function makeContext(options: { withConnection?: boolean } = {}) {
+function makeContext(options: {
+  withConnection?: boolean
+  rpcHandler?: (method: string, payload: unknown) => Promise<unknown>
+  onRegister?: (registration: { id: string, name: string }, factory?: () => unknown) => void
+} = {}) {
   const entries: Array<{ id: string, name: string }> = []
   const dictionaries: string[] = []
-  let cleanup: (() => void) | undefined
+  // One cleanup per effect, in registration order: the plugin installs two
+  // (stylesheet, dictionaries) before it registers anything, and each slot
+  // registration is an effect of its own — keeping only the last would leave
+  // the earlier registration behind on dispose.
+  const cleanups: Array<() => void> = []
   const warnings: string[] = []
   const ctx = {
-    effect: (install: () => () => void) => { cleanup = install(); return cleanup },
+    effect: (install: () => () => void) => { cleanups.push(install()); return () => {} },
     get: (name: string) => (name === 'connection' && options.withConnection !== false
-      ? { rpc: { call: async () => ({ ok: true, value: {} }) } }
+      ? {
+          rpc: {
+            call: async (_channel: string, _endpoint: string, envelope: { method: string, payload: unknown }) => {
+              if (options.rpcHandler) {
+                return { ok: true, value: await options.rpcHandler(envelope.method, envelope.payload) }
+              }
+              return { ok: true, value: {} }
+            },
+          },
+        }
       : undefined),
     locale: {
       register: (ns: string) => { dictionaries.push(ns); return () => {} },
@@ -26,8 +84,9 @@ function makeContext(options: { withConnection?: boolean } = {}) {
     logger: { warn: (message: string) => { warnings.push(message) } },
     slots: {
       inject: (_slot: string, install: () => () => void) => install(),
-      register: (registration: { id: string, name: string }) => {
+      register: (registration: { id: string, name: string }, factory?: () => unknown) => {
         entries.push({ id: registration.id, name: registration.name })
+        options.onRegister?.(registration, factory)
         return () => {
           const at = entries.findIndex((entry) => entry.id === registration.id)
           if (at >= 0) entries.splice(at, 1)
@@ -35,27 +94,87 @@ function makeContext(options: { withConnection?: boolean } = {}) {
       },
     },
   }
-  return { ctx, entries, dictionaries, warnings, dispose: () => { cleanup?.() } }
+  return {
+    ctx,
+    entries,
+    dictionaries,
+    warnings,
+    dispose: () => { for (const undo of cleanups.reverse()) undo() },
+  }
 }
 
 describe('dsh-agy client plugin', () => {
-  it('registers the Antigravity Settings section, not a Plugins tab', () => {
-    // The old entry contributed a `settings.plugins.tab` link to the standalone
-    // /agy dashboard; that surface is gone and this is a first-class section.
+  it('registers only the Antigravity Settings section by default (opt-in disabled)', () => {
+    // #62 invariant: by default conversation header badge is NOT registered.
     const { ctx, entries, dictionaries } = makeContext()
     apply(ctx as never)
-    expect(entries).toEqual([{ id: 'agy', name: 'settings.section' }])
+    expect(entries).toEqual([
+      { id: 'agy', name: 'settings.section' },
+    ])
     // The section must own a dictionary, or its copy cannot follow the host's
     // language setting.
     expect(dictionaries).toEqual(['agy'])
   })
 
-  it('removes the section when the client fiber disposes', () => {
+  it('removes registration when the client fiber disposes', () => {
     const { ctx, entries, dispose } = makeContext()
     apply(ctx as never)
     expect(entries).toHaveLength(1)
     dispose()
     expect(entries).toEqual([])
+  })
+
+  it('registers quota badge when opt-in preference is enabled on startup', async () => {
+    let capturedFactory: (() => unknown) | undefined
+    const { ctx, entries, dispose } = makeContext({
+      rpcHandler: async (method) => {
+        if (method === 'ui.prefs.get') return { conversationBadge: true }
+        return {}
+      },
+      onRegister: (registration, factory) => {
+        if (registration.id === 'agy-quota-badge') capturedFactory = factory
+      },
+    })
+    apply(ctx as never)
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(entries).toEqual([
+      { id: 'agy', name: 'settings.section' },
+      { id: 'agy-quota-badge', name: 'conversation.session.header.actions' },
+    ])
+    expect(capturedFactory).toBeDefined()
+    const element = capturedFactory!() as { type: unknown }
+    expect(element.type).toBe(AgyQuotaBadge)
+    dispose()
+    expect(entries).toEqual([])
+  })
+
+  it('dynamically registers and unregisters badge when toggled from settings', () => {
+    let capturedSettingsProps: Record<string, unknown> | undefined
+    const { ctx, entries } = makeContext({
+      onRegister: (registration, factory) => {
+        if (registration.id === 'agy' && factory) {
+          capturedSettingsProps = (factory() as { props: Record<string, unknown> }).props
+        }
+      },
+    })
+    apply(ctx as never)
+    expect(entries).toEqual([{ id: 'agy', name: 'settings.section' }])
+
+    const onBadgePrefChange = capturedSettingsProps?.onBadgePrefChange as ((enabled: boolean) => void) | undefined
+    expect(onBadgePrefChange).toBeDefined()
+
+    // Turn ON
+    onBadgePrefChange!(true)
+    expect(entries).toEqual([
+      { id: 'agy', name: 'settings.section' },
+      { id: 'agy-quota-badge', name: 'conversation.session.header.actions' },
+    ])
+
+    // Turn OFF
+    onBadgePrefChange!(false)
+    expect(entries).toEqual([
+      { id: 'agy', name: 'settings.section' },
+    ])
   })
 
   it('skips registration and warns when the connection service is absent', () => {
@@ -95,10 +214,10 @@ describe('agy section i18n', () => {
     //  - a dead key (its copy can never render, and it drifts from the UI);
     //  - a hardcoded label (Chinese string literals shipped into the English UI),
     //    which is why the Credentials tab's import buttons are checked here.
-    const source = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
+    const source = clientFiles().map((file) => file.source).join('\n')
     const unused = (Object.keys(zh) as Array<keyof typeof zh>)
       .filter((key) => !source.includes(`'${key}'`))
-    expect(unused, `locale keys never referenced by index.ts: ${unused.join(', ')}`).toEqual([])
+    expect(unused, `locale keys never referenced by the client: ${unused.join(', ')}`).toEqual([])
   })
 
   it('passes every placeholder a key declares at every call site', () => {
@@ -107,7 +226,7 @@ describe('agy section i18n', () => {
     // literal braces to the user (`代理可达：{proxy}`) instead of failing. The
     // parity test above compares the two dictionaries and so cannot see this:
     // both sides agree on a placeholder that no caller ever supplies.
-    const source = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
+    const source = clientFiles().map((file) => file.source).join('\n')
     const missing: string[] = []
     for (const [key, template] of Object.entries(zh)) {
       const names = [...template.matchAll(/\{(\w+)\}/g)].map((match) => match[1] as string)
@@ -131,15 +250,58 @@ describe('agy section i18n', () => {
   })
 
   it('has no CJK literals outside the dictionaries', () => {
-    // The UI's copy belongs in locales.ts; a literal here is untranslatable and
-    // invisible to every other i18n check. `styles.ts` carries no user-visible
-    // text at all, so it is held to the same rule.
-    const cjkIn = (file: string): string[] => {
-      const source = readFileSync(new URL(`../src/client/${file}`, import.meta.url), 'utf8')
-      return source.match(/[\u4e00-\u9fff]+/g) ?? []
+    // The UI's copy belongs in locales.ts; a literal anywhere in the browser half
+    // is untranslatable and invisible to every other i18n check. `styles.ts`
+    // carries no user-visible text at all, so it is held to the same rule, and
+    // every module added to the half is scanned without editing this list.
+    // `locales.ts` is the dictionary itself: the one file where CJK belongs.
+    for (const file of clientFiles().filter((entry) => entry.name !== 'locales.ts')) {
+      const literals = file.source.match(/[\u4e00-\u9fff]+/g) ?? []
+      expect(literals, `CJK copy in ${file.name} (belongs in locales.ts)`).toEqual([])
     }
-    expect(cjkIn('index.ts'), 'CJK copy in index.ts (belongs in locales.ts)').toEqual([])
-    expect(cjkIn('styles.ts'), 'CJK copy in styles.ts').toEqual([])
+  })
+})
+
+describe('settings tab layout', () => {
+  /** The source of one top-level function, from its `function` line to the next. */
+  function functionBody(name: string): string {
+    const source = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
+    // Every component in the browser half is a TOP-LEVEL function, so the next
+    // top-level `function`/`const`/`export` line bounds the body. A regex is
+    // enough here because nothing nests a second top-level declaration inside a
+    // component body.
+    const start = source.indexOf(`function ${name}(`)
+    expect(start, `${name} not found in src/client/index.ts`).toBeGreaterThan(-1)
+    const rest = source.slice(start + 1)
+    const end = rest.search(/\n(?:export )?(?:function |const |\/\/ ───)/)
+    return end === -1 ? rest : rest.slice(0, end)
+  }
+
+  it('renders the thinking card on the config tab, not the models tab', () => {
+    // The test environment is `environment: 'node'`, so nothing renders; this is
+    // a source assertion instead. It is the issue's own acceptance condition —
+    // "the models tab no longer renders the thinking budget" — and the failure
+    // mode it guards is silent: leaving the card in ModelsTab and also adding
+    // ConfigTab would show the block on two tabs with no type error anywhere.
+    expect(functionBody('ModelsTab')).not.toContain('ThinkingBudgetCard')
+    expect(functionBody('ConfigTab')).toContain('h(ThinkingBudgetCard')
+    expect(functionBody('ConfigTab')).toContain('h(MultimodalCard')
+  })
+
+  it('carries the moved card into the tab body chain ahead of the credentials fallback', () => {
+    // The body ternary ends in a bare `else` for CredentialsTab, so a new tab
+    // that misses its branch renders credentials with no compile error.
+    const source = readFileSync(new URL('../src/client/index.ts', import.meta.url), 'utf8')
+    const from = source.indexOf('const body = tab ===')
+    // Bound the slice at the ROOT element's return, searched from `from`: the
+    // same `return h('div', { className: 'agy-root' },` line occurs in every tab,
+    // so an unanchored `indexOf` would cut the chain off before its own start.
+    const to = source.indexOf("return h('div', { className: 'agy-root' },", from)
+    expect(from, 'the tab body chain moved — update this scan').toBeGreaterThan(-1)
+    expect(to, 'the root return moved — update this scan').toBeGreaterThan(from)
+    const chain = source.slice(from, to)
+    expect(chain).toContain("tab === 'config'")
+    expect(chain.indexOf("tab === 'config'")).toBeLessThan(chain.indexOf("tab === 'usage'"))
   })
 })
 
@@ -174,9 +336,9 @@ describe('usage table stylesheet', () => {
     // repeatedly. Only the body matters — the delimiters and the surrounding
     // TypeScript (other template literals in this file) legitimately contain
     // backticks, so counting the whole file would be meaningless.
-    const start = css.indexOf('const CSS = `') + 'const CSS = `'.length
+    const start = css.indexOf('export const AGY_STYLES_CSS = `') + 'export const AGY_STYLES_CSS = `'.length
     const end = css.indexOf('`', start)
-    expect(start, 'the CSS template literal must exist').toBeGreaterThan('const CSS = `'.length)
+    expect(start, 'the CSS template literal must exist').toBeGreaterThan('export const AGY_STYLES_CSS = `'.length)
     expect(css.slice(start, end), 'no backtick may appear inside the CSS body').not.toContain('`')
   })
 
@@ -474,5 +636,57 @@ describe('installAgyStyles', () => {
     } finally {
       restore()
     }
+  })
+
+
+})
+
+describe('dsw alias fallback table', () => {
+  const tableVar = /var\(--dsw-alias-([a-z0-9-]+), (#[0-9a-fA-F]+|rgba\([0-9., ]+\))\)/g
+
+  it('answers every alias with exactly the table fallback, everywhere', () => {
+    const seen = new Map<string, string>()
+    for (const [, name, fallback] of AGY_STYLES_CSS.matchAll(tableVar)) {
+      const expected = (ALIAS_FALLBACKS as Record<string, string>)[name]
+      expect(expected, `--dsw-alias-${name} is missing from ALIAS_FALLBACKS`).toBeDefined()
+      expect(
+        seen.has(name) && seen.get(name) !== fallback,
+        `--dsw-alias-${name} carries a second fallback (${fallback}; table says ${seen.get(name)})`,
+      ).toBe(false)
+      expect(fallback, `--dsw-alias-${name} drifts from the table`).toBe(expected)
+      seen.set(name, fallback)
+    }
+    expect(seen.size).toBe(Object.keys(ALIAS_FALLBACKS).length)
+  })
+
+  it('keeps the helper the only alias literal and the renamed-forever token dead', () => {
+    for (const { name, source } of clientFiles()) {
+      if (name === 'styles.ts') {
+        const occurrences = source.split('var(--dsw-alias-').length - 1
+        expect(occurrences, 'styles.ts must hold exactly the aliasVar helper literal').toBe(1)
+      } else {
+        expect(source, `${name} inlines a raw alias var()`).not.toContain('var(--dsw-alias-')
+      }
+    }
+    expect(AGY_STYLES_CSS).not.toContain('new-colorprimary')
+  })
+})
+
+describe('quota badge snapshot render', () => {
+  it('renders the closed badge in node, with no RPC and no DOM', () => {
+    // Effects do not run in static markup, so the render must not need the
+    // fetch paths: an rpc that throws pins "snapshot implies zero network".
+    const failingRpc = {
+      call: async () => { throw new Error('snapshot render must not fetch') },
+    } as unknown as AgyRpcClient
+    // The real zh dictionary with placeholder substitution, so the snapshot
+    // carries the copy a user would see, not bare key names.
+    const t = ((key: string, params?: Record<string, unknown>) => {
+      let text = (zh as Record<string, string>)[key] ?? key
+      for (const [k, v] of Object.entries(params ?? {})) text = text.replaceAll(`{${k}}`, String(v))
+      return text
+    }) as unknown as QuotaTranslate
+    const html = renderToStaticMarkup(h(AgyQuotaBadge, { rpc: failingRpc, t }))
+    expect(html).toMatchSnapshot()
   })
 })

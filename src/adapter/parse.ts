@@ -115,6 +115,43 @@ export class UnmappedFinishReasonError extends Error {
 }
 
 /**
+ * Thrown when the SSE body produces no bytes for longer than the idle timeout.
+ *
+ * The streaming dispatcher deliberately runs with `bodyTimeout: 0` (a reasoning
+ * pause must not be killed mid-turn), so a connection that stops producing
+ * bytes without ever closing has no transport-level reclaim: the read simply
+ * never settles and the turn hangs until the user cancels it. The watchdog
+ * exists only for that shape.
+ */
+export class AgyStreamIdleTimeoutError extends Error {
+  constructor(readonly idleTimeoutMs: number) {
+    super(idleTimeoutMs >= 1000
+      ? `agy stream idle timeout: no data received for ${Math.round(idleTimeoutMs / 1000)}s`
+      : `agy stream idle timeout: no data received for ${idleTimeoutMs}ms`)
+    this.name = 'AgyStreamIdleTimeoutError'
+  }
+}
+
+/** Silence budget for one body read before the stream is declared stalled. */
+export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 180_000
+
+/**
+ * Resolve the idle timeout from `DSH_AGY_IDLE_TIMEOUT_MS` (or the `AGY_IDLE_TIMEOUT_MS` alias).
+ * Deliberately generous: measured reasoning gaps on a real tunnel reach ~35s, so the default is
+ * ~5x that and only a connection that has genuinely stopped trips it. `0` disables the watchdog;
+ * negative or non-numeric values fall back to the default rather than silently disabling it.
+ */
+export function resolveStreamIdleTimeoutMs(): number {
+  const dsh = process.env.DSH_AGY_IDLE_TIMEOUT_MS?.trim()
+  const agy = process.env.AGY_IDLE_TIMEOUT_MS?.trim()
+  const raw = dsh && dsh.length > 0 ? dsh : agy && agy.length > 0 ? agy : undefined
+  if (raw === undefined) return DEFAULT_STREAM_IDLE_TIMEOUT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_STREAM_IDLE_TIMEOUT_MS
+  return parsed
+}
+
+/**
  * Map the upstream `finishReason` vocabulary onto DSH's. WHITELIST, not
  * blacklist: the completable reasons map to their kinds and every other
  * explicit reason throws. `FINISH_REASON_UNSPECIFIED` is granted `stop` — it
@@ -135,6 +172,61 @@ function mapFinishReason(reason: string): FinishReason {
   }
 }
 
+type StreamReadResult = Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>
+
+/**
+ * Await one body read, failing after `timeoutMs` of silence (0 = no watchdog)
+ * or as soon as `signal` aborts.
+ *
+ * The timer measures the GAP between reads, so any byte resets it: a slow but
+ * live generation is untouched, while a connection that died without closing —
+ * or an upstream that accepted the request and then went away — fails instead
+ * of hanging forever. The abort leg exists for the same reason: without it a
+ * cancelled turn keeps waiting out the whole idle window, because the read loop
+ * only checks `signal.aborted` BETWEEN reads.
+ *
+ * Each abandonment rejects BEFORE cancelling the reader, and the order is
+ * load-bearing (measured on undici 7 and synthetic streams): the rejection is
+ * what settles this race — `reader.cancel()` settles the outstanding read only
+ * on a later turn — while the cancel reclaims the connection the streaming
+ * dispatcher (`bodyTimeout: 0`) would otherwise leave pinned. The abandoned
+ * read rejects with the release error once the caller's `finally` drops the
+ * lock, and `Promise.race` is what keeps that rejection handled.
+ */
+async function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<StreamReadResult> {
+  const pending = reader.read()
+  if (timeoutMs <= 0 && signal === undefined) return pending
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
+  const watchdog = new Promise<never>((_resolve, reject) => {
+    const abandon = (error: Error): void => {
+      reject(error)
+      void reader.cancel(error).catch(() => {})
+    }
+    if (signal?.aborted) {
+      abandon(new DOMException('aborted', 'AbortError'))
+      return
+    }
+    if (timeoutMs > 0) {
+      timer = setTimeout(() => abandon(new AgyStreamIdleTimeoutError(timeoutMs)), timeoutMs)
+    }
+    if (signal) {
+      onAbort = () => abandon(new DOMException('aborted', 'AbortError'))
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+  })
+  try {
+    return await Promise.race([pending, watchdog])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort)
+  }
+}
+
 /**
  * Consume an SSE text stream and yield StreamChunks. One accumulating block is
  * kept open at a time; tool-call argument deltas accumulate until a different
@@ -142,6 +234,11 @@ function mapFinishReason(reason: string): FinishReason {
  */
 export interface ParseAgySseOptions {
   signal?: AbortSignal
+  /**
+   * Milliseconds of silence on the body before the read is abandoned. Defaults
+   * to `resolveStreamIdleTimeoutMs()`; 0 disables the watchdog.
+   */
+  idleTimeoutMs?: number
   /**
    * Invoked when a functionCall part carries a sibling thoughtSignature, and
    * when a thought part carries one, keyed by the functionCall id (or the
@@ -155,7 +252,7 @@ export async function* parseAgySse(
   body: ReadableStream<Uint8Array>,
   options: ParseAgySseOptions = {},
 ): AsyncGenerator<StreamChunk> {
-  const { signal } = options
+  const { signal, idleTimeoutMs = resolveStreamIdleTimeoutMs() } = options
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
@@ -248,6 +345,30 @@ export async function* parseAgySse(
       const message = payload.error.message ?? payload.error.status ?? 'upstream error'
       throw new Error(`agy stream error (${payload.error.code ?? 'unknown'}): ${message}`)
     }
+    if (payload.usageMetadata) {
+      // The upstream sends usageMetadata on EVERY SSE event (cumulative).
+      // Do NOT close the block here: closing per event would split one
+      // continuous text stream into a block per chunk (frontend renders
+      // block boundaries as line breaks). Stash the last (full) totals
+      // and emit one usage chunk at stream end.
+      //
+      // Stashed BEFORE the candidates loop below, because that loop is where an
+      // unmapped `finishReason` throws: the totals ride on the same event that
+      // ends the stream, and `drainLine` can only flush a stash that exists.
+      sawUsage = true
+      // DSH TokenUsage buckets are DISJOINT: inputTokens must be the
+      // uncached portion only; cache reads are reported separately.
+      // Reporting the full promptTokenCount here double-counts cached
+      // tokens in the stats line's cache-hit percentage (it divides by
+      // uncached + cacheRead + cacheWrite).
+      const promptTokens = payload.usageMetadata.promptTokenCount ?? 0
+      const cachedTokens = payload.usageMetadata.cachedContentTokenCount ?? 0
+      lastUsage = {
+        inputTokens: Math.max(0, promptTokens - cachedTokens),
+        outputTokens: payload.usageMetadata.candidatesTokenCount ?? 0,
+        cacheReadTokens: cachedTokens,
+      }
+    }
     for (const candidate of payload.candidates ?? []) {
       if (candidate.finishReason) {
         sawFinishReason = true
@@ -307,42 +428,61 @@ export async function* parseAgySse(
         }
       }
     }
-    if (payload.usageMetadata) {
-      // The upstream sends usageMetadata on EVERY SSE event (cumulative).
-      // Do NOT close the block here: closing per event would split one
-      // continuous text stream into a block per chunk (frontend renders
-      // block boundaries as line breaks). Stash the last (full) totals
-      // and emit one usage chunk at stream end.
-      sawUsage = true
-      // DSH TokenUsage buckets are DISJOINT: inputTokens must be the
-      // uncached portion only; cache reads are reported separately.
-      // Reporting the full promptTokenCount here double-counts cached
-      // tokens in the stats line's cache-hit percentage (it divides by
-      // uncached + cacheRead + cacheWrite).
-      const promptTokens = payload.usageMetadata.promptTokenCount ?? 0
-      const cachedTokens = payload.usageMetadata.cachedContentTokenCount ?? 0
-      lastUsage = {
-        inputTokens: Math.max(0, promptTokens - cachedTokens),
-        outputTokens: payload.usageMetadata.candidatesTokenCount ?? 0,
-        cacheReadTokens: cachedTokens,
-      }
-    }
     return out
+  }
+
+  /**
+   * Yield one line's chunks, but flush the stashed usage first if the line
+   * aborts the stream.
+   *
+   * An unmapped `finishReason` throws from inside `handleLine`, i.e. BEFORE the
+   * usageMetadata stash on that same line AND before the end-of-stream usage
+   * chunk below. Without this the caller sees no usage at all for an attempt
+   * that the upstream really did bill — and the adapter's `MALFORMED_FUNCTION_CALL`
+   * re-sample discards exactly such an attempt, so its tokens would silently
+   * never reach the ledger (AGENTS.md: the ledger accumulates per attempt).
+   */
+  const drainLine = function* (line: string): Generator<StreamChunk> {
+    try {
+      yield* handleLine(line)
+    } catch (error) {
+      if (error instanceof UnmappedFinishReasonError && lastUsage !== null) {
+        yield { type: 'usage', usage: lastUsage }
+      }
+      throw error
+    }
   }
 
   try {
     while (true) {
       if (signal?.aborted) {
+        if (lastUsage !== null) {
+          yield { type: 'usage', usage: lastUsage }
+        }
         throw new DOMException('aborted', 'AbortError')
       }
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
+      let read: StreamReadResult
+      try {
+        read = await readWithIdleTimeout(reader, idleTimeoutMs, signal)
+      } catch (error) {
+        // Same rescue `drainLine` performs for an unmapped finishReason, for the
+        // same reason: this attempt really did consume quota (the ledger
+        // accumulates per attempt), and the totals the upstream already
+        // reported would otherwise be dropped with the stalled or aborted stream.
+        const isTimeout = error instanceof AgyStreamIdleTimeoutError
+        const isAbort = error instanceof DOMException && error.name === 'AbortError'
+        if ((isTimeout || isAbort) && lastUsage !== null) {
+          yield { type: 'usage', usage: lastUsage }
+        }
+        throw error
+      }
+      if (read.done) break
+      buffer += decoder.decode(read.value, { stream: true })
       let newlineIndex: number
       while ((newlineIndex = buffer.indexOf('\n')) !== -1) {
         const line = buffer.slice(0, newlineIndex)
         buffer = buffer.slice(newlineIndex + 1)
-        for (const chunk of handleLine(line)) yield chunk
+        for (const chunk of drainLine(line)) yield chunk
       }
     }
     // Flush the decoder and process a final line that arrived without its
@@ -352,7 +492,7 @@ export async function* parseAgySse(
     if (buffer.trim() !== '') {
       const line = buffer
       buffer = ''
-      for (const chunk of handleLine(line)) yield chunk
+      for (const chunk of drainLine(line)) yield chunk
     }
     // Completeness guard: a CLEAN close carrying neither `[DONE]` nor any
     // `finishReason` is a cut-short stream, not a completed turn — yielding

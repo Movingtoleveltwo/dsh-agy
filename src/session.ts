@@ -1213,7 +1213,13 @@ export class AgySessionManager {
    */
   async testCall(
     model: string,
-    options: { prompt?: string; maxTokens?: number; accountIndex?: number } = {},
+    options: {
+      prompt?: string
+      maxTokens?: number
+      accountIndex?: number
+      signal?: AbortSignal
+      idleTimeoutMs?: number
+    } = {},
   ): Promise<{ ok: boolean; text?: string; error?: string }> {
     const prompt = options.prompt ?? 'Reply with exactly: OK'
     const maxTokens = options.maxTokens ?? 1024
@@ -1266,6 +1272,7 @@ export class AgySessionManager {
           method: 'POST',
           headers,
           body: JSON.stringify(body),
+          signal: options.signal,
         },
         accountFetch(routing),
         routing,
@@ -1282,7 +1289,10 @@ export class AgySessionManager {
       const text: string[] = []
       let usage: UsageRecord['usage']
       let ttftMs: number | undefined
-      for await (const chunk of parseAgySse(response.body)) {
+      for await (const chunk of parseAgySse(response.body, {
+        signal: options.signal,
+        idleTimeoutMs: options.idleTimeoutMs,
+      })) {
         if (chunk.type === 'usage') {
           usage = {
             input: chunk.usage.inputTokens,

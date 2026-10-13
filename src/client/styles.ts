@@ -24,35 +24,72 @@
 
 const STYLE_ID = 'dsh-agy-styles'
 
-const CSS = `
+/**
+ * Single source of truth for `--dsw-alias-*` fallbacks: the colour an alias
+ * renders with when the host theme has not defined it. The host owns the real
+ * values; this table only pins the degraded-mode answer, and every usage must
+ * go through `aliasVar()` so one alias cannot carry two answers — without the
+ * table the file grew three values for `border-l2` and a renamed-forever
+ * `--dsw-alias-brand-primary-new-colorprimary-new-color` that no host defines.
+ * Normalisation picks (degraded-mode only, enforced by the alias scans in
+ * tests/client.test.ts): `state-success` took `#10b981` over the duplicated
+ * `#22c55e` because the 60%-alpha glow variant derives from the same base, and
+ * `state-business` took the brand blue over the popover pill's emerald —
+ * active/cooling/disabled reads as blue/amber/grey, not success-green.
+ */
+export const ALIAS_FALLBACKS = {
+  'bg-layer-1': '#fff',
+  'bg-layer-2': '#f4f5f7',
+  'bg-layer-3': '#fff',
+  'bg-overlay': '#fff',
+  'border-l1': 'rgba(0,0,0,.04)',
+  'border-l2': '#e5e6eb',
+  'border-l3': 'rgba(0,0,0,.15)',
+  'brand-primary': '#4176e6',
+  'interactive-bg-hover': '#f4f5f7',
+  'label-primary': '#1f2329',
+  'label-secondary': '#61666b',
+  'label-tertiary': '#8f959e',
+  'state-business-primary': '#4176e6',
+  'state-error-primary': '#ec1313',
+  'state-error-secondary': '#f59e0b',
+  'state-success-primary': '#10b981',
+  'state-warn-primary': '#f59e0b',
+} as const
+
+export function aliasVar(alias: keyof typeof ALIAS_FALLBACKS): string {
+  return `var(--dsw-alias-${alias}, ${ALIAS_FALLBACKS[alias]})`
+}
+
+export const AGY_STYLES_CSS = `
 .agy-root { display: flex; flex-direction: column; gap: 12px; font: var(--dsw-font-xs-13); }
 .agy-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
-.agy-title { font: var(--dsw-font-base-strong-16); color: var(--dsw-alias-label-primary, #1f2329); }
-.agy-sub { margin-top: 3px; font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-tertiary, #8f959e); }
+.agy-title { font: var(--dsw-font-base-strong-16); color: ${aliasVar('label-primary')}; }
+.agy-sub { margin-top: 3px; font: var(--dsw-font-xxs-12); color: ${aliasVar('label-tertiary')}; }
 
 .agy-tabs {
   display: flex; align-items: flex-end; gap: 22px; margin-top: 2px;
-  border-bottom: 0.5px solid var(--dsw-alias-border-l2, #eef0f3);
+  border-bottom: 0.5px solid ${aliasVar('border-l2')};
 }
 .agy-tab {
   position: relative; border: 0; padding: 7px 1px 9px; background: transparent;
-  color: var(--dsw-alias-label-tertiary, #8f959e);
+  color: ${aliasVar('label-tertiary')};
   font: var(--dsw-font-xs-13); cursor: pointer;
 }
-.agy-tab:hover, .agy-tab[data-active="true"] { color: var(--dsw-alias-label-primary, #1f2329); }
+.agy-tab:hover, .agy-tab[data-active="true"] { color: ${aliasVar('label-primary')}; }
 /* Active tab is an underline rule, matching the Plugins settings section's own
    tab bar rather than introducing a second, boxed tab idiom. */
 .agy-tab[data-active="true"]::after {
   position: absolute; right: 0; bottom: -1px; left: 0; height: 2px;
-  border-radius: 2px 2px 0 0; background: var(--dsw-alias-label-primary, #1f2329);
+  border-radius: 2px 2px 0 0; background: ${aliasVar('label-primary')};
   content: '';
 }
 .agy-tab:focus-visible {
-  outline: 2px solid var(--dsw-alias-state-business-primary, #4176e6);
+  outline: 2px solid ${aliasVar('state-business-primary')};
   outline-offset: 2px;
   border-radius: 4px;
 }
-.agy-tab .agy-count { margin-left: 5px; font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
+.agy-tab .agy-count { margin-left: 5px; font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')}; }
 
 /* A failed action states WHAT failed and then WHY, on two lines. The default
    white-space (normal) folds that newline into a space and runs the verdict
@@ -60,35 +97,35 @@ const CSS = `
    .agy-notice already does for its own multi-line form. */
 .agy-error { padding: 9px 12px; border-radius: 8px; font: var(--dsw-font-xxs-12);
   white-space: pre-wrap; overflow-wrap: anywhere;
-  color: var(--dsw-alias-state-error-primary, #ec1313);
-  background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #ec1313) 10%, transparent); }
+  color: ${aliasVar('state-error-primary')};
+  background: color-mix(in srgb, ${aliasVar('state-error-primary')} 10%, transparent); }
 /* A non-fatal outcome (a partial import). Neutral, not alarming, and it keeps
    newlines so a list of per-source failures stays readable. */
 .agy-notice { padding: 9px 12px; border-radius: 8px; font: var(--dsw-font-xxs-12);
   white-space: pre-wrap; overflow-wrap: anywhere;
-  color: var(--dsw-alias-label-secondary, #61666b);
-  background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
-.agy-empty { padding: 24px 12px; text-align: center; font: var(--dsw-font-xs-13); color: var(--dsw-alias-label-tertiary, #8f959e); }
-.agy-hint { margin: 0; font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-tertiary, #8f959e); }
-.agy-aside { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
+  color: ${aliasVar('label-secondary')};
+  background: ${aliasVar('bg-layer-2')}; }
+.agy-empty { padding: 24px 12px; text-align: center; font: var(--dsw-font-xs-13); color: ${aliasVar('label-tertiary')}; }
+.agy-hint { margin: 0; font: var(--dsw-font-xxs-12); color: ${aliasVar('label-tertiary')}; }
+.agy-aside { font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')}; }
 .agy-grow { flex: 1; }
 
 /* ── Grouping surface ───────────────────────────────────────────────────────
    DSH groups with spacing first and a light container second. A settings page
    built only from tables reads as a spreadsheet, so each block gets a card. */
 .agy-card {
-  border: 0.5px solid var(--dsw-alias-border-l2, #eef0f3);
+  border: 0.5px solid ${aliasVar('border-l2')};
   border-radius: 12px;
-  background: var(--dsw-alias-bg-layer-3, #fff);
+  background: ${aliasVar('bg-layer-3')};
   overflow: hidden;
 }
 .agy-card-head {
   display: flex; align-items: center; justify-content: space-between; gap: 10px;
   padding: 10px 12px;
-  border-bottom: 0.5px solid var(--dsw-alias-border-l1, rgba(0,0,0,.04));
-  background: var(--dsw-alias-bg-layer-2, #f9fafb);
+  border-bottom: 0.5px solid ${aliasVar('border-l1')};
+  background: ${aliasVar('bg-layer-2')};
 }
-.agy-card-title { font: var(--dsw-font-xs-strong-13); color: var(--dsw-alias-label-primary, #1f2329); }
+.agy-card-title { font: var(--dsw-font-xs-strong-13); color: ${aliasVar('label-primary')}; }
 .agy-card-body { padding: 6px 12px 8px; }
 
 /* ── Rows inside a card ────────────────────────────────────────────────────
@@ -104,8 +141,8 @@ const CSS = `
 .agy-live {
   display: flex; align-items: center; gap: 7px;
   margin: 2px 2px 6px; padding: 7px 8px; border-radius: 10px;
-  font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-secondary, #61666b);
-  background: var(--dsw-alias-bg-layer-2, #f4f5f7);
+  font: var(--dsw-font-xxs-12); color: ${aliasVar('label-secondary')};
+  background: ${aliasVar('bg-layer-2')};
 }
 /* Master/detail: the account list beside the selected account's detail, so a
  * row and the panel it opens stay in view together — but only when the
@@ -151,23 +188,23 @@ const CSS = `
 }
 .agy-rowitem[data-clickable="true"] { cursor: pointer; }
 .agy-rowitem[data-clickable="true"]:hover {
-  background: var(--dsw-alias-interactive-bg-hover, #f4f5f7);
+  background: ${aliasVar('interactive-bg-hover')};
 }
 .agy-rowitem[data-selected="true"] {
-  background: var(--dsw-alias-interactive-bg-hover, #f4f5f7);
+  background: ${aliasVar('interactive-bg-hover')};
 }
 .agy-rowitem:focus-visible {
-  outline: 2px solid var(--dsw-alias-label-primary, #1f2329);
+  outline: 2px solid ${aliasVar('label-primary')};
   outline-offset: -2px;
 }
 .agy-rowmain { min-width: 0; flex: 1 1 160px; display: flex; flex-direction: column; gap: 3px; }
 .agy-rowtitle { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .agy-rowname {
-  font: var(--dsw-font-xs-strong-13); color: var(--dsw-alias-label-primary, #1f2329);
+  font: var(--dsw-font-xs-strong-13); color: ${aliasVar('label-primary')};
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .agy-rowmeta {
-  font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e);
+  font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')};
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 /* margin-left: auto right-aligns the cluster while it shares a line with the
@@ -185,15 +222,15 @@ const CSS = `
    the gap and their own left alignment, and the dividers turned a metric strip
    into a spreadsheet grid. */
 .agy-metric { padding: 12px 0; }
-.agy-metric-k { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
+.agy-metric-k { font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')}; }
 /* The theme's own role carries family + size + line-height + weight; the
    metric only tightens the tracking. */
 .agy-metric-v { margin-top: 4px; font: var(--dsw-font-base-strong-16); letter-spacing: -.015em;
-  font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-primary, #1f2329); }
+  font-variant-numeric: tabular-nums; color: ${aliasVar('label-primary')}; }
 .agy-metric-v small { margin-left: 2px; font: var(--dsw-font-xxs-strong-12);
-  color: var(--dsw-alias-label-tertiary, #8f959e); }
+  color: ${aliasVar('label-tertiary')}; }
 .agy-metric-d { margin-top: 3px; font: var(--dsw-font-xxxs-11);
-  color: var(--dsw-alias-label-tertiary, #8f959e); }
+  color: ${aliasVar('label-tertiary')}; }
 
 /* ── Token composition ─────────────────────────────────────────────────────
    A share bar per bucket, under the headline metrics. This exists to answer
@@ -206,16 +243,16 @@ const CSS = `
   display: grid; grid-template-columns: 64px minmax(0,1fr) 56px 44px;
   align-items: center; gap: 10px;
 }
-.agy-compose-k { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
+.agy-compose-k { font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')}; }
 .agy-compose-track {
   height: 6px; border-radius: 3px; overflow: hidden;
-  background: var(--dsw-alias-border-l2, rgba(0,0,0,.12));
+  background: ${aliasVar('border-l2')};
 }
 .agy-compose-track i { display: block; height: 100%; border-radius: 3px; }
 .agy-compose-v { text-align: right; font: var(--dsw-font-xxs-12);
-  font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-secondary, #61666b); }
+  font-variant-numeric: tabular-nums; color: ${aliasVar('label-secondary')}; }
 .agy-compose-p { text-align: right; font: var(--dsw-font-xxxs-11);
-  font-variant-numeric: tabular-nums; color: var(--dsw-alias-label-tertiary, #8f959e); }
+  font-variant-numeric: tabular-nums; color: ${aliasVar('label-tertiary')}; }
 /* A table's own footnote: states a column's scope that its header cannot. */
 .agy-table-note { padding: 6px 8px 2px; }
 /* The 65535 row is a CONFIGURATION of High, not a sibling tier: indenting it
@@ -225,25 +262,25 @@ const CSS = `
 /* ── Definition rows (label / value pairs) ───────────────────────────────── */
 .agy-defs { display: grid; grid-template-columns: 92px minmax(0,1fr); margin: 0; }
 .agy-defs dt {
-  padding: 7px 0; font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-tertiary, #8f959e);
-  border-bottom: 0.5px solid var(--dsw-alias-border-l1, rgba(0,0,0,.04));
+  padding: 7px 0; font: var(--dsw-font-xxs-12); color: ${aliasVar('label-tertiary')};
+  border-bottom: 0.5px solid ${aliasVar('border-l1')};
 }
 .agy-defs dd {
-  margin: 0; padding: 7px 0; font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-secondary, #61666b);
-  border-bottom: 0.5px solid var(--dsw-alias-border-l1, rgba(0,0,0,.04));
+  margin: 0; padding: 7px 0; font: var(--dsw-font-xxs-12); color: ${aliasVar('label-secondary')};
+  border-bottom: 0.5px solid ${aliasVar('border-l1')};
   overflow-wrap: anywhere;
 }
 .agy-defs dt:last-of-type, .agy-defs dd:last-of-type { border-bottom: 0; }
 
 /* ── Disclosure (the collapsible model-quota block) ──────────────────────── */
-.agy-disclosure { border-top: 0.5px solid var(--dsw-alias-border-l1, rgba(0,0,0,.04)); }
+.agy-disclosure { border-top: 0.5px solid ${aliasVar('border-l1')}; }
 .agy-disclosure-toggle {
   display: flex; align-items: center; gap: 7px; width: 100%;
   padding: 9px 0; border: 0; cursor: pointer;
   font: var(--dsw-font-xxs-strong-12); text-align: left;
-  color: var(--dsw-alias-label-secondary, #61666b); background: none;
+  color: ${aliasVar('label-secondary')}; background: none;
 }
-.agy-disclosure-toggle:hover { color: var(--dsw-alias-label-primary, #1f2329); }
+.agy-disclosure-toggle:hover { color: ${aliasVar('label-primary')}; }
 .agy-caret {
   flex: none; width: 0; height: 0; border-left: 4px solid currentColor;
   border-top: 3.5px solid transparent; border-bottom: 3.5px solid transparent;
@@ -261,7 +298,7 @@ const CSS = `
 .agy-thinking-group { display: flex; flex-direction: column; }
 .agy-thinking-group + .agy-thinking-group { margin-top: 16px; }
 .agy-thinking-group-name {
-  font: var(--dsw-font-xxs-strong-12); color: var(--dsw-alias-label-secondary, #61666b);
+  font: var(--dsw-font-xxs-strong-12); color: ${aliasVar('label-secondary')};
   margin-bottom: 2px;
 }
 .agy-thinking-group .agy-hint { margin: 0 0 8px; }
@@ -272,28 +309,33 @@ const CSS = `
    last one is why that group has no reference table. */
 .agy-thinking-notes { margin: 0 0 8px; padding-left: 18px; }
 .agy-thinking-notes li {
-  font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e);
+  font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')};
   line-height: 1.6;
 }
 .agy-thinking-row {
   display: grid; grid-template-columns: 72px minmax(0, 180px) auto;
   align-items: center; gap: 14px; padding: 8px 0;
 }
-.agy-thinking-k { font: var(--dsw-font-xxs-12); color: var(--dsw-alias-label-secondary, #61666b); }
+.agy-thinking-k { font: var(--dsw-font-xxs-12); color: ${aliasVar('label-secondary')}; }
+/* The unit sits INSIDE the third column, left of the chips: that auto column is
+   what holds "what the number counts" next to the field it counts, and a unit
+   drifting to the input's far edge would read as a separate label. */
+.agy-input-unit { display: flex; align-items: center; gap: 8px;
+  font: var(--dsw-font-xxs-12); color: ${aliasVar('label-tertiary')}; }
 /* Shortcut chips, not a second control: they fill the field beside them. */
 .agy-thinking-chips { display: flex; gap: 6px; }
 .agy-thinking-chip {
-  border: 0.5px solid var(--dsw-alias-border-l3, rgba(0,0,0,.15));
+  border: 0.5px solid ${aliasVar('border-l3')};
   background: transparent; cursor: pointer; border-radius: 10px;
   padding: 2px 8px; font: var(--dsw-font-xxxs-11);
-  color: var(--dsw-alias-label-secondary, #61666b);
+  color: ${aliasVar('label-secondary')};
 }
-.agy-thinking-chip:hover { background: var(--dsw-alias-interactive-bg-hover); }
+.agy-thinking-chip:hover { background: ${aliasVar('interactive-bg-hover')}; }
 .agy-thinking-chip:focus-visible {
-  outline: 2px solid var(--dsw-alias-brand-primary, #4176e6); outline-offset: 1px;
+  outline: 2px solid ${aliasVar('brand-primary')}; outline-offset: 1px;
 }
 .agy-disclosure-meta { margin-left: auto; font: var(--dsw-font-xxxs-11);
-  color: var(--dsw-alias-label-tertiary, #8f959e); font-variant-numeric: tabular-nums; }
+  color: ${aliasVar('label-tertiary')}; font-variant-numeric: tabular-nums; }
 
 /* ── 5h / weekly limits ────────────────────────────────────────────────────
    One group per upstream group (Gemini, Claude+GPT), each with its windows.
@@ -301,37 +343,43 @@ const CSS = `
      Top: label (left) and countdown + percentage (right)
      Bottom: full-width progress bar track */
 .agy-limits { display: flex; flex-direction: column; gap: 12px; padding: 4px 0; }
-.agy-limit-age { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
+.agy-limit-age { font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')}; }
 .agy-limit-group { display: flex; flex-direction: column; gap: 8px; }
 .agy-limit-group-name {
-  font: var(--dsw-font-xxs-strong-12); color: var(--dsw-alias-label-secondary, #61666b);
+  font: var(--dsw-font-xxs-strong-12); color: ${aliasVar('label-secondary')};
   padding-bottom: 2px;
 }
 .agy-limit-item { display: flex; flex-direction: column; gap: 6px; padding: 2px 0; }
 .agy-limit-header { display: flex; justify-content: space-between; align-items: center; font: var(--dsw-font-xxs-12); }
-.agy-limit-k { color: var(--dsw-alias-label-secondary, #61666b); font: var(--dsw-font-xxs-strong-12); }
+.agy-limit-k { color: ${aliasVar('label-secondary')}; font: var(--dsw-font-xxs-strong-12); }
 .agy-limit-status { display: flex; align-items: center; gap: 8px; }
-.agy-limit-reset { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-label-tertiary, #8f959e); }
+.agy-limit-reset { font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')}; }
 .agy-limit-p { font: var(--dsw-font-xxs-strong-12); font-variant-numeric: tabular-nums; }
 .agy-limit-track { width: 100%; height: 5px; border-radius: 3px; overflow: hidden;
-  background: var(--dsw-alias-border-l2, rgba(0,0,0,.12)); }
+  background: ${aliasVar('border-l2')}; }
 .agy-limit-track i { display: block; height: 100%; border-radius: 3px; transition: width 0.3s ease; }
+/* Fallback 4-column row for any generic limit rendering */
+.agy-limit-row {
+  display: grid; grid-template-columns: 58px minmax(0,1fr) 40px minmax(0,auto);
+  align-items: center; gap: 10px; padding: 4px 0;
+  font: var(--dsw-font-xxs-12);
+}
 /* The burn projection: warn-tinted because "this window runs dry before it resets"
    is the one projection that asks the reader to act. */
-.agy-limit-burn { font: var(--dsw-font-xxxs-11); color: var(--dsw-alias-state-warn-primary, #f59e0b); }
+.agy-limit-burn { font: var(--dsw-font-xxxs-11); color: ${aliasVar('state-warn-primary')}; }
 
 /* ── Dense breakdown tables (Usage tab only) ─────────────────────────────── */
 .agy-table-wrap { padding: 6px 0 2px; }
 .agy-table { width: 100%; border-collapse: collapse; font: var(--dsw-font-xs-13); table-layout: fixed; }
 .agy-table th {
   text-align: left; padding: 0 8px 7px; font: var(--dsw-font-xxxs-strong-11);
-  color: var(--dsw-alias-label-tertiary, #8f959e);
-  border-bottom: 0.5px solid var(--dsw-alias-border-l2, #eef0f3); white-space: nowrap;
+  color: ${aliasVar('label-tertiary')};
+  border-bottom: 0.5px solid ${aliasVar('border-l2')}; white-space: nowrap;
 }
-.agy-table td { padding: 8px; vertical-align: middle; color: var(--dsw-alias-label-secondary, #61666b);
-  border-bottom: 0.5px solid var(--dsw-alias-border-l1, rgba(0,0,0,.04)); }
+.agy-table td { padding: 8px; vertical-align: middle; color: ${aliasVar('label-secondary')};
+  border-bottom: 0.5px solid ${aliasVar('border-l1')}; }
 .agy-table tr:last-child td { border-bottom: 0; }
-.agy-table tbody tr:hover td { background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
+.agy-table tbody tr:hover td { background: ${aliasVar('bg-layer-2')}; }
 .agy-num { text-align: right; font-variant-numeric: tabular-nums; }
 /* Numeric HEADERS must right-align too, and .agy-num alone cannot do it: the
    .agy-table th rule above is specificity 0-1-1 and outranks the bare .agy-num
@@ -342,20 +390,20 @@ const CSS = `
    escalating with !important. */
 .agy-table th.agy-num { text-align: right; }
 /* Inline emphasis on a table cell: a strong role, not a heavier size. */
-.agy-strong { color: var(--dsw-alias-label-primary, #1f2329); font-weight: 500; }
+.agy-strong { color: ${aliasVar('label-primary')}; font-weight: 500; }
 .agy-mail { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agy-mono { font-family: var(--ds-font-family-code); }
 /* The one external link in the section (a verification appeal URL). Colored and
    underlined with theme tokens rather than left to the browser default, which
    ignores both the light/dark theme and the host's brand color. */
-.agy-link { color: var(--dsw-alias-brand-primary-new-colorprimary-new-color, #4176e6); text-decoration: underline; }
+.agy-link { color: ${aliasVar('brand-primary')}; text-decoration: underline; }
 .agy-link:hover { opacity: 0.8; }
 
 .agy-bar { display: inline-flex; align-items: center; gap: 8px; justify-content: flex-end; }
 .agy-bar .agy-track { width: 56px; height: 4px; border-radius: 2px; overflow: hidden;
-  background: var(--dsw-alias-border-l2, rgba(0,0,0,.12)); }
+  background: ${aliasVar('border-l2')}; }
 .agy-bar .agy-track i { display: block; height: 100%; border-radius: 2px;
-  background: var(--dsw-alias-brand-primary-new-colorprimary-new-color, #4176e6); }
+  background: ${aliasVar('brand-primary')}; }
 
 /* ── Range picker container ────────────────────────────────────────────────
    The pills themselves are the host Pill primitive (its own fill pair and
@@ -363,16 +411,16 @@ const CSS = `
 .agy-chips { display: flex; gap: 6px; }
 
 /* Danger has no primitive variant; keep the ghost skin and tint the label. */
-.agy-btn-danger { color: var(--dsw-alias-state-error-primary, #ec1313) !important; }
+.agy-btn-danger { color: ${aliasVar('state-error-primary')} !important; }
 
 /* ── Recent activity ring ──────────────────────────────────────────────────
    The "what just happened" list. Only the result cell carries color — ok
    inherits the table's neutral, and a wall of tinted rows would read as an
    alarm rather than a log. */
 .agy-recent-state { font: var(--dsw-font-xxs-12); }
-.agy-recent-state[data-kind="fail"] { color: var(--dsw-alias-state-error-primary, #ec1313); }
-.agy-recent-state[data-kind="limited"] { color: var(--dsw-alias-state-warn-primary, #f59e0b); }
-.agy-recent-state[data-kind="rotation"] { color: var(--dsw-alias-brand-primary-new-colorprimary-new-color, #4176e6); }
+.agy-recent-state[data-kind="fail"] { color: ${aliasVar('state-error-primary')}; }
+.agy-recent-state[data-kind="limited"] { color: ${aliasVar('state-warn-primary')}; }
+.agy-recent-state[data-kind="rotation"] { color: ${aliasVar('brand-primary')}; }
 /* The recent list is a standalone disclosure on the tab root, not one block
    inside a card body — the separator border-top the disclosure idiom uses
    between sibling blocks would draw a stray line across nothing here. */
@@ -381,9 +429,471 @@ const CSS = `
 .agy-toolbar { display: flex; align-items: center; gap: 8px; }
 .agy-textarea { width: 100%; min-height: 88px; resize: vertical; outline: none;
   padding: 9px 10px; font: var(--dsw-font-xxs-12); font-family: var(--ds-font-family-code);
-  color: var(--dsw-alias-label-primary, #1f2329); background: var(--dsw-alias-bg-layer-1, #fff);
-  border: 0.5px solid var(--dsw-alias-border-l2, #eef0f3); border-radius: 8px; }
-.agy-textarea:focus { border-color: var(--dsw-alias-brand-primary-new-colorprimary-new-color, #4176e6); }
+  color: ${aliasVar('label-primary')}; background: ${aliasVar('bg-layer-1')};
+  border: 0.5px solid ${aliasVar('border-l2')}; border-radius: 8px; }
+.agy-textarea:focus { border-color: ${aliasVar('brand-primary')}; }
+
+/* ── Preferences card ───────────────────────────────────────────────────── */
+.agy-pref-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 4px 0;
+}
+.agy-pref-name {
+  font: var(--dsw-font-xs-strong-13);
+  color: ${aliasVar('label-primary')};
+}
+.agy-pref-desc {
+  font: var(--dsw-font-xxs-12);
+  color: ${aliasVar('label-tertiary')};
+  margin-top: 2px;
+}
+
+/* ── Conversation-header quota badge & popover ─────────────────────────── */
+.agy-ui-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: ${aliasVar('bg-layer-2')};
+  border: 0.5px solid ${aliasVar('border-l2')};
+  border-radius: 9999px;
+  padding: 3px 10px;
+  font: var(--dsw-font-xxs-12);
+  color: ${aliasVar('label-primary')};
+  cursor: pointer;
+  user-select: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  font-family: inherit;
+  height: auto;
+}
+
+.agy-ui-badge:hover,
+.agy-ui-badge.pinned {
+  background: ${aliasVar('bg-layer-3')};
+  border-color: ${aliasVar('border-l1')};
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.12);
+}
+
+.agy-ui-badge.pinned {
+  border-color: ${aliasVar('brand-primary')};
+  box-shadow: 0 0 0 1px ${aliasVar('brand-primary')}, 0 3px 10px rgba(0, 0, 0, 0.12);
+}
+
+.agy-ui-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  transition: background-color 0.3s;
+}
+
+.agy-ui-dot[data-state="done"],
+.agy-ui-dot.active {
+  background-color: ${aliasVar('state-success-primary')};
+  box-shadow: 0 0 6px ${aliasVar('state-success-primary')};
+}
+
+.agy-ui-dot[data-state="warning"],
+.agy-ui-dot.cooling {
+  background-color: ${aliasVar('state-warn-primary')};
+  box-shadow: 0 0 6px ${aliasVar('state-warn-primary')};
+}
+
+.agy-ui-dot[data-state="idle"],
+.agy-ui-dot.disabled {
+  background-color: ${aliasVar('label-tertiary')};
+}
+
+.agy-ui-dot.updating {
+  animation: agy-ui-pulse 1.2s ease-in-out infinite;
+}
+
+.agy-ui-dot.active.updating,
+.agy-ui-dot[data-state="done"].updating {
+  box-shadow: 0 0 10px ${aliasVar('state-success-primary')};
+}
+
+.agy-ui-dot.cooling.updating,
+.agy-ui-dot[data-state="warning"].updating {
+  box-shadow: 0 0 10px ${aliasVar('state-warn-primary')};
+}
+
+@keyframes agy-ui-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.7);
+  }
+}
+
+.agy-ui-sparkle {
+  color: ${aliasVar('brand-primary')};
+  font: var(--dsw-font-xs-13);
+}
+
+.agy-ui-popover-container.desktop {
+  position: static;
+}
+
+.agy-ui-popover-container.mobile {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  animation: agy-ui-fade-in 0.2s ease-out;
+}
+
+.agy-ui-popover {
+  background: ${aliasVar('bg-overlay')};
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 0.5px solid ${aliasVar('border-l2')};
+  box-shadow: 0 20px 45px rgba(0, 0, 0, 0.15), 0 0 0 0.5px ${aliasVar('border-l1')};
+  color: ${aliasVar('label-primary')};
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  z-index: 1000;
+}
+
+.agy-ui-popover.desktop {
+  width: 380px;
+  max-width: calc(100vw - 24px);
+  border-radius: 14px;
+  animation: agy-ui-popover-in 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.agy-ui-popover.mobile {
+  width: 100%;
+  max-height: 82vh;
+  border-radius: 20px 20px 0 0;
+  border-bottom: none;
+  animation: agy-ui-bottom-sheet-in 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.agy-ui-mobile-handle {
+  width: 36px;
+  height: 4px;
+  background: ${aliasVar('border-l2')};
+  border-radius: 9999px;
+  margin: 8px auto 2px auto;
+}
+
+@keyframes agy-ui-popover-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes agy-ui-bottom-sheet-in {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+@keyframes agy-ui-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.agy-ui-modal-header {
+  padding: 10px 14px;
+  border-bottom: 0.5px solid ${aliasVar('border-l2')};
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: ${aliasVar('bg-layer-1')};
+}
+
+.agy-ui-modal-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font: var(--dsw-font-xs-strong-13);
+  color: ${aliasVar('label-primary')};
+}
+
+.agy-ui-pinned-tag {
+  font: var(--dsw-font-xxxs-11);
+  margin-left: 2px;
+}
+
+.agy-ui-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.agy-ui-icon-btn {
+  color: ${aliasVar('label-secondary')};
+  padding: 4px;
+  min-width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  border-radius: 6px;
+  transition: all 0.15s;
+}
+
+.agy-ui-icon-btn:hover {
+  color: ${aliasVar('label-primary')};
+  background: ${aliasVar('bg-layer-2')};
+}
+
+.agy-ui-icon-btn.active {
+  color: ${aliasVar('brand-primary')};
+  background: color-mix(in srgb, ${aliasVar('brand-primary')} 18%, transparent);
+}
+
+.agy-ui-icon-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.agy-ui-spinning {
+  animation: agy-ui-spin 1s linear infinite;
+}
+
+@keyframes agy-ui-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.agy-ui-modal-body {
+  padding: 14px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 480px;
+}
+
+.agy-ui-account-card {
+  background: ${aliasVar('bg-layer-2')};
+  border: 0.5px solid ${aliasVar('border-l1')};
+  border-radius: 9px;
+  padding: 8px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.agy-ui-account-email {
+  font: var(--dsw-font-xxs-12);
+  color: ${aliasVar('label-primary')};
+}
+
+.agy-ui-account-project {
+  font: var(--dsw-font-xxxs-11);
+  color: ${aliasVar('label-tertiary')};
+  margin-top: 2px;
+}
+
+.agy-ui-state-pill {
+  font: var(--dsw-font-xxxs-11);
+  padding: 2px 7px;
+  border-radius: 9999px;
+  text-transform: capitalize;
+}
+
+.agy-ui-state-pill.active {
+  background: color-mix(in srgb, ${aliasVar('state-business-primary')} 15%, transparent);
+  color: ${aliasVar('state-business-primary')};
+  border: 0.5px solid color-mix(in srgb, ${aliasVar('state-business-primary')} 30%, transparent);
+}
+
+.agy-ui-state-pill.cooling {
+  background: color-mix(in srgb, ${aliasVar('state-error-secondary')} 15%, transparent);
+  color: ${aliasVar('state-error-secondary')};
+  border: 0.5px solid color-mix(in srgb, ${aliasVar('state-error-secondary')} 30%, transparent);
+}
+
+.agy-ui-state-pill.verification-required {
+  background: color-mix(in srgb, ${aliasVar('brand-primary')} 15%, transparent);
+  color: ${aliasVar('brand-primary')};
+  border: 0.5px solid color-mix(in srgb, ${aliasVar('brand-primary')} 30%, transparent);
+}
+
+.agy-ui-state-pill.disabled {
+  background: color-mix(in srgb, ${aliasVar('label-tertiary')} 15%, transparent);
+  color: ${aliasVar('label-secondary')};
+  border: 0.5px solid color-mix(in srgb, ${aliasVar('label-tertiary')} 30%, transparent);
+}
+
+.agy-ui-section-label {
+  font: var(--dsw-font-xxxs-11);
+  color: ${aliasVar('label-tertiary')};
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.agy-ui-quota-card {
+  background: ${aliasVar('bg-layer-2')};
+  border: 0.5px solid ${aliasVar('border-l1')};
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.agy-ui-quota-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 2px;
+}
+
+.agy-ui-model-name {
+  font: var(--dsw-font-xxs-12);
+  color: ${aliasVar('label-primary')};
+}
+
+.agy-ui-limit-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.agy-ui-limit-row + .agy-ui-limit-row {
+  margin-top: 5px;
+}
+
+.agy-ui-limit-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font: var(--dsw-font-xxxs-11);
+}
+
+.agy-ui-limit-title {
+  color: ${aliasVar('label-secondary')};
+  font: var(--dsw-font-xxxs-11);
+}
+
+.agy-ui-limit-percent {
+  font: var(--dsw-font-xxs-12);
+  font-variant-numeric: tabular-nums;
+}
+
+.agy-ui-progress-track {
+  width: 100%;
+  height: 5px;
+  background: color-mix(in srgb, ${aliasVar('label-primary')} 8%, transparent);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+
+.agy-ui-progress-fill {
+  height: 100%;
+  border-radius: 9999px;
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.agy-ui-quota-footer {
+  display: flex;
+  justify-content: flex-end;
+  font: var(--dsw-font-xxxs-11);
+  color: ${aliasVar('label-tertiary')};
+  font-variant-numeric: tabular-nums;
+}
+
+.agy-ui-modal-footer {
+  padding: 8px 14px;
+  border-top: 0.5px solid ${aliasVar('border-l2')};
+  background: ${aliasVar('bg-layer-1')};
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  font: var(--dsw-font-xxxs-11);
+  color: ${aliasVar('label-tertiary')};
+}
+
+.agy-ui-window-note {
+  font: var(--dsw-font-xxxs-11);
+  color: ${aliasVar('label-tertiary')};
+  margin-top: 3px;
+  padding: 8px 0;
+}
+
+.agy-ui-limit-age {
+  font: var(--dsw-font-xxxs-11);
+  color: ${aliasVar('label-tertiary')};
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.agy-ui-verify-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font: var(--dsw-font-xxs-12);
+  color: ${aliasVar('brand-primary')};
+  background: color-mix(in srgb, ${aliasVar('brand-primary')} 10%, transparent);
+  border: 0.5px solid color-mix(in srgb, ${aliasVar('brand-primary')} 30%, transparent);
+  border-radius: 9999px;
+  padding: 6px 12px;
+}
+
+.agy-ui-link-btn {
+  color: ${aliasVar('brand-primary')};
+  text-decoration: none;
+  font: var(--dsw-font-xxs-12);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  transition: color 0.15s;
+  background: none;
+  border: none;
+  padding: 0;
+}
+
+.agy-ui-link-btn:hover {
+  text-decoration: underline;
+}
+
+@media (max-width: 640px) {
+  .agy-ui-badge {
+    padding: 2px 7px;
+    font: var(--dsw-font-xxxs-11);
+    gap: 4px;
+  }
+  .agy-ui-modal-body {
+    padding: 12px 14px;
+    gap: 10px;
+  }
+}
 `
 
 /** Install the stylesheet once (idempotent across plugin reloads): a second
@@ -396,12 +906,12 @@ export function installAgyStyles(): () => void {
   if (typeof document === 'undefined') return () => {}
   const existing = document.getElementById(STYLE_ID)
   if (existing !== null) {
-    if (existing.textContent !== CSS) existing.textContent = CSS
+    if (existing.textContent !== AGY_STYLES_CSS) existing.textContent = AGY_STYLES_CSS
     return () => {}
   }
   const style = document.createElement('style')
   style.id = STYLE_ID
-  style.textContent = CSS
+  style.textContent = AGY_STYLES_CSS
   document.head.appendChild(style)
   return () => {}
 }

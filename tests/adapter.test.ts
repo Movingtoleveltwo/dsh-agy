@@ -4,11 +4,17 @@ import fs from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
 import { AGY_CLAUDE_MAX_OUTPUT_TOKENS, AGY_SCHEMA_ALLOWLIST, toAgyRequestBody } from '../src/adapter/translate.ts'
-import { parseAgySse, parseSseDataLine } from '../src/adapter/parse.ts'
+import {
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  parseAgySse,
+  parseSseDataLine,
+  resolveStreamIdleTimeoutMs,
+} from '../src/adapter/parse.ts'
 import { catalogModelList, fetchAvailableModels, listAgyModels, mergeModelCatalog, resolveAgyModel } from '../src/adapter/models.ts'
-import { AGY_PUBLIC_MODELS, formatTieredModelName } from '../src/adapter/catalog.ts'
+import { AGY_PUBLIC_MODELS, formatTieredModelName, isChatCallableModelId } from '../src/adapter/catalog.ts'
 import { AgyAdapter, buildRequestHeaders } from '../src/adapter/adapter.ts'
 import type { AgyAccountSession } from '../src/adapter/adapter.ts'
+import { getThoughtSignature } from '../src/runtime/signature-cache.ts'
 import { AgyAuthError, AgyPoolBlockedError } from '../src/types.ts'
 function textMessage(role: Message['role'], text: string): Message {
   return { id: `m-${Math.random()}`, role, content: [{ type: 'text', text }] } as Message
@@ -205,6 +211,241 @@ describe('translate', () => {
     )
     expect(body.request.contents[2]!.parts).toEqual([
       { functionResponse: { id: 'call-9', name: 'read', response: { result: 'boom', is_error: true } } },
+    ])
+  })
+
+  // The harness emits a fragmented per-step vocabulary (prompt + runtime-context
+  // snapshot + injected reminders as separate `user` messages, one message per
+  // tool result) and its own first-party serializer coalesces adjacent
+  // same-role messages at the wire boundary. Forwarding 1:1 instead put runs of
+  // `user` turns belonging to one logical prompt on the wire (issue #93).
+  it('coalesces adjacent user turns (prompt + injected context) into one', () => {
+    const messages = [
+      { id: 'u1', role: 'user', content: [{ type: 'text', text: '帮我总结这个文件' }] },
+      { id: 'u2', role: 'user', content: [{ type: 'text', text: 'Current runtime context. …' }] },
+      { id: 'u3', role: 'user', content: [{ type: 'text', text: '<system-reminder>skill catalog</system-reminder>' }] },
+    ]
+    const body = toAgyRequestBody(generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }), {})
+    expect(body.request.contents).toEqual([
+      {
+        role: 'user',
+        parts: [
+          { text: '帮我总结这个文件' },
+          { text: 'Current runtime context. …' },
+          { text: '<system-reminder>skill catalog</system-reminder>' },
+        ],
+      },
+    ])
+  })
+
+  // Parallel tool results must group into one functionResponse turn — the shape
+  // the official Gemini tooling produces and its own a2a-server enforces.
+  it('groups parallel tool results into a single functionResponse turn', () => {
+    const messages = [
+      { id: 'a', role: 'assistant', content: [
+        { type: 'tool-call', id: 'call-a', name: 'read', arguments: '{}' },
+        { type: 'tool-call', id: 'call-b', name: 'read', arguments: '{}' },
+      ]},
+      { id: 't1', role: 'tool', toolCallId: 'call-a', content: [{ type: 'text', text: 'a' }] },
+      { id: 't2', role: 'tool', toolCallId: 'call-b', content: [{ type: 'text', text: 'b' }] },
+    ]
+    const body = toAgyRequestBody(generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }), {})
+    expect(body.request.contents.map((content) => content.role)).toEqual(['model', 'user'])
+    expect(body.request.contents[1]!.parts).toEqual([
+      { functionResponse: { id: 'call-a', name: 'read', response: { result: 'a', is_error: false } } },
+      { functionResponse: { id: 'call-b', name: 'read', response: { result: 'b', is_error: false } } },
+    ])
+  })
+
+  // A functionResponse turn never merges with (or receives) text parts: the
+  // Gemini-family validator rejects a user content mixing functionResponse with
+  // text (measured 400 on the model family), so the two families stay in
+  // separate adjacent turns. The following text turns still coalesce together.
+  it('keeps a functionResponse turn unmixed from the following text turns', () => {
+    const messages = [
+      { id: 'a', role: 'assistant', content: [{ type: 'tool-call', id: 'call-a', name: 'read', arguments: '{}' }] },
+      { id: 't1', role: 'tool', toolCallId: 'call-a', content: [{ type: 'text', text: 'body' }] },
+      { id: 'u1', role: 'user', content: [{ type: 'text', text: 'next question' }] },
+      { id: 'u2', role: 'user', content: [{ type: 'text', text: 'Current runtime context. …' }] },
+    ]
+    const body = toAgyRequestBody(generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }), {})
+    expect(body.request.contents.map((content) => content.role)).toEqual(['model', 'user', 'user'])
+    expect(body.request.contents[1]!.parts).toEqual([
+      { functionResponse: { id: 'call-a', name: 'read', response: { result: 'body', is_error: false } } },
+    ])
+    expect(body.request.contents[2]!.parts).toEqual([{ text: 'next question' }, { text: 'Current runtime context. …' }])
+  })
+
+  // A 0.1.5 user message can carry tool-result and text blocks in one message;
+  // it is segmented in part order so neither turn ends up mixed.
+  it('segments a mixed tool-result + text user message into family runs', () => {
+    const messages = [
+      { id: 'a', role: 'assistant', content: [{ type: 'tool-call', id: 'call-1', name: 'read', arguments: '{}' }] },
+      { id: 'b', role: 'user', content: [
+        { type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text', text: 'body' }] },
+        { type: 'text', text: 'and also this' },
+      ]},
+    ]
+    const body = toAgyRequestBody(generateOptions({ messages }), {})
+    expect(body.request.contents).toEqual([
+      { role: 'model', parts: [{ thoughtSignature: 'skip_thought_signature_validator', functionCall: { id: 'call-1', name: 'read', args: {} } }] },
+      { role: 'user', parts: [{ functionResponse: { id: 'call-1', name: 'read', response: { result: 'body', is_error: false } } }] },
+      { role: 'user', parts: [{ text: 'and also this' }] },
+    ])
+  })
+
+  // A tool-call id is NOT unique across a conversation: `parse.ts` falls back
+  // to `String(blockIndex)` when the upstream omits `functionCall.id` and that
+  // counter restarts at 0 for every stream, so distant turns routinely answer
+  // the same id. A single-valued name index resolved every one of them to the
+  // LAST call recorded under that id, and Google validates `name` against the
+  // call the response answers — the whole history was rejected with 400
+  // `INVALID_ARGUMENT` and every retry replayed the same broken history
+  // (issue #99). Measured pin, on the 0.2.0 vocabulary: turn 12's `job_output`
+  // result must not ride turn 23's `bash` name.
+  it('resolves a repeated tool-call id to each result\'s own call (0.2.0 tool-role)', () => {
+    const messages = [
+      { id: 'a', role: 'assistant', content: [
+        { type: 'tool-call', id: 'call_200990', name: 'job_output', arguments: '{"job":"b-1"}' },
+      ]},
+      { id: 't1', role: 'tool', toolCallId: 'call_200990', content: [{ type: 'text', text: 'job output' }] },
+      { id: 'u1', role: 'user', content: [{ type: 'text', text: 'keep going' }] },
+      { id: 'a2', role: 'assistant', content: [
+        { type: 'tool-call', id: 'call_200990', name: 'bash', arguments: '{"cmd":"ls"}' },
+      ]},
+      { id: 't2', role: 'tool', toolCallId: 'call_200990', content: [{ type: 'text', text: 'ls output' }] },
+    ]
+    const body = toAgyRequestBody(
+      generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }),
+      {},
+    )
+    expect(body.request.contents.map((content) => content.role)).toEqual(['model', 'user', 'user', 'model', 'user'])
+    expect(body.request.contents[1]!.parts).toEqual([
+      { functionResponse: { id: 'call_200990', name: 'job_output', response: { result: 'job output', is_error: false } } },
+    ])
+    expect(body.request.contents[2]!.parts).toEqual([{ text: 'keep going' }])
+    expect(body.request.contents[4]!.parts).toEqual([
+      { functionResponse: { id: 'call_200990', name: 'bash', response: { result: 'ls output', is_error: false } } },
+    ])
+  })
+
+  // Same collision, 0.1.5 vocabulary: the result rides a `tool-result` content
+  // block inside a user message. The wire shape must not depend on which
+  // dsh-llm line produced the conversation, so the resolution cannot either.
+  it('resolves a repeated tool-call id to each result\'s own call (0.1.5 tool-result block)', () => {
+    const messages = [
+      { id: 'a', role: 'assistant' as const, content: [
+        { type: 'tool-call' as const, id: 'call_200990', name: 'job_output', arguments: '{"job":"b-1"}' },
+      ]},
+      { id: 'b', role: 'user' as const, content: [
+        { type: 'tool-result' as const, toolCallId: 'call_200990', content: [{ type: 'text' as const, text: 'job output' }] },
+      ]},
+      { id: 'a2', role: 'assistant' as const, content: [
+        { type: 'tool-call' as const, id: 'call_200990', name: 'bash', arguments: '{"cmd":"ls"}' },
+      ]},
+      { id: 'b2', role: 'user' as const, content: [
+        { type: 'tool-result' as const, toolCallId: 'call_200990', content: [{ type: 'text' as const, text: 'ls output' }] },
+      ]},
+    ]
+    const body = toAgyRequestBody(generateOptions({ messages }), {})
+    expect(body.request.contents.map((content) => content.role)).toEqual(['model', 'user', 'model', 'user'])
+    expect(body.request.contents[1]!.parts).toEqual([
+      { functionResponse: { id: 'call_200990', name: 'job_output', response: { result: 'job output', is_error: false } } },
+    ])
+    expect(body.request.contents[3]!.parts).toEqual([
+      { functionResponse: { id: 'call_200990', name: 'bash', response: { result: 'ls output', is_error: false } } },
+    ])
+  })
+
+  // Two parallel calls sharing ONE id inside the same assistant turn: the
+  // results arrive in the same order as the calls, so the queue must be
+  // consumed in document order rather than pinned to either name.
+  it('resolves two calls sharing one id within one assistant turn in order', () => {
+    const messages = [
+      { id: 'a', role: 'assistant', content: [
+        { type: 'tool-call', id: 'call-x', name: 'read', arguments: '{"path":"a"}' },
+        { type: 'tool-call', id: 'call-x', name: 'write', arguments: '{"path":"b"}' },
+      ]},
+      { id: 't1', role: 'tool', toolCallId: 'call-x', content: [{ type: 'text', text: 'read body' }] },
+      { id: 't2', role: 'tool', toolCallId: 'call-x', content: [{ type: 'text', text: 'write body' }] },
+    ]
+    const body = toAgyRequestBody(
+      generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }),
+      {},
+    )
+    expect(body.request.contents.map((content) => content.role)).toEqual(['model', 'user'])
+    expect(body.request.contents[1]!.parts).toEqual([
+      { functionResponse: { id: 'call-x', name: 'read', response: { result: 'read body', is_error: false } } },
+      { functionResponse: { id: 'call-x', name: 'write', response: { result: 'write body', is_error: false } } },
+    ])
+  })
+
+  // Nothing ever recorded this id, so the caller's `?? toolCallId` fallback
+  // answers exactly as it did before the index became a queue. This is the ONLY
+  // case that reaches the raw id: an id is not a function name, so it is a
+  // guaranteed 400 and must stay the last resort.
+  it('falls back to the raw id when nothing recorded the id', () => {
+    const messages = [
+      { id: 'a', role: 'assistant', content: [
+        { type: 'tool-call', id: 'call-1', name: 'read', arguments: '{}' },
+      ]},
+      { id: 't1', role: 'tool', toolCallId: 'call-orphan', content: [{ type: 'text', text: 'unmatched' }] },
+    ]
+    const body = toAgyRequestBody(
+      generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }),
+      {},
+    )
+    expect(body.request.contents[1]!.parts).toEqual([
+      { functionResponse: { id: 'call-orphan', name: 'call-orphan', response: { result: 'unmatched', is_error: false } } },
+    ])
+  })
+
+  // More results than calls under one id — a call dropped from the history while
+  // its result survived. The queue is drained, so nothing is left to pair: the
+  // last name recorded for the id is a guess that is right whenever the repeated
+  // calls were the same tool, where the raw id would be wrong every time. Pinned
+  // with two DIFFERENT names so the choice of "last" over "first" is deliberate
+  // and a later change to it has to be intentional.
+  it('answers a drained id with the last name recorded for it', () => {
+    const messages = [
+      { id: 'a', role: 'assistant', content: [
+        { type: 'tool-call', id: 'call-x', name: 'read', arguments: '{}' },
+        { type: 'tool-call', id: 'call-x', name: 'write', arguments: '{}' },
+      ]},
+      { id: 't1', role: 'tool', toolCallId: 'call-x', content: [{ type: 'text', text: 'read body' }] },
+      { id: 't2', role: 'tool', toolCallId: 'call-x', content: [{ type: 'text', text: 'write body' }] },
+      { id: 't3', role: 'tool', toolCallId: 'call-x', content: [{ type: 'text', text: 'orphan body' }] },
+    ]
+    const body = toAgyRequestBody(
+      generateOptions({ messages: messages as unknown as GenerateOptions['messages'] }),
+      {},
+    )
+    expect(body.request.contents.map((content) => content.role)).toEqual(['model', 'user'])
+    expect(body.request.contents[1]!.parts).toEqual([
+      { functionResponse: { id: 'call-x', name: 'read', response: { result: 'read body', is_error: false } } },
+      { functionResponse: { id: 'call-x', name: 'write', response: { result: 'write body', is_error: false } } },
+      { functionResponse: { id: 'call-x', name: 'write', response: { result: 'orphan body', is_error: false } } },
+    ])
+  })
+
+  // A model turn whose parts all drop (a thoughts-only turn replayed on the
+  // Claude path) is filtered to null, so the user turns around it fuse into
+  // one. A placeholder turn would fabricate model content and a structural
+  // empty turn is unmeasured on this channel — pinned as known behavior,
+  // not an accident (issue #93).
+  it('fuses the user runs around a model turn that projects to nothing', () => {
+    const messages = [
+      { id: 'u1', role: 'user', content: [{ type: 'text', text: 'question one' }] },
+      { id: 'u2', role: 'user', content: [{ type: 'text', text: 'Current runtime context. …' }] },
+      { id: 'a1', role: 'assistant', content: [{ type: 'reasoning', text: 'a gemini thought' }] },
+      { id: 'u3', role: 'user', content: [{ type: 'text', text: 'question two' }] },
+    ]
+    const body = toAgyRequestBody(generateOptions({ model: 'claude-opus-4-6-thinking', messages }), {})
+    expect(body.request.contents).toEqual([
+      {
+        role: 'user',
+        parts: [{ text: 'question one' }, { text: 'Current runtime context. …' }, { text: 'question two' }],
+      },
     ])
   })
 
@@ -464,6 +705,28 @@ describe('translate', () => {
     for (const nested of ['items']) {
       if (nested in node) assertUpstreamContract(node[nested], `${path}.${nested}`)
     }
+    // protobuf `Schema` has no "any item" form, so an array without `items` is
+    // rejected as `properties[<name>].items: missing field` (measured against
+    // gemini-3.8-flash: `research_audit_derivation.steps`). JSON Schema itself
+    // allows the omission, so the sanitizer supplies a typed one.
+    //
+    // The VALUE, not the key: `items: undefined` keeps the key on the object
+    // and still serializes to nothing, so `'items' in node` passes while the
+    // wire carries the very 400 this guards. A tuple keeps an ARRAY there,
+    // which the `toBe(false)` at the top of this function rejects.
+    if (node.type === 'array') {
+      expect(node.items, `${path}: array without items is rejected upstream`).toBeTypeOf('object')
+    }
+    // The same "missing field" error is what a nested schema slot that
+    // declares neither `type` nor `properties` produces — those slots are the
+    // ones reached through `properties.*.items` / `.additionalProperties`.
+    const isNestedSlot = /\.(items|additionalProperties)(\.|$)/.test(path)
+    if (isNestedSlot) {
+      expect(
+        'type' in node || 'properties' in node,
+        `${path}: nested schema without type/properties is rejected upstream`,
+      ).toBe(true)
+    }
     // additionalProperties accepts a boolean (false = no extra keys) or a
     // nested schema — live-verified accepted by the Antigravity upstream.
     if ('additionalProperties' in node) {
@@ -521,6 +784,192 @@ describe('translate', () => {
       const body = toAgyRequestBody(generateOptions({ tools: [tool] }), {})
       assertUpstreamContract(body.request.tools![0].functionDeclarations[0].parameters)
     }
+  })
+
+  // Trigger: gemini-3.8-flash rejected the whole request with
+  // `GenerateContentRequest.tools[0].functionDeclarations[135].parameters
+  // .properties[steps].items: missing field.` The declaration is this
+  // register's own `research_audit_derivation` (`@suxeca/dsh-research-core`),
+  // whose parameter map declares `steps: {type:'array', required:true}` with
+  // no `items` — valid JSON Schema (DSH's enforced subset documents `items`
+  // as optional), impossible in protobuf Schema. Every shape below is copied
+  // from a LIVE registered tool schema, not invented:
+  //   research_audit_derivation.steps  — array, no items
+  //   research_audit_derivation.symbols — array, no items
+  //   research_hostile_review.claims    — array, no items
+  //   mcp__firecrawl__firecrawl_search.sources — items present, no `type`
+  //     (a keyword-only union carrier: `{anyOf:[...]}` — no `oneOf` keyword
+  //     survives the allowlist, so it reaches upstream typeless)
+  const ARRAY_ITEM_SHAPES = [{
+    name: 'research_audit_derivation',
+    description: '第一性原理推导审查',
+    parameters: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: '推导主题或命题名称' },
+        steps: {
+          type: 'array',
+          description: '推导步骤列表 [{ stepIndex, rawText, equation, classification, assumptions }]',
+        },
+        invariantObject: {
+          type: 'object',
+          description: '考察的组织对象',
+          additionalProperties: true,
+        },
+        symbols: { type: 'array', description: '符号与物理量纲列表 [{ symbol, dimension, rawUnit }]' },
+        axioms: { type: 'array', description: '显式公理起点/哈密顿量定义（Axioms/Postulates）', items: { type: 'string' } },
+      },
+      required: ['steps'],
+    },
+  }, {
+    name: 'mcp__firecrawl__firecrawl_search',
+    description: 'Search web, news, or image sources',
+    parameters: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', minLength: 1, description: 'Query' },
+        sources: {
+          description: 'Search sources',
+          type: 'array',
+          items: {
+            anyOf: [
+              { type: 'string', enum: ['web', 'images', 'news', 'alexandria', 'exchange'] },
+              {
+                type: 'object',
+                properties: { type: { type: 'string', enum: ['web', 'images', 'news', 'alexandria', 'exchange'] } },
+                required: ['type'],
+                additionalProperties: false,
+              },
+            ],
+          },
+        },
+      },
+      required: ['query'],
+    },
+  }]
+
+  it('gives an array without items a typed item schema (missing-field 400)', () => {
+    for (const tool of ARRAY_ITEM_SHAPES) {
+      const body = toAgyRequestBody(generateOptions({ tools: [tool] }), {})
+      const parameters = body.request.tools![0].functionDeclarations[0].parameters as {
+        properties: Record<string, Record<string, unknown>>
+      }
+      assertUpstreamContract(parameters)
+
+      const steps = parameters.properties.steps
+      if (steps) {
+        expect(steps.type).toBe('array')
+        expect(steps.items).toEqual({ type: 'string' })
+      }
+      for (const [name, child] of Object.entries(parameters.properties)) {
+        if (child.type !== 'array') continue
+        expect(child.items, `${name}: array must carry items upstream`).toBeDefined()
+        const items = child.items as Record<string, unknown>
+        // A declared `items` is preserved (never rewritten to the fallback),
+        // and it can never reach upstream typeless.
+        expect(typeof items.type, `${name}.items: must be typed upstream`).toBe('string')
+        if (name === 'sources') expect(items.type).toBe('string')
+      }
+    }
+  })
+
+  it('preserves a declared items schema byte-for-byte', () => {
+    const body = toAgyRequestBody(
+      generateOptions({
+        tools: [{
+          name: 'x',
+          description: 'd',
+          parameters: {
+            type: 'object',
+            properties: {
+              steps: { type: 'array', items: { type: 'object', additionalProperties: true } },
+              tags: { type: 'array', items: { type: 'string', enum: ['a', 'b'] } },
+              empty_items: { type: 'array', items: {} },
+            },
+          },
+        }],
+      }),
+      {},
+    )
+    const p = body.request.tools![0].functionDeclarations[0].parameters as {
+      properties: Record<string, Record<string, unknown>>
+    }
+    expect(p.properties.steps.items).toEqual({ type: 'object', additionalProperties: true })
+    expect(p.properties.tags.items).toEqual({ type: 'string', enum: ['a', 'b'] })
+    // An `items: {}` is typeless too, so it gets the same fallback.
+    expect(p.properties.empty_items.items).toEqual({ type: 'string' })
+  })
+
+  // Three shapes that reach the wire with no usable `items`, none of which the
+  // key-presence guard (`'items' in node`) could see: the key is there, the
+  // value is not something protobuf can parse. The first is the important one —
+  // `items: undefined` serializes to nothing, i.e. the exact
+  // `properties[<name>].items: missing field` 400 the guard exists for, and the
+  // old assertion passed it.
+  it('treats an absent, null or scalar items as missing', () => {
+    const body = toAgyRequestBody(
+      generateOptions({
+        tools: [{
+          name: 'x',
+          description: 'd',
+          parameters: {
+            type: 'object',
+            properties: {
+              undefined_items: { type: 'array', items: undefined },
+              null_items: { type: 'array', items: null },
+              scalar_items: { type: 'array', items: 'string' as unknown as Record<string, unknown> },
+              absent_items: { type: 'array' },
+            },
+          },
+        }],
+      }),
+      {},
+    )
+    const p = body.request.tools![0].functionDeclarations[0].parameters as {
+      properties: Record<string, Record<string, unknown>>
+    }
+    assertUpstreamContract(p)
+    for (const name of ['undefined_items', 'null_items', 'scalar_items', 'absent_items']) {
+      expect(p.properties[name]!.items, `${name}: must reach the wire with a typed items`).toEqual({ type: 'string' })
+    }
+    // The wire form is what matters: a key that serializes away is the 400.
+    const wire = JSON.parse(JSON.stringify(p)) as { properties: Record<string, Record<string, unknown>> }
+    for (const name of ['undefined_items', 'null_items', 'scalar_items', 'absent_items']) {
+      expect(wire.properties[name]!.items, `${name}: serialized items`).toEqual({ type: 'string' })
+    }
+  })
+
+  // protobuf `Schema.items` is a single message, never repeated, so a JSON
+  // Schema tuple has no wire form and goes up as an array the parser rejects.
+  // Degrading to the first element is the same additive philosophy as the
+  // missing-`items` fallback: the alternative is a 400 for the whole request.
+  it('degrades a tuple items to its first element', () => {
+    const body = toAgyRequestBody(
+      generateOptions({
+        tools: [{
+          name: 'x',
+          description: 'd',
+          parameters: {
+            type: 'object',
+            properties: {
+              pair: { type: 'array', items: [{ type: 'string' }, { type: 'number' }] },
+              empty_tuple: { type: 'array', items: [] },
+              nested_tuple: { type: 'array', items: [[{ type: 'string' }]] },
+            },
+          },
+        }],
+      }),
+      {},
+    )
+    const p = body.request.tools![0].functionDeclarations[0].parameters as {
+      properties: Record<string, Record<string, unknown>>
+    }
+    assertUpstreamContract(p)
+    expect(p.properties.pair!.items).toEqual({ type: 'string' })
+    // An empty tuple has no first element to keep, so it takes the fallback.
+    expect(p.properties.empty_tuple!.items).toEqual({ type: 'string' })
+    // A nested tuple degrades the same way, one level at a time.
+    expect(p.properties.nested_tuple!.items).toEqual({ type: 'string' })
   })
 
   it('sanitizes tool names to the upstream charset and dedupes', () => {
@@ -941,6 +1390,134 @@ describe('parseAgySse', () => {
     ])))
     expect(chunks[chunks.length - 1]).toMatchObject({ type: 'finish', reason: { kind: 'stop' } })
   })
+
+  it('fails a stalled body on the idle timeout instead of hanging forever', async () => {
+    // The streaming dispatcher runs with `bodyTimeout: 0` on purpose (a
+    // reasoning pause must not be killed mid-turn), so a body that stops
+    // producing bytes without closing has no transport-level reclaim: without
+    // the watchdog this read never settles and the turn hangs until the user
+    // cancels it.
+    const encoder = new TextEncoder()
+    const stalled = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: [{"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}]\n'))
+        // ...and then nothing: no further byte, no close.
+      },
+    })
+    const iterator = parseAgySse(stalled, { idleTimeoutMs: 25 })[Symbol.asyncIterator]()
+    expect((await iterator.next()).value).toMatchObject({ type: 'block-start' })
+    expect((await iterator.next()).value).toMatchObject({ type: 'text-delta', text: 'partial' })
+    await expect(iterator.next()).rejects.toThrow(/idle timeout: no data received/)
+  })
+
+  it('keeps waiting on a silent-but-alive body when the watchdog is disabled', async () => {
+    const encoder = new TextEncoder()
+    let push!: (line: string) => void
+    let close!: () => void
+    const live = new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (line) => controller.enqueue(encoder.encode(line + '\n'))
+        close = () => controller.close()
+      },
+    })
+    const iterator = parseAgySse(live, { idleTimeoutMs: 0 })[Symbol.asyncIterator]()
+    const firstPull = iterator.next()
+    // Silence longer than the 25ms the watchdog above tolerates: with the
+    // watchdog disabled a slow-but-alive body must be given all the time it
+    // needs (a generator may legitimately stay silent while it reasons).
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    push('data: [{"candidates":[{"content":{"parts":[{"text":"late"}]},"finishReason":"STOP"}]}]')
+    push('data: [DONE]')
+    close()
+    const chunks: Array<{ type: string; text?: string }> = []
+    for (let next = await firstPull; next.done !== true; next = await iterator.next()) {
+      chunks.push(next.value as { type: string; text?: string })
+    }
+    expect(chunks.some((chunk) => chunk.text === 'late')).toBe(true)
+  })
+
+  it('stops waiting for a stalled body the moment the request is aborted', async () => {
+    // The read loop only checks `signal.aborted` BETWEEN reads, so without an
+    // abort leg a cancelled turn keeps waiting out the whole idle window.
+    const controller = new AbortController()
+    const stalled = new ReadableStream<Uint8Array>({ start() { /* never produces */ } })
+    const iterator = parseAgySse(stalled, {
+      idleTimeoutMs: 60_000,
+      signal: controller.signal,
+    })[Symbol.asyncIterator]()
+    const pull = iterator.next()
+    controller.abort()
+    await expect(pull).rejects.toMatchObject({ name: 'AbortError' })
+  })
+
+  it('flushes stashed usage when an in-flight read is aborted', async () => {
+    const encoder = new TextEncoder()
+    let push!: (line: string) => void
+    let streamReady!: () => void
+    const ready = new Promise<void>((resolve) => { streamReady = resolve })
+    const controller = new AbortController()
+    const live = new ReadableStream<Uint8Array>({
+      start(c) {
+        push = (line) => c.enqueue(encoder.encode(line + '\n'))
+        streamReady()
+      },
+    })
+    const iterator = parseAgySse(live, { signal: controller.signal, idleTimeoutMs: 60_000 })[Symbol.asyncIterator]()
+    const pull = iterator.next()
+    await ready
+    push('data: [{"candidates":[{"content":{"parts":[{"thought":true,"text":"thinking"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3}}]')
+    const first = await pull
+    expect(first.value).toMatchObject({ type: 'block-start', blockType: 'reasoning' })
+    const second = await iterator.next()
+    expect(second.value).toMatchObject({ type: 'reasoning-delta', text: 'thinking' })
+    // Now that the first event is fully drained, the generator awaits the next read:
+    const abortPull = iterator.next()
+    controller.abort()
+    // The abort must flush the stashed usage before rejecting:
+    const usageChunk = await abortPull
+    expect(usageChunk.value).toMatchObject({
+      type: 'usage',
+      usage: { inputTokens: 10, outputTokens: 3 },
+    })
+    await expect(iterator.next()).rejects.toMatchObject({ name: 'AbortError' })
+  })
+})
+
+describe('resolveStreamIdleTimeoutMs', () => {
+  afterEach(() => {
+    delete process.env.DSH_AGY_IDLE_TIMEOUT_MS
+    delete process.env.AGY_IDLE_TIMEOUT_MS
+  })
+
+  it('returns the default 180s when unset', () => {
+    expect(resolveStreamIdleTimeoutMs()).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
+  })
+
+  it('parses valid positive values from DSH_AGY_IDLE_TIMEOUT_MS', () => {
+    process.env.DSH_AGY_IDLE_TIMEOUT_MS = '60000'
+    expect(resolveStreamIdleTimeoutMs()).toBe(60000)
+  })
+
+  it('allows explicit 0 to disable the watchdog', () => {
+    process.env.DSH_AGY_IDLE_TIMEOUT_MS = '0'
+    expect(resolveStreamIdleTimeoutMs()).toBe(0)
+  })
+
+  it('falls back to AGY_IDLE_TIMEOUT_MS when DSH_ prefix is unset or empty', () => {
+    process.env.AGY_IDLE_TIMEOUT_MS = '30000'
+    expect(resolveStreamIdleTimeoutMs()).toBe(30000)
+
+    process.env.DSH_AGY_IDLE_TIMEOUT_MS = '   '
+    expect(resolveStreamIdleTimeoutMs()).toBe(30000)
+  })
+
+  it('falls back to default on negative or non-numeric values instead of disabling', () => {
+    process.env.DSH_AGY_IDLE_TIMEOUT_MS = '-1'
+    expect(resolveStreamIdleTimeoutMs()).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
+
+    process.env.DSH_AGY_IDLE_TIMEOUT_MS = 'invalid'
+    expect(resolveStreamIdleTimeoutMs()).toBe(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
+  })
 })
 
 describe('models', () => {
@@ -984,6 +1561,23 @@ describe('models', () => {
       audioTranscriptionModelIds: ['models/proactive-observer-v10'],
     })
     expect(merged.map((m) => m.id)).toEqual(['gemini-3.6-flash-high'])
+  })
+
+  it('treats a chat_ session id as non-chat even when no role list names it', () => {
+    // The role list is the primary signal, but it is optional in the payload:
+    // an account that omits `tabModelIds` must still not get a raw session id in
+    // the picker. Same rule the tab_ prefix already applied.
+    expect(isChatCallableModelId('chat_20706')).toBe(false)
+    expect(isChatCallableModelId('chat_23310')).toBe(false)
+    expect(isChatCallableModelId('tab_flash_lite_preview')).toBe(false)
+    // A chat-prefixed id that is NOT the session shape stays callable: the rule
+    // is the digits suffix, not the word.
+    expect(isChatCallableModelId('chat-flash')).toBe(true)
+    expect(isChatCallableModelId('gemini-3.8-flash-tiered')).toBe(true)
+
+    expect(mergeModelCatalog({
+      models: { 'gemini-3.6-flash-high': {}, 'chat_20706': {} },
+    }).map((m) => m.id)).toEqual(['gemini-3.6-flash-high'])
   })
 
   it('hides a deprecated id only when its replacement is present, chat-callable and visible', () => {
@@ -1442,7 +2036,11 @@ describe('buildRequestHeaders', () => {
 })
 
 describe('AgyAdapter', () => {
-  afterEach(() => vi.unstubAllGlobals())
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    delete process.env.DSH_AGY_IDLE_TIMEOUT_MS
+    delete process.env.AGY_IDLE_TIMEOUT_MS
+  })
 
   function session(overrides: Partial<AgyAccountSession> = {}): AgyAccountSession {
     return {
@@ -1563,6 +2161,515 @@ describe('AgyAdapter', () => {
       for await (const _ of adapter.stream(generateOptions())) void _
     }).rejects.toMatchObject({ code: 'UPSTREAM' })
     expect(failures).toEqual(['request-error'])
+  })
+
+  it('retries a stream ending in MALFORMED_FUNCTION_CALL and yields the recovered attempt', async () => {
+    let callCount = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      callCount++
+      if (callCount === 1) {
+        return new Response(sseStream([
+          'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash","args":"{bad"}}]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}]',
+          'data: [DONE]',
+        ]), { status: 200 })
+      }
+      return new Response(sseStream([
+        'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash","args":{"command":"ls"}}}]},"finishReason":"STOP"}]}]',
+        'data: [DONE]',
+      ]), { status: 200 })
+    }))
+
+    const records: unknown[] = []
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+      recordUsage: (record) => { records.push(record) },
+    })
+
+    const chunks: StreamChunk[] = []
+    for await (const chunk of adapter.stream(generateOptions())) {
+      chunks.push(chunk)
+    }
+
+    expect(callCount).toBe(2)
+    const toolCallDelta = chunks.find((c) => c.type === 'tool-call-delta') as { type: string; name?: string } | undefined
+    expect(toolCallDelta?.name).toBe('bash')
+    expect(records).toHaveLength(2)
+    expect(records[0]).toMatchObject({ ok: false, reason: 'request-error' })
+    expect(records[1]).toMatchObject({ ok: true })
+  })
+
+  it('retries up to 3 times on persistent MALFORMED_FUNCTION_CALL before failing with UPSTREAM', async () => {
+    let callCount = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      callCount++
+      // Every attempt is billed on its own, INCLUDING the terminal one: the
+      // upstream reports usage on the very event that ends the stream, so a
+      // fixture without it cannot catch the terminal path dropping the tokens.
+      return new Response(sseStream([
+        'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash"}}]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":42,"candidatesTokenCount":9}}]',
+        'data: [DONE]',
+      ]), { status: 200 })
+    }))
+
+    const failures: string[] = []
+    const records: Array<{ ok: boolean; usage?: { input: number; output: number } }> = []
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async (kind) => { failures.push(kind) },
+      recordUsage: (record) => { records.push(record as never) },
+    })
+
+    await expect(async () => {
+      for await (const _ of adapter.stream(generateOptions())) void _
+    }).rejects.toMatchObject({ code: 'UPSTREAM' })
+
+    expect(callCount).toBe(4)
+    expect(failures).toEqual(['request-error'])
+    expect(records).toHaveLength(4)
+    expect(records.every((r) => r.ok === false)).toBe(true)
+    // All four attempts consumed quota, so all four must be billed — the last
+    // one is the terminal failure, which used to drop its usage.
+    for (const record of records) {
+      expect(record).toMatchObject({ usage: { input: 42, output: 9 } })
+    }
+  })
+
+  it('flushes buffered reasoning the moment a text-delta arrives, without waiting for the stream to end', async () => {
+    // A body that emits only when this test tells it to. Holding the stream open
+    // is what makes "real-time" falsifiable: a buffer flushed at stream end
+    // cannot deliver anything until the stream ends.
+    const encoder = new TextEncoder()
+    let push!: (line: string) => void
+    let close!: () => void
+    let streamReady!: () => void
+    const ready = new Promise<void>((resolve) => { streamReady = resolve })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (line) => controller.enqueue(encoder.encode(line + '\n'))
+        close = () => controller.close()
+        streamReady()
+      },
+    }), { status: 200 })))
+
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+
+    const iterator = adapter.stream(generateOptions())[Symbol.asyncIterator]()
+    // Start the generator — it is lazy, so nothing runs until the first pull —
+    // then wait for the response body to exist before feeding it.
+    const firstPull = iterator.next()
+    await ready
+
+    // Reasoning first. The adapter must hold it: a turn that later ends malformed
+    // has to stay discardable, which is impossible once its reasoning is out.
+    push('data: [{"candidates":[{"content":{"parts":[{"thought":true,"text":"thinking"}]}}]}]')
+    // Text. The moment this lands, the held reasoning is delivered ahead of it.
+    push('data: [{"candidates":[{"content":{"parts":[{"text":"hello world"}]}}]}]')
+
+    const seen: string[] = []
+    const first = await firstPull
+    if (first.done !== true) seen.push(first.value.type)
+    while (!seen.includes('text-delta')) {
+      const next = await iterator.next()
+      if (next.done === true) break
+      seen.push(next.value.type)
+    }
+
+    // Nothing was closed, so every chunk above arrived WITHOUT waiting for stream
+    // completion, and the reasoning was delivered ahead of the text that
+    // triggered its flush.
+    expect(seen).toContain('reasoning-delta')
+    expect(seen.indexOf('reasoning-delta')).toBeLessThan(seen.indexOf('text-delta'))
+
+    // Terminate the stream properly, then drain. Closing without a finishReason
+    // would trip the completeness guard (issue #85) and mask this test's point.
+    push('data: [{"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}]')
+    push('data: [DONE]')
+    close()
+    while ((await iterator.next()).done !== true) { /* drain */ }
+  })
+
+  it('delivers a tool-call-only turn that never emits a text-delta', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(sseStream([
+      'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash","args":{"command":"ls"}}}]},"finishReason":"STOP"}]}]',
+      'data: [DONE]',
+    ]), { status: 200 })))
+
+    const chunks: StreamChunk[] = []
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+    for await (const chunk of adapter.stream(generateOptions())) {
+      chunks.push(chunk)
+    }
+
+    // A turn with no text at all never flips `yieldedDirect`, so it is delivered
+    // by the end-of-stream commit. Were that commit dropped, the buffer — and
+    // with it the only tool call in the turn — would vanish silently.
+    const toolCallDelta = chunks.find((c) => c.type === 'tool-call-delta') as { type: string; name?: string } | undefined
+    expect(toolCallDelta?.name).toBe('bash')
+  })
+
+  it('does not retry a malformed turn once a text-delta has been committed to the consumer', async () => {
+    let callCount = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      callCount++
+      return new Response(sseStream([
+        'data: [{"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}]',
+        'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash"}}]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}]',
+        'data: [DONE]',
+      ]), { status: 200 })
+    }))
+
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+
+    await expect(async () => {
+      for await (const _ of adapter.stream(generateOptions())) void _
+    }).rejects.toMatchObject({ code: 'UPSTREAM' })
+
+    // Re-sampling now would replay a turn the consumer has already seen, so the
+    // fail-safe fallthrough must fire with ZERO retries.
+    expect(callCount).toBe(1)
+  })
+
+  it('surfaces a stalled stream as retryable TIMEOUT while nothing was delivered', async () => {
+    process.env.DSH_AGY_IDLE_TIMEOUT_MS = '25'
+    const failures: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      // Accepted, then silence: not a byte, not a close — the shape a proxy or
+      // a black-holed upstream leaves behind.
+      start() {},
+    }), { status: 200 })))
+
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async (kind) => { failures.push(kind) },
+    })
+
+    await expect(async () => {
+      for await (const _ of adapter.stream(generateOptions())) void _
+    }).rejects.toMatchObject({ code: 'TIMEOUT' })
+    // Nothing reached the consumer, so DSH's retry replays a turn the user never
+    // saw; the account still absorbs the transient, and the retry stays DSH's.
+    expect(failures).toEqual(['network-error'])
+  })
+
+  it('bills a stalled attempt with the totals the upstream already reported', async () => {
+    process.env.DSH_AGY_IDLE_TIMEOUT_MS = '25'
+    const encoder = new TextEncoder()
+    const billed: Array<{
+      reason?: string
+      usage?: { input: number; output: number; cacheRead: number; cacheWrite: number }
+    }> = []
+    let push!: (line: string) => void
+    let streamReady!: () => void
+    const ready = new Promise<void>((resolve) => { streamReady = resolve })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (line) => controller.enqueue(encoder.encode(line + '\n'))
+        streamReady()
+      },
+    }), { status: 200 })))
+
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+      recordUsage: (record) => { billed.push({ reason: record.reason, usage: record.usage }) },
+    })
+
+    const drain = (async () => {
+      for await (const _ of adapter.stream(generateOptions())) void _
+    })()
+    await ready
+    // Reasoning plus the totals the upstream reports alongside it: the adapter
+    // holds the reasoning, so nothing is committed and the attempt stays
+    // retryable — but those tokens were really spent, and the ledger accumulates
+    // per attempt. The stash reaches the caller only because the watchdog
+    // flushes it before propagating the timeout.
+    push('data: [{"candidates":[{"content":{"parts":[{"thought":true,"text":"thinking"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3}}]')
+    await expect(drain).rejects.toMatchObject({ code: 'TIMEOUT' })
+    expect(billed).toEqual([{
+      reason: 'network-error',
+      usage: { input: 10, output: 3, cacheRead: 0, cacheWrite: 0 },
+    }])
+  })
+
+  it('bills an aborted attempt with the totals the upstream already reported', async () => {
+    const encoder = new TextEncoder()
+    const billed: Array<{
+      reason?: string
+      usage?: { input: number; output: number; cacheRead: number; cacheWrite: number }
+    }> = []
+    let push!: (line: string) => void
+    let streamReady!: () => void
+    const ready = new Promise<void>((resolve) => { streamReady = resolve })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (line) => controller.enqueue(encoder.encode(line + '\n'))
+        streamReady()
+      },
+    }), { status: 200 })))
+
+    const controller = new AbortController()
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+      recordUsage: (record) => { billed.push({ reason: record.reason, usage: record.usage }) },
+    })
+
+    const drain = (async () => {
+      for await (const _ of adapter.stream(generateOptions({ signal: controller.signal }))) void _
+    })()
+    await ready
+    push('data: [{"candidates":[{"content":{"parts":[{"thought":true,"text":"thinking"}]}}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":3}}]')
+    // Give parseAgySse time to process the SSE chunk and stash usage
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    controller.abort()
+    await expect(drain).rejects.toMatchObject({ code: 'ABORTED' })
+    expect(billed).toEqual([{
+      reason: 'aborted',
+      usage: { input: 10, output: 3, cacheRead: 0, cacheWrite: 0 },
+    }])
+  })
+
+  it('keeps a stall terminal once a text-delta was handed to the consumer', async () => {
+    process.env.DSH_AGY_IDLE_TIMEOUT_MS = '25'
+    const encoder = new TextEncoder()
+    const failures: string[] = []
+    let push!: (line: string) => void
+    let streamReady!: () => void
+    const ready = new Promise<void>((resolve) => { streamReady = resolve })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        push = (line) => controller.enqueue(encoder.encode(line + '\n'))
+        streamReady()
+      },
+    }), { status: 200 })))
+
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async (kind) => { failures.push(kind) },
+    })
+
+    const iterator = adapter.stream(generateOptions())[Symbol.asyncIterator]()
+    const firstPull = iterator.next()
+    // The fetch stub builds the body lazily, so wait for the stream to exist
+    // before feeding it (same shape as the buffered-reasoning test above).
+    await ready
+    push('data: [{"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}]')
+    const seen: string[] = []
+    for (let next = await firstPull; next.done !== true; next = await iterator.next()) {
+      seen.push(next.value.type)
+      if (seen.includes('text-delta')) break
+    }
+    expect(seen).toContain('text-delta')
+    // Past the hand-off the turn is content the consumer already holds, so
+    // retrying would replay a partially-delivered turn: it stays the same
+    // terminal UPSTREAM every other mid-body death produces.
+    await expect(iterator.next()).rejects.toMatchObject({ code: 'UPSTREAM' })
+    expect(failures).toEqual(['network-error'])
+  })
+
+  it('persists the thought signature of a recovered attempt but never of a discarded one', async () => {
+    let callCount = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      callCount++
+      if (callCount === 1) {
+        // A malformed call that still carries a signature. The attempt is thrown
+        // away, so this signature must never reach the cache.
+        //
+        // The parts and the finishReason must sit on SEPARATE SSE events: the
+        // parser evaluates `candidate.finishReason` before the parts loop, so a
+        // single candidate carrying both throws before `onToolSignature` ever
+        // runs — which would make the discarded half of this assertion vacuous.
+        return new Response(sseStream([
+          'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-doomed","name":"bash","args":"{bad"},"thoughtSignature":"sig-doomed"}]}}]}]',
+          'data: [{"candidates":[{"content":{"parts":[]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}]',
+          'data: [DONE]',
+        ]), { status: 200 })
+      }
+      return new Response(sseStream([
+        'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-kept","name":"bash","args":{"command":"ls"}},"thoughtSignature":"sig-kept"}]},"finishReason":"STOP"}]}]',
+        'data: [DONE]',
+      ]), { status: 200 })
+    }))
+
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+    for await (const _ of adapter.stream(generateOptions())) void _
+
+    expect(callCount).toBe(2)
+    // The recovered attempt is committed, so its signature is cached...
+    expect(getThoughtSignature('call-kept')).toBe('sig-kept')
+    // ...while the discarded one is not. Caching it would let a malformed attempt
+    // write the process-global cache keyed by a toolCallId — and issue #99 records
+    // those ids colliding across distant turns, which would poison the retry.
+    expect(getThoughtSignature('call-doomed')).toBeNull()
+  })
+
+  it('bills a discarded attempt for the tokens it spent', async () => {
+    let callCount = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      callCount++
+      if (callCount === 1) {
+        // The upstream reports usage on EVERY event (cumulative), including the
+        // one that ends the stream malformed. Those tokens were really spent, so
+        // the ledger must see them even though the attempt itself is thrown
+        // away — whether the totals arrived on an earlier line or on the very
+        // line that carries the unmapped finishReason.
+        return new Response(sseStream([
+          'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash","args":{"command":"ls"}}}]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3}}]',
+          'data: [{"candidates":[{"content":{"parts":[]},"finishReason":"MALFORMED_FUNCTION_CALL"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}]',
+          'data: [DONE]',
+        ]), { status: 200 })
+      }
+      return new Response(sseStream([
+        'data: [{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":5}}]',
+        'data: [DONE]',
+      ]), { status: 200 })
+    }))
+
+    const records: Array<{ ok: boolean; usage?: { input: number; output: number } }> = []
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+      recordUsage: (record) => { records.push(record as never) },
+    })
+    for await (const _ of adapter.stream(generateOptions())) void _
+
+    expect(callCount).toBe(2)
+    // Each attempt is billed on its own: a re-sample rebuilt the body and made
+    // its own upstream request, so it consumed its own quota. Dropping the
+    // discarded attempt's usage is the silent-ledger regression in miniature.
+    expect(records).toHaveLength(2)
+    expect(records[0]).toMatchObject({ ok: false, reason: 'request-error', usage: { input: 10, output: 5 } })
+    expect(records[1]).toMatchObject({ ok: true, usage: { input: 10, output: 5 } })
+  })
+
+  it('commits a signature that arrives after the hand-off, so a mid-body death keeps it', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(sseStream([
+      // Text first: this is the hand-off point.
+      'data: [{"candidates":[{"content":{"parts":[{"text":"sure, running that"}]}}]}]',
+      // Then a tool call carrying a signature — a shape that can only arrive
+      // after the buffer has already been handed off.
+      'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"id":"call-late","name":"bash","args":{"command":"ls"}},"thoughtSignature":"sig-late"}]}}]}]',
+      // ...and the stream dies here with neither [DONE] nor a finishReason.
+    ]), { status: 200 })))
+
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+
+    await expect(async () => {
+      for await (const _ of adapter.stream(generateOptions())) void _
+    }).rejects.toMatchObject({ code: 'UPSTREAM' })
+
+    // The tool call WAS delivered, so its signature must be cached. Anchoring
+    // the commit at stream end would drop it here and silently degrade the next
+    // round to the `skip_thought_signature_validator` sentinel.
+    expect(getThoughtSignature('call-late')).toBe('sig-late')
+  })
+
+  it('cancels the abandoned body of every discarded attempt', async () => {
+    let cancels = 0
+    // A body that delivers the malformed finishReason in its first chunk and
+    // still has unread bytes after it: the only way those bytes stop mattering
+    // is something cancelling the stream.
+    const malformed = 'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash"}}]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}]\n'
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(malformed))
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n'.repeat(50)))
+        controller.close()
+      },
+      cancel() { cancels++ },
+    }), { status: 200 })))
+
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+
+    await expect(async () => {
+      for await (const _ of adapter.stream(generateOptions())) void _
+    }).rejects.toMatchObject({ code: 'UPSTREAM' })
+
+    // The streaming dispatcher runs with `bodyTimeout: 0` so a reasoning pause
+    // survives, which means nothing else reclaims these connections: one per
+    // attempt, all four of them.
+    expect(cancels).toBe(4)
+  })
+
+  it('bills the terminal attempt too when content was already committed', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(sseStream([
+      // Text first, so the turn commits: this attempt can no longer be retried.
+      'data: [{"candidates":[{"content":{"parts":[{"text":"partial"}]}}]}]',
+      // Then a content-level verdict carrying usage on the very same event.
+      'data: [{"candidates":[{"content":{"parts":[]},"finishReason":"SAFETY"}],"usageMetadata":{"promptTokenCount":42,"candidatesTokenCount":9}}]',
+      'data: [DONE]',
+    ]), { status: 200 })))
+
+    const records: Array<{ ok: boolean; reason?: string; usage?: { input: number; output: number } }> = []
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+      recordUsage: (record) => { records.push(record as never) },
+    })
+
+    await expect(async () => {
+      for await (const _ of adapter.stream(generateOptions())) void _
+    }).rejects.toMatchObject({ code: 'UPSTREAM' })
+
+    // The tokens were spent on a turn the consumer already saw, so they must be
+    // billed even though the attempt ends terminally with no retry.
+    expect(records).toHaveLength(1)
+    expect(records[0]).toMatchObject({ ok: false, reason: 'request-error', usage: { input: 42, output: 9 } })
+  })
+
+  it('reports an abort landing in the retry backoff as the typed ABORTED error', async () => {
+    let callCount = 0
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      callCount++
+      return new Response(sseStream([
+        'data: [{"candidates":[{"content":{"parts":[{"functionCall":{"name":"bash"}}]},"finishReason":"MALFORMED_FUNCTION_CALL"}]}]',
+        'data: [DONE]',
+      ]), { status: 200 })
+    }))
+
+    const controller = new AbortController()
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => {},
+    })
+
+    vi.useFakeTimers()
+    try {
+      const iterator = adapter.stream(generateOptions({ signal: controller.signal }))[Symbol.asyncIterator]()
+      const pending = iterator.next()
+      // Walk attempt 1 through to the backoff wait.
+      for (let i = 0; i < 50 && callCount === 0; i++) await vi.advanceTimersByTimeAsync(1)
+      // Attach the assertion BEFORE aborting. Awaiting the abort even one turn
+      // later leaves the rejection momentarily unobserved, which surfaces as an
+      // unhandled rejection rather than as this test's failure.
+      const verdict = expect(pending).rejects.toMatchObject({ code: 'ABORTED' })
+      controller.abort()
+      await vi.advanceTimersByTimeAsync(200)
+      await verdict
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect(callCount).toBe(1)
   })
 
   it('fails image requests with UNSUPPORTED_CONTENT and no fetch when the attachment service is absent', async () => {
@@ -1834,6 +2941,51 @@ describe('AgyAdapter', () => {
       })
     } finally {
       await fs.promises.unlink(tmpFile).catch(() => {})
+    }
+  })
+
+  it('caps inlining through the maxInlineBytes resolver, dropping the file from the body', async () => {
+    // End-to-end wiring proof: the adapter's RESOLVER (not a snapshot) reaches
+    // `resolveMultimodalFiles`, so a settings save applies to the next request.
+    // The cap is deliberately 1 byte here, so the real temp file below is over
+    // it and the assertion does not depend on how big the fixture happens to be.
+    let capturedBody: any
+    vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init: any) => {
+      capturedBody = JSON.parse(init.body as string)
+      return new Response(sseStream([
+        'data: [{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}]',
+        'data: [DONE]',
+      ]), { status: 200 })
+    }))
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agy-adapter-cap-'))
+    const tmpFile = path.join(tmpDir, 'capped.pdf')
+    fs.writeFileSync(tmpFile, 'PDF dummy content')
+    const fileText = `[File "capped.pdf" (18 bytes, sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef): verbatim read-only copy saved at "${tmpFile}".]`
+    const messages = [
+      {
+        id: 'msg-1',
+        role: 'user' as const,
+        content: [{ type: 'text' as const, text: fileText }],
+      },
+    ]
+
+    try {
+      const adapter = new AgyAdapter({
+        getSession: async () => session(),
+        reportFailure: async () => {},
+        maxInlineBytes: () => 1,
+      })
+      for await (const _ of adapter.stream(generateOptions({ model: 'gemini-3.8-flash-tiered', messages }))) {
+        void _
+      }
+      const parts = capturedBody.request.contents[0].parts
+      // The text handle survives — that is the whole contract for a skipped
+      // file: the model can still read it with its file tools.
+      expect(parts).toEqual([{ text: fileText }])
+      expect(JSON.stringify(parts)).not.toContain('inlineData')
+    } finally {
+      await fs.promises.rm(tmpDir, { recursive: true, force: true })
     }
   })
 

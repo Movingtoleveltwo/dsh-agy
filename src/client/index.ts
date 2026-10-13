@@ -1,7 +1,7 @@
 /**
  * agy Settings section — the browser half.
  *
- * One `settings.section` page with four tabs (accounts, models, usage,
+ * One `settings.section` page with five tabs (accounts, models, config, usage,
  * credentials), replacing the standalone `/agy` dashboard. Every figure comes
  * from the `/api/agy` RPC over `ctx.connection`, so this section needs no
  * host-rendered page and there is no second UI to keep in step.
@@ -12,7 +12,7 @@
  * readable where nested `createElement` calls become a parenthesis maze.
  */
 
-import { createElement, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
@@ -27,16 +27,39 @@ import {
   Tag,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { StateDotState, TagTone } from '@deepseek-ai/dsh-client-ui-primitives'
-import { installAgyStyles } from './styles.ts'
+import { aliasVar, installAgyStyles } from './styles.ts'
 import { en, zh, type AgyLocaleKey } from './locales.ts'
-import type { AccountView, AgyRpcClient, AgyRpcResult, ModelView, StatsView, ThinkingBudgets } from '../rpc-contract.ts'
+import { h } from './element.ts'
+import { AgyQuotaBadge } from './quota-badge.ts'
+import { agoText, quotaColor, stateLabel, untilText, windowLabel, MINUTE_MS, HOUR_MS } from './quota-view.ts'
+import type { AccountView, AgyRpcClient, AgyRpcResult, ModelView, MultimodalView, StatsView, ThinkingBudgets } from '../rpc-contract.ts'
 import { CLAUDE_BUDGET_MAX, CLAUDE_BUDGET_MIN, THINKING_BUDGET_MAX, THINKING_BUDGET_MIN, THINKING_LEVELS } from '../thinking-types.ts'
+import { MULTIMODAL_DEFAULT_MB, MULTIMODAL_MAX_MB, MULTIMODAL_MIN_MB } from '../multimodal-types.ts'
 import type { UsageCounters } from '../usage-types.ts'
 
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
     /** Copy owned by the Antigravity Settings section. */
     agy: AgyLocaleKey
+  }
+
+  /**
+   * The Session header's action row.
+   *
+   * The face is OWNED by `@deepseek-ai/dsh-client-ui-conversation`, which this
+   * package deliberately does not depend on: that UI package brings its own
+   * app-shell peer set, and a plugin registering ONE slot should not install a
+   * shell to name it. The entry below mirrors that package's declaration (a
+   * list-ordered slot scoped to a Session, whose owner face is empty because
+   * header actions read the standard session kit) — the same declaration-merging
+   * idiom already used for `LocaleNamespaceMap` above.
+   */
+  interface SlotMap {
+    'conversation.session.header.actions': {
+      kind: 'list'
+      scope: 'session'
+      owner: Record<string, never>
+    }
   }
 }
 
@@ -56,7 +79,7 @@ type RecentEntry = AgyRpcResult<'pool.recent'>['recent'][number]
 const RPC_CHANNEL = '/api'
 const RPC_ENDPOINT = 'agy'
 
-type TabId = 'accounts' | 'models' | 'usage' | 'credentials'
+type TabId = 'accounts' | 'models' | 'config' | 'usage' | 'credentials'
 
 /**
  * How long a one-shot action's verdict stays on screen.
@@ -82,28 +105,6 @@ interface ConnectionLike {
   rpc: {
     call: (channel: string, endpoint: string, payload: unknown, signal?: AbortSignal) => Promise<unknown>
   }
-}
-
-/**
- * Element shorthand: flat children, no nesting ceremony.
- *
- * The component overload accepts children as trailing arguments too, because
- * React's `createElement` handles them natively for function components.
- */
-function h(tag: string, props?: Record<string, unknown> | null, ...children: ReactNode[]): ReactNode
-function h<Props>(
-  // `key` rides in props for `createElement`, so the component overload must
-  // admit it even though it is not part of the component's own props type.
-  component: (props: Props) => ReactNode,
-  props: Props & { key?: string | number },
-  ...children: ReactNode[]
-): ReactNode
-function h(
-  tag: string | ((props: never) => ReactNode),
-  props?: Record<string, unknown> | null,
-  ...children: ReactNode[]
-): ReactNode {
-  return createElement(tag as string, props ?? null, ...children)
 }
 
 /** Call one management method and unwrap the Connection RPC envelope. */
@@ -238,23 +239,6 @@ function promptTokens(counters: UsageCounters): number {
   return counters.input + counters.cacheRead + counters.cacheWrite
 }
 
-/** Quota tint by remaining fraction: healthy / low / critical. */
-function quotaColor(fraction: number): string {
-  if (fraction > 0.7) return 'var(--dsw-alias-state-success-primary, #22c55e)'
-  if (fraction >= 0.3) return 'var(--dsw-alias-state-warn-primary, #f59e0b)'
-  return 'var(--dsw-alias-state-error-primary, #ec1313)'
-}
-
-/** Localized account-state label. */
-function stateLabel(state: AccountView['state'], t: T): string {
-  switch (state) {
-    case 'active': return t('stateActive')
-    case 'cooling': return t('stateCooling')
-    case 'verification-required': return t('stateVerificationRequired')
-    case 'disabled': return t('stateDisabled')
-  }
-}
-
 /**
  * Localized label for a reasoning level.
  *
@@ -267,22 +251,6 @@ function levelLabel(level: string, t: T): string {
     case 'medium': return t('thinkingLevelMedium')
     case 'high': return t('thinkingLevelHigh')
     default: return level
-  }
-}
-
-/**
- * Localized label for an upstream quota window token.
- *
- * Upstream sends `5h` / `weekly` today. The tokens are mapped rather than
- * printed so the panel follows the UI language, and an UNRECOGNIZED token falls
- * back to its raw value: upstream may add a window, and showing `30d` is better
- * than a blank or a wrong localized label.
- */
-function windowLabel(window: string, t: T): string {
-  switch (window) {
-    case '5h': return t('quotaWindow5h')
-    case 'weekly': return t('quotaWindowWeekly')
-    default: return window
   }
 }
 
@@ -336,47 +304,6 @@ function dayLabel(day: string, lang?: string): string {
   return new Date(y, m - 1, d).toLocaleDateString(lang, { month: 'short', day: 'numeric' })
 }
 
-const MINUTE_MS = 60_000
-const HOUR_MS = 60 * MINUTE_MS
-const DAY_MS = 24 * HOUR_MS
-
-/**
- * Time until a future moment, as localized copy.
- *
- * A quota reset wall is often more than 24h out, so a bare `HH:mm` cannot say
- * whether it means today or tomorrow — the failure this replaces. Bucket
- * boundaries mirror the host's `relativeTime` (which is defined for past-dated
- * rows and would need its arguments reversed to serve a future one, so the
- * comparison is written out here instead); the words stay in this plugin's own
- * dictionary, which is exactly the split that API intends.
- */
-function untilText(iso: string | null, t: T, now: number): string {
-  if (iso === null) return '—'
-  const at = new Date(iso).getTime()
-  if (Number.isNaN(at)) return '—'
-  const diff = at - now
-  if (diff <= 0) return t('quotaResetPassed')
-  if (diff < MINUTE_MS) return t('quotaResetSoon')
-  const value = diff < HOUR_MS
-    ? t('relMinutes', { n: Math.floor(diff / MINUTE_MS) })
-    : diff < DAY_MS
-      ? (() => {
-          const h = Math.floor(diff / HOUR_MS)
-          const m = Math.floor((diff % HOUR_MS) / MINUTE_MS)
-          return m > 0 ? t('relHoursMinutes', { h, m }) : t('relHours', { n: h })
-        })()
-      : diff < 30 * DAY_MS
-        ? (() => {
-            const d = Math.floor(diff / DAY_MS)
-            const h = Math.floor((diff % DAY_MS) / HOUR_MS)
-            return h > 0 ? t('relDaysHours', { d, h }) : t('relDays', { n: d })
-          })()
-        : diff < 365 * DAY_MS
-          ? t('relMonths', { n: Math.floor(diff / (30 * DAY_MS)) })
-          : t('relYears', { n: Math.floor(diff / (365 * DAY_MS)) })
-  return t('quotaResetIn', { value })
-}
-
 /**
  * Localized label for a cooldown reason.
  *
@@ -391,34 +318,6 @@ function cooldownReasonLabel(reason: string, t: T): string {
     case 'project-error': return t('cooldownReasonProjectError')
     default: return reason
   }
-}
-
-/**
- * How long ago a past moment was (the mirror of `untilText`).
- *
- * Reuses the same `rel*` magnitudes so the two read consistently, but adds a
- * direction suffix: a bare magnitude beside a cooldown could equally mean when
- * it started or when it ends. The suffix and every magnitude come from the
- * dictionary, so nothing here is language-specific.
- */
-function agoText(iso: string | null, t: T, now: number): string {
-  if (iso === null) return '—'
-  const at = new Date(iso).getTime()
-  if (Number.isNaN(at)) return '—'
-  const diff = now - at
-  // A clock skew or a just-written stamp reads as "just now" rather than a
-  // negative age.
-  if (diff < MINUTE_MS) return t('relJustNow')
-  const value = diff < HOUR_MS
-    ? t('relMinutes', { n: Math.floor(diff / MINUTE_MS) })
-    : diff < DAY_MS
-      ? t('relHours', { n: Math.floor(diff / HOUR_MS) })
-      : diff < 30 * DAY_MS
-        ? t('relDays', { n: Math.floor(diff / DAY_MS) })
-        : diff < 365 * DAY_MS
-          ? t('relMonths', { n: Math.floor(diff / (30 * DAY_MS)) })
-          : t('relYears', { n: Math.floor(diff / (365 * DAY_MS)) })
-  return t('relAgo', { value })
 }
 
 /**
@@ -450,7 +349,6 @@ export function truncateIdentity(text: string, max = 22): string {
   const tail = max - 1 - head
   return `${text.slice(0, head)}…${text.slice(-tail)}`
 }
-
 // ─── building blocks ─────────────────────────────────────────────────────────
 
 /**
@@ -807,7 +705,73 @@ export function resolveSelectedAccountIndex(
   return activePos >= 0 ? activePos : 0
 }
 
-export function AccountsTab(props: {
+function PreferencesCard(props: {
+  rpc: AgyRpcClient
+  t: T
+  onBadgePrefChange?: (enabled: boolean) => void
+}): ReactNode {
+  const { rpc, t, onBadgePrefChange } = props
+  const [badgeEnabled, setBadgeEnabled] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
+  const errorTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+
+  useEffect(() => () => {
+    if (errorTimer.current !== undefined) clearTimeout(errorTimer.current)
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    void rpc.call('ui.prefs.get', {}).then((prefs) => {
+      if (active) {
+        setBadgeEnabled(prefs?.conversationBadge === true)
+        setLoading(false)
+      }
+    }).catch(() => {
+      if (active) setLoading(false)
+    })
+    return () => { active = false }
+  }, [rpc])
+
+  const toggleBadge = useCallback(async (checked: boolean) => {
+    setSaving(true)
+    setBadgeEnabled(checked)
+    if (errorTimer.current !== undefined) clearTimeout(errorTimer.current)
+    try {
+      const res = await rpc.call('ui.prefs.set', { conversationBadge: checked })
+      setBadgeEnabled(res.conversationBadge)
+      setSaveError(null)
+      onBadgePrefChange?.(res.conversationBadge)
+    } catch (err) {
+      // A bounced switch with no verdict reads as a flicker: surface the
+      // one-shot failure like the section's other action errors.
+      setBadgeEnabled(!checked)
+      setSaveError(t('prefSaveFailed', { message: err instanceof Error ? err.message : String(err) }))
+      errorTimer.current = setTimeout(() => setSaveError(null), ACTION_MESSAGE_TTL_MS)
+    } finally {
+      setSaving(false)
+    }
+  }, [rpc, t, onBadgePrefChange])
+
+  const row = h('div', { className: 'agy-pref-row' },
+    h('div', { className: 'agy-pref-info' },
+      h('div', { className: 'agy-pref-name' }, t('prefConversationBadge')),
+      h('div', { className: 'agy-pref-desc' }, t('prefConversationBadgeDesc'))),
+    h(Switch, {
+      label: t('prefConversationBadge'),
+      checked: badgeEnabled,
+      disabled: loading || saving,
+      onChange: (checked: boolean) => void toggleBadge(checked),
+    }))
+
+  return card(t('preferencesTitle'),
+    saveError === null
+      ? row
+      : [row, h('div', { className: 'agy-error' }, saveError)])
+}
+
+function AccountsTab(props: {
   accounts: AccountView[]
   busy: boolean
   /** Accounts with upstream requests in flight, from the latest pool.status. */
@@ -818,6 +782,7 @@ export function AccountsTab(props: {
   /** UI language for locale-sensitive date formatting ('zh' | 'en'). */
   lang?: string
   t: T
+  onBadgePrefChange?: (enabled: boolean) => void
 }): ReactNode {
   const { accounts, busy, handlers, t } = props
   const [selected, setSelected] = useState<number | null>(null)
@@ -951,7 +916,8 @@ export function AccountsTab(props: {
           })),
     // The "what just happened" list, under the split: it is pool-level
     // activity, not one account's, and the split owns the full height.
-    h(RecentCard, { rpc: props.rpc, t })))
+    h(RecentCard, { rpc: props.rpc, t }),
+    h(PreferencesCard, { rpc: props.rpc, t, onBadgePrefChange: props.onBadgePrefChange })))
 }
 
 /**
@@ -987,11 +953,9 @@ function ModelsTab(props: {
   onToggle: (modelId: string, disabled: boolean) => void
   /** Fire one test call against this exact model on the active account. */
   onTestModel: (modelId: string) => void
-  /** RPC carrier for the thinking-budget block, which loads its own state. */
-  rpc: AgyRpcClient
   t: T
 }): ReactNode {
-  const { models, account, pending, testing, onToggle, onTestModel, rpc, t } = props
+  const { models, account, pending, testing, onToggle, onTestModel, t } = props
 
   // Hooks MUST run unconditionally: an early `return` above any hook changes
   // this component's hook count between renders, and React's renderer state —
@@ -1044,24 +1008,9 @@ function ModelsTab(props: {
   return h('div', { className: 'agy-root' },
     card(t('modelsTitle'), h('div', { className: 'agy-rows' }, ...rows),
       hidden > 0 ? t('modelsHiddenSuffix', { count: hidden }) : account ?? undefined),
-    hint(t('modelsHelp')),
-    h(ThinkingBudgetCard, { rpc, t }))
+    hint(t('modelsHelp')))
 }
 
-/**
- * The global reasoning-level token budgets.
- *
- * One row per level rather than per model: only `*-tiered` models send a
- * `thinkingConfig` at all, and the level itself is already chosen in DSH's model
- * selector. So this supplies the missing VALUE behind each level — the same three
- * numbers for every such model.
- *
- * An EMPTY input is the meaningful default: the request then sends
- * `thinkingLevel` and lets upstream pick, which is exactly the behaviour before
- * this setting existed. That is why the field is not a `number` input with a
- * zero fallback, and why clearing it is a real action rather than "set to 0"
- * (measured: `0` reduces thinking but does not reliably disable it).
- */
 /**
  * One budget row: label, input, and optional shortcut chips.
  *
@@ -1215,6 +1164,20 @@ function ThinkingSamples({ t }: { t: T }): ReactNode {
       : null)
 }
 
+/**
+ * The global reasoning-level token budgets, on the config tab.
+ *
+ * One row per level rather than per model: only `*-tiered` models send a
+ * `thinkingConfig` at all, and the level itself is already chosen in DSH's model
+ * selector. So this supplies the missing VALUE behind each level — the same three
+ * numbers for every such model.
+ *
+ * An EMPTY input is the meaningful default: the request then sends
+ * `thinkingLevel` and lets upstream pick, which is exactly the behaviour before
+ * this setting existed. That is why the field is not a `number` input with a
+ * zero fallback, and why clearing it is a real action rather than "set to 0"
+ * (measured: `0` reduces thinking but does not reliably disable it).
+ */
 function ThinkingBudgetCard(props: { rpc: AgyRpcClient, t: T }): ReactNode {
   const { rpc, t } = props
   const [budgets, setBudgets] = useState<ThinkingBudgets>({})
@@ -1395,6 +1358,142 @@ function ThinkingBudgetCard(props: { rpc: AgyRpcClient, t: T }): ReactNode {
   return card(t('thinkingTitle'), block)
 }
 
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+/**
+ * The config tab: a card container, not one component.
+ *
+ * Each card loads and saves its OWN state (the thinking card already had that
+ * shape), so a new knob is a new card rather than a field threaded through a
+ * shared form — and one card's failed load cannot blank the others. Nothing here
+ * holds cross-card state, which is the property that keeps that true.
+ */
+function ConfigTab(props: { rpc: AgyRpcClient, t: T }): ReactNode {
+  const { rpc, t } = props
+  return h('div', { className: 'agy-root' },
+    h(ThinkingBudgetCard, { rpc, t }),
+    h(MultimodalCard, { rpc, t }))
+}
+
+/**
+ * The per-file inline cap for non-image multimodal files.
+ *
+ * A plain card, not a disclosure like the thinking block: it is one number, so
+ * there is nothing to collapse, and the same self-loading shape as the thinking
+ * card (load on mount, draft mirrored as a string, blur commits).
+ *
+ * The EMPTY semantics are inherited deliberately: an empty box means "no stored
+ * setting", which falls back to the env override or the 20MB default. That is
+ * why clearing has its own button rather than being reachable only by emptying
+ * the field — the destructive direction should be an explicit click, not the
+ * side effect of a blur on a field the user emptied while deciding.
+ */
+function MultimodalCard(props: { rpc: AgyRpcClient, t: T }): ReactNode {
+  const { rpc, t } = props
+  const [view, setView] = useState<MultimodalView | null>(null)
+  const [draft, setDraft] = useState('')
+  const [error, setError] = useState<string | undefined>(undefined)
+  const [loaded, setLoaded] = useState(false)
+  const alive = useRef(true)
+  useEffect(() => {
+    alive.current = true
+    return () => { alive.current = false }
+  }, [])
+
+  const load = useCallback((): void => {
+    void (async () => {
+      try {
+        const result = await rpc.call('multimodal.get', {})
+        if (!alive.current) return
+        setView(result)
+        setDraft(result.value === null ? '' : String(result.value))
+        setError(undefined)
+      } catch (caught) {
+        if (!alive.current) return
+        setError(caught instanceof Error ? caught.message : String(caught))
+      } finally {
+        if (alive.current) setLoaded(true)
+      }
+    })()
+  }, [rpc])
+
+  useEffect(() => { load() }, [load])
+
+  const commit = (value: number | null): void => {
+    void (async () => {
+      try {
+        const result = await rpc.call('multimodal.set', { maxInlineMb: value })
+        if (!alive.current) return
+        setView(result)
+        setDraft(result.value === null ? '' : String(result.value))
+        setError(undefined)
+      } catch (caught) {
+        // The host states the accepted interval, so its message beats a generic
+        // one; the draft is left as typed for the user to correct.
+        if (!alive.current) return
+        setError(caught instanceof Error ? caught.message : String(caught))
+      }
+    })()
+  }
+
+  const save = (raw: string): void => {
+    const trimmed = raw.trim()
+    if (trimmed === '') {
+      commit(null)
+      return
+    }
+    const value = Number(trimmed)
+    if (!Number.isInteger(value)) {
+      setError(t('multimodalInvalid'))
+      return
+    }
+    if (value < MULTIMODAL_MIN_MB || value > MULTIMODAL_MAX_MB) {
+      // Rejected locally rather than sent: the host would answer with the same
+      // interval, and a round trip for a message we can already write is noise.
+      setError(t('multimodalRange', { min: MULTIMODAL_MIN_MB, max: MULTIMODAL_MAX_MB }))
+      return
+    }
+    commit(value)
+  }
+
+  // The status line names the EFFECTIVE source, which is not the same question
+  // as what is stored: an env override wins, so a user staring at a number the
+  // requests ignore has to be told that rather than left to infer it.
+  const source = view === null
+    ? null
+    : view.source === 'env'
+      ? t('multimodalSourceEnv')
+      : view.source === 'stored' ? t('multimodalSourceStored') : t('multimodalSourceDefault', { default: MULTIMODAL_DEFAULT_MB })
+
+  return card(t('multimodalTitle'), [
+    h('div', { className: 'agy-thinking-row' },
+      h('span', { className: 'agy-thinking-k' }, t('multimodalLabel')),
+      h(Input, {
+        value: draft,
+        placeholder: t('multimodalAuto'),
+        inputMode: 'numeric',
+        disabled: !loaded,
+        onChange: (event: { target: { value: string } }) => { setDraft(event.target.value) },
+        onBlur: (event: { target: { value: string } }) => { save(event.target.value) },
+      }),
+      h('span', { className: 'agy-input-unit' },
+        t('multimodalUnit'),
+        h('button', {
+          type: 'button',
+          className: 'agy-thinking-chip',
+          // Clears AND commits in one step; the blur that follows sees the
+          // reloaded value and does not save a second time.
+          onClick: () => { setDraft(''); commit(null) },
+        }, t('multimodalClear')))),
+    // The status line names the EFFECTIVE source, which is not the same question
+    // as what is stored: an env override wins, and a user staring at a number the
+    // requests ignore needs to be told that rather than left to infer it.
+    source === null ? null : h('div', { className: 'agy-hint' }, source),
+    hint(t('multimodalHint')),
+    error === undefined ? null : h('div', { className: 'agy-error' }, error),
+  ])
+}
+
 // ─── Recent activity ─────────────────────────────────────────────────────────
 
 /** Result vocabulary for one recent row; rotation events are their own kind. */
@@ -1408,6 +1507,10 @@ function recentResultKind(entry: RecentEntry): 'ok' | 'fail' | 'limited' | 'rota
 /**
  * Localized label for a failure-classification token, falling back to the raw
  * token so a classification added upstream still reads as something.
+ *
+ * 'aborted' is the one token that is NOT an upstream classification (it marks a
+ * turn the consumer cancelled), and it is listed here so the ring reads
+ * "cancelled" rather than leaking the raw ledger token.
  */
 function failureReasonLabel(reason: string, t: T): string {
   switch (reason) {
@@ -1417,6 +1520,7 @@ function failureReasonLabel(reason: string, t: T): string {
     case 'verification-required': return t('cooldownReasonValidationRequired')
     case 'quota-exhausted': return t('cooldownReasonQuotaExhausted')
     case 'project-error': return t('cooldownReasonProjectError')
+    case 'aborted': return t('reasonAborted')
     default: return reason
   }
 }
@@ -1588,9 +1692,9 @@ function numHeader(index: number, label: string): ReactNode {
 function tokenComposition(counters: UsageCounters, t: T): ReactNode {
   const total = totalTokens(counters)
   const rows: Array<{ id: string, labelKey: AgyLocaleKey, value: number, tone: string }> = [
-    { id: 'cacheRead', labelKey: 'kpiCacheRead', value: counters.cacheRead, tone: 'var(--dsw-alias-brand-primary-new-colorprimary-new-color, #4176e6)' },
+    { id: 'cacheRead', labelKey: 'kpiCacheRead', value: counters.cacheRead, tone: aliasVar('brand-primary') },
     { id: 'missed', labelKey: 'kpiInputMissedLabel', value: counters.input, tone: 'var(--dsw-static-neutral-bluish-700, #8b8f96)' },
-    { id: 'output', labelKey: 'kpiOutput', value: counters.output, tone: 'var(--dsw-alias-state-success-primary, #22c55e)' },
+    { id: 'output', labelKey: 'kpiOutput', value: counters.output, tone: aliasVar('state-success-primary') },
   ]
   return h('div', { className: 'agy-compose' }, ...rows.map((row) => {
     const share = total > 0 ? (row.value / total) * 100 : 0
@@ -1787,8 +1891,16 @@ function CredentialsTab(props: {
 // ─── root ────────────────────────────────────────────────────────────────────
 
 /** The Settings section body. */
-export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): ReactNode {
+export function AgySettings(props: {
+  rpc: AgyRpcClient
+  t: T
+  lang?: string
+  onBadgePrefChange?: (enabled: boolean) => void
+}): ReactNode {
   const { rpc, t } = props
+  useEffect(() => {
+    installAgyStyles()
+  }, [])
   const [tab, setTab] = useState<TabId>('accounts')
   const [accounts, setAccounts] = useState<AccountView[]>([])
   const [models, setModels] = useState<ModelView[]>([])
@@ -2194,7 +2306,7 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
     }, label, count === undefined ? null : h('span', { className: 'agy-count' }, String(count)))
 
   const body = tab === 'accounts'
-    ? h(AccountsTab, { accounts, busy, busyNow: poolBusy, handlers, lang: props.lang, rpc, t })
+    ? h(AccountsTab, { accounts, busy, busyNow: poolBusy, handlers, lang: props.lang, rpc, t, onBadgePrefChange: props.onBadgePrefChange })
     : tab === 'models'
       ? modelError === undefined
         ? h(ModelsTab, {
@@ -2206,7 +2318,6 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
           // queries (see management.ts listAccounts).
           pending: toggling,
           testing: modelTesting,
-          rpc,
           t,
           /**
            * Optimistic, per-model toggle.
@@ -2281,9 +2392,11 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
         : h('div', { className: 'agy-root' },
           h('div', { className: 'agy-error' }, modelError),
           button(t('refresh'), () => { void loadModels() }, { size: 'sm' }))
-      : tab === 'usage'
-        ? h(UsageTab, { stats, lang: props.lang, t })
-        : h(CredentialsTab, {
+      : tab === 'config'
+        ? h(ConfigTab, { rpc, t })
+        : tab === 'usage'
+          ? h(UsageTab, { stats, lang: props.lang, t })
+          : h(CredentialsTab, {
           busy,
           t,
           onImport: (kind: 'json' | 'blob', sources: string[]) => {
@@ -2332,6 +2445,7 @@ export function AgySettings(props: { rpc: AgyRpcClient, t: T, lang?: string }): 
     h('div', { className: 'agy-tabs' },
       tabButton('accounts', t('tabAccounts'), accounts.length),
       tabButton('models', t('tabModels'), models.length > 0 ? models.length : undefined),
+      tabButton('config', t('tabConfig')),
       tabButton('usage', t('tabUsage')),
       tabButton('credentials', t('tabCredentials'))),
     error === undefined ? null : h('div', { className: 'agy-error' }, error),
@@ -2367,11 +2481,49 @@ export function apply(ctx: ClientContext): void {
   // `getLocale`: undefined then degrades to the browser default, which is the
   // pre-`lang` behaviour, not a crash.
   const lang = ctx.locale.getLocale?.().active
+  let badgeDisposer: (() => void) | null = null
+
+  const registerBadge = (): void => {
+    if (badgeDisposer !== null) return
+    badgeDisposer = ctx.slots.inject('conversation.session.header.actions', () => ctx.slots.register({
+      name: 'conversation.session.header.actions',
+      id: 'agy-quota-badge',
+      order: 8,
+      label: () => t('title'),
+    }, () => h(AgyQuotaBadge, { rpc, t })))
+  }
+
+  const unregisterBadge = (): void => {
+    if (badgeDisposer !== null) {
+      badgeDisposer()
+      badgeDisposer = null
+    }
+  }
+
+  // Opt-in: only register when user preference has enabled the badge
+  void rpc.call('ui.prefs.get', {}).then((prefs) => {
+    if (prefs?.conversationBadge) {
+      registerBadge()
+    }
+  }).catch(() => {})
+
+  const onBadgePrefChange = (enabled: boolean): void => {
+    if (enabled) {
+      registerBadge()
+    } else {
+      unregisterBadge()
+    }
+  }
+
   ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
     id: 'agy',
     order: 30,
     locale: NS,
     label: () => t('title'),
-  }, () => h(AgySettings, { rpc, t, lang }))), 'dsh-agy: Settings section')
+  }, () => h(AgySettings, { rpc, t, lang, onBadgePrefChange }))), 'dsh-agy: Settings section')
+
+  ctx.effect(() => () => {
+    unregisterBadge()
+  }, 'dsh-agy: quota badge cleanup')
 }

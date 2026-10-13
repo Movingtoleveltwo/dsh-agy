@@ -18,7 +18,7 @@ import { fetchAgyFirstOk } from '../src/oauth/constants.ts'
 const dshHome = resolveDshHome()
 const masterKey = loadMasterKey(dshHome)
 const codec = createAesGcmCodec(deriveKey(masterKey))
-const storage = decryptStorage(JSON.parse(readFileSync(join(dshHome, 'agy-accounts.json'), 'utf8')), codec)
+const storage = decryptStorage(JSON.parse(readFileSync(join(dshHome, 'agy', 'agy-accounts.json'), 'utf8')), codec)
 const account = storage.accounts[0]
 const refreshed = await refreshAccessToken({ access: '', expires: 0, refresh: account.refresh })
 const access = refreshed.type === 'success' ? refreshed.auth.access : ''

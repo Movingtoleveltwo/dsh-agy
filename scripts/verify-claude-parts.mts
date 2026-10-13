@@ -28,7 +28,7 @@ if (!masterKey) {
   process.exit(1)
 }
 const codec = createAesGcmCodec(deriveKey(masterKey))
-const storage = decryptStorage(JSON.parse(readFileSync(join(dshHome, 'agy-accounts.json'), 'utf8')), codec)
+const storage = decryptStorage(JSON.parse(readFileSync(join(dshHome, 'agy', 'agy-accounts.json'), 'utf8')), codec)
 const account = storage.accounts[0]
 if (!account) {
   console.error('No accounts. Run `dsh-agy login`.')

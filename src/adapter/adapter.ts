@@ -41,7 +41,7 @@ import { setThoughtSignature } from '../runtime/signature-cache.ts'
 import { toAgyRequestBody } from './translate.ts'
 import type { AgyResolvedImage } from './translate.ts'
 import { resolveMultimodalFiles } from './multimodal.ts'
-import { parseAgySse, UnmappedFinishReasonError } from './parse.ts'
+import { AgyStreamIdleTimeoutError, parseAgySse, UnmappedFinishReasonError } from './parse.ts'
 import { AGY_PROVIDER, catalogModelList, listAgyModels, resolveAgyModel } from './models.ts'
 
 export type { AgyAccountSession }
@@ -115,6 +115,16 @@ export interface AgyAdapterOptions {
   claudeBudgetFor?(): number | undefined
   /** Budget for the tiered slot (the selector's "Default" effort). */
   tieredBudgetFor?(): number | undefined
+  /**
+   * Configured per-file cap for non-image multimodal inlining, in bytes
+   * (see `multimodal-config.ts`).
+   *
+   * A resolver rather than a snapshot, for the same reason as
+   * `thinkingBudgetFor`: an edit in the settings UI applies to the next request
+   * without rebuilding the adapter. `undefined` means "not configured", which
+   * `resolveMultimodalFiles` answers with its built-in constant.
+   */
+  maxInlineBytes?(): number | undefined
   /** Resolve the harness attachment store; undefined outside the harness (standalone CLI). */
   resolveAttachments?(): AgyAttachmentStore | undefined
   /**
@@ -155,6 +165,28 @@ export interface AgyAdapterOptions {
 const UPSTREAM_ERROR_CODE = 'UPSTREAM'
 /** First-class DSH retryable code: the default retry policy honors SERVER (5xx), not UPSTREAM. */
 const SERVER_ERROR_CODE = 'SERVER'
+
+/** Abort-aware delay helper for transient stream retries. */
+async function sleepWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw new DOMException('aborted', 'AbortError')
+  }
+  await new Promise<void>((resolve, reject) => {
+    // Both exits must detach the listener: `{ once: true }` covers the abort
+    // firing, but a timer that simply wins would otherwise leave `onAbort` on the
+    // request-scoped signal for the rest of the call.
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new DOMException('aborted', 'AbortError'))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    if (!signal) return
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
 
 /** Stable ledger key for an account: email when present, else the generated id. */
 function ledgerAccountKey(session: AgyAccountSession): string | undefined {
@@ -455,7 +487,7 @@ export class AgyAdapter extends LlmAdapter {
       )
     }
 
-    const multimodalFiles = await resolveMultimodalFiles(options)
+    const multimodalFiles = await resolveMultimodalFiles(options, { maxBytes: this.options.maxInlineBytes?.() })
     // The account is now fixed for this request; take the in-flight slot that the
     // `stream` wrapper releases (see its comment for why release lives there).
     holder.account = session.account
@@ -465,8 +497,6 @@ export class AgyAdapter extends LlmAdapter {
     // session id degrades to the per-account value rather than inventing a
     // conversation.
     const conversationAccount = ledgerAccountKey(session)
-    /** Wall-clock origin for this attempt's latency figures. */
-    const startedAt = Date.now()
     // Streaming dispatch: the account proxy MUST carry the generation request
     // (it carried only the control-plane calls before, so a proxied account
     // silently generated from the host's real IP), and the streaming
@@ -483,8 +513,11 @@ export class AgyAdapter extends LlmAdapter {
      * names a fresh upstream session and recovers the conversation. This is not
      * an account fault, so it does not go through `reportFailure`: the account
      * stays healthy and only the derived id changes.
+     *
+     * `attemptStartedAt` is the clock of the outer attempt that owns this send,
+     * so a transport failure is billed to that attempt rather than to the call.
      */
-    const sendAttempt = async (): Promise<{ response: Response; bodyText?: string }> => {
+    const sendAttempt = async (attemptStartedAt: number): Promise<{ response: Response; bodyText?: string }> => {
       for (let attempt = 0; ; attempt++) {
         const generation = conversationKey !== undefined && conversationAccount !== undefined
           ? currentSessionGeneration(conversationAccount, conversationKey)
@@ -527,7 +560,7 @@ export class AgyAdapter extends LlmAdapter {
           await this.options.reportFailure(classified.kind, session)
           // A transport failure consumed no tokens, but it is a real attempt
           // against this account's quota — record the request, not the usage.
-          this.recordUsage(session, options.model, { ok: false, reason: 'network-error' }, startedAt)
+          this.recordUsage(session, options.model, { ok: false, reason: 'network-error' }, attemptStartedAt)
           throw new LlmError(classified.message ?? 'agy fetch failed', 'TRANSPORT', { cause: error })
         }
         if (response.ok) return { response }
@@ -545,146 +578,297 @@ export class AgyAdapter extends LlmAdapter {
       }
     }
 
-    const { response, bodyText } = await sendAttempt()
+    /**
+     * Maximum internal retries when the upstream ends a stream with
+     * `MALFORMED_FUNCTION_CALL` before any user-facing text chunks have been
+     * yielded to DSH. Gemini models occasionally glitch on tool-call JSON syntax;
+     * re-sampling cleanly recovers the turn without crashing the conversation.
+     *
+     * This deliberately generalises the `sendAttempt` accumulation-wall resend
+     * into the stream path: the invariant that one DSH call is one provider
+     * attempt now has this second, documented exception (see AGENTS.md, "the
+     * adapter does not silent-retry"). Both exceptions share the same shape —
+     * the account is healthy and the request was accepted — and neither goes
+     * through `reportFailure`, so the pool sees nothing.
+     */
+    const MAX_MALFORMED_RETRIES = 3
 
-    if (!response.ok) {
-      const classified = classifyHttpError(response.status, response.headers, bodyText)
-      await this.options.reportFailure(classified.kind, session, {
-        retryAfterMs: classified.retryAfterMs,
-        status: response.status,
-        rateLimitCategory: classified.rateLimitCategory,
-        resetTime: classified.resetTime,
-        model: options.model,
-        verificationUrl: classified.verificationUrl,
-      })
-      this.recordUsage(session, options.model, {
-        ok: false,
-        rateLimited: classified.kind === 'rate-limit',
-        reason: classified.kind,
-      }, startedAt)
-      if (classified.kind === 'rate-limit') {
-        // soft/rate limits are retryable by the harness (RATE_LIMIT + delay);
-        // daily quota exhaustion is terminal (QUOTA, 24h cooldown already set).
-        if (classified.rateLimitCategory === 'quota_exhausted') {
+    for (let malformedAttempt = 0; ; malformedAttempt++) {
+      const attemptStartedAt = Date.now()
+      const { response, bodyText } = await sendAttempt(attemptStartedAt)
+
+      if (!response.ok) {
+        const classified = classifyHttpError(response.status, response.headers, bodyText)
+        await this.options.reportFailure(classified.kind, session, {
+          retryAfterMs: classified.retryAfterMs,
+          status: response.status,
+          rateLimitCategory: classified.rateLimitCategory,
+          resetTime: classified.resetTime,
+          model: options.model,
+          verificationUrl: classified.verificationUrl,
+        })
+        this.recordUsage(session, options.model, {
+          ok: false,
+          rateLimited: classified.kind === 'rate-limit',
+          reason: classified.kind,
+        }, attemptStartedAt)
+        if (classified.kind === 'rate-limit') {
+          // soft/rate limits are retryable by the harness (RATE_LIMIT + delay);
+          // daily quota exhaustion is terminal (QUOTA, 24h cooldown already set).
+          if (classified.rateLimitCategory === 'quota_exhausted') {
+            throw new LlmError(
+              `agy daily quota exhausted (${response.status}): ${classified.message ?? ''}`,
+              QUOTA_EXCEEDED_CODE,
+            )
+          }
           throw new LlmError(
-            `agy daily quota exhausted (${response.status}): ${classified.message ?? ''}`,
-            QUOTA_EXCEEDED_CODE,
+            `agy rate-limited (${response.status}): ${classified.message ?? ''}`,
+            'RATE_LIMIT',
+            {
+              providerRetryAfterMs: classified.retryAfterMs ?? undefined,
+              requestId: ProviderRequestId(generateAntigravityRequestId()),
+            },
+          )
+        }
+        if (classified.kind === 'verification-required') {
+          // Recoverable, so deliberately NOT INVALID_CREDENTIAL: the account is
+          // parked for a timed window, not disabled, and the pool moves on. The
+          // appeal link goes in the message because a message is the only channel
+          // DSH surfaces to the user.
+          //
+          // Deliberately NO `providerRetryAfterMs`: the park IS the cooldown, and a
+          // delay above DSH's `maxDelayMs` makes its `normal` retry mode give up
+          // outright (`llm-retry`: `providerRetryAfterMs > maxDelayMs` -> `next()`),
+          // turning a recoverable challenge into a failed turn. With no delay DSH
+          // backs off locally and retries, and that retry lands on another account
+          // because this one is already parked.
+          const appeal = classified.verificationUrl ? ` Verify at: ${classified.verificationUrl}` : ''
+          throw new LlmError(
+            `agy account needs verification (${response.status}): ${classified.message ?? ''}${appeal}`,
+            'RATE_LIMIT',
+            {
+              requestId: ProviderRequestId(generateAntigravityRequestId()),
+            },
+          )
+        }
+        if (classified.kind === 'auth-failure') {
+          throw new LlmError(
+            `agy authentication failed (${response.status}) — run \`dsh-agy login\``,
+            'INVALID_CREDENTIAL',
+          )
+        }
+        // 5xx upstream failures (e.g. 503 "No capacity available") are transient:
+        // the DSH retry policy honors SERVER but treats UPSTREAM as terminal, so
+        // classifying 5xx as UPSTREAM kills the turn with zero retries. Non-5xx
+        // transient/request errors (404, generic 400, other 4xx) stay terminal.
+        if (classified.status !== undefined && classified.status >= 500) {
+          throw new LlmError(
+            `agy upstream error (${response.status}): ${classified.message ?? ''}`,
+            SERVER_ERROR_CODE,
+            {
+              providerRetryAfterMs: classified.retryAfterMs ?? undefined,
+              requestId: ProviderRequestId(generateAntigravityRequestId()),
+            },
           )
         }
         throw new LlmError(
-          `agy rate-limited (${response.status}): ${classified.message ?? ''}`,
-          'RATE_LIMIT',
-          {
-            providerRetryAfterMs: classified.retryAfterMs ?? undefined,
-            requestId: ProviderRequestId(generateAntigravityRequestId()),
-          },
-        )
-      }
-      if (classified.kind === 'verification-required') {
-        // Recoverable, so deliberately NOT INVALID_CREDENTIAL: the account is
-        // parked for a timed window, not disabled, and the pool moves on. The
-        // appeal link goes in the message because a message is the only channel
-        // DSH surfaces to the user.
-        //
-        // Deliberately NO `providerRetryAfterMs`: the park IS the cooldown, and a
-        // delay above DSH's `maxDelayMs` makes its `normal` retry mode give up
-        // outright (`llm-retry`: `providerRetryAfterMs > maxDelayMs` -> `next()`),
-        // turning a recoverable challenge into a failed turn. With no delay DSH
-        // backs off locally and retries, and that retry lands on another account
-        // because this one is already parked.
-        const appeal = classified.verificationUrl ? ` Verify at: ${classified.verificationUrl}` : ''
-        throw new LlmError(
-          `agy account needs verification (${response.status}): ${classified.message ?? ''}${appeal}`,
-          'RATE_LIMIT',
-          {
-            requestId: ProviderRequestId(generateAntigravityRequestId()),
-          },
-        )
-      }
-      if (classified.kind === 'auth-failure') {
-        throw new LlmError(
-          `agy authentication failed (${response.status}) — run \`dsh-agy login\``,
-          'INVALID_CREDENTIAL',
-        )
-      }
-      // 5xx upstream failures (e.g. 503 "No capacity available") are transient:
-      // the DSH retry policy honors SERVER but treats UPSTREAM as terminal, so
-      // classifying 5xx as UPSTREAM kills the turn with zero retries. Non-5xx
-      // transient/request errors (404, generic 400, other 4xx) stay terminal.
-      if (classified.status !== undefined && classified.status >= 500) {
-        throw new LlmError(
           `agy upstream error (${response.status}): ${classified.message ?? ''}`,
-          SERVER_ERROR_CODE,
-          {
-            providerRetryAfterMs: classified.retryAfterMs ?? undefined,
-            requestId: ProviderRequestId(generateAntigravityRequestId()),
-          },
+          UPSTREAM_ERROR_CODE,
         )
       }
-      throw new LlmError(
-        `agy upstream error (${response.status}): ${classified.message ?? ''}`,
-        UPSTREAM_ERROR_CODE,
-      )
-    }
 
-    if (!response.body) {
-      throw new LlmError('agy stream returned no body', UPSTREAM_ERROR_CODE)
-    }
+      if (!response.body) {
+        throw new LlmError('agy stream returned no body', UPSTREAM_ERROR_CODE)
+      }
 
-    try {
-      // The usage chunk is the ledger's only token source, so the stream is
-      // consumed here rather than piped: every chunk still reaches DSH
-      // unchanged, but the terminal `usage` chunk is also folded into this
-      // account's record. Upstream repeats `usageMetadata` on every SSE event
-      // (cumulative); parse.ts already reduces that to one final chunk.
+      // Buffer stream chunks while reasoning or tool calls accumulate. If
+      // `text-delta` arrives, commit the buffer and stream directly to preserve
+      // real-time token streaming for user-facing responses. If
+      // `MALFORMED_FUNCTION_CALL` arrives before any text deltas were committed,
+      // the buffer is discarded and the attempt is cleanly retried.
+      //
+      // Cost, deliberately accepted: until the first `text-delta` this also holds
+      // `reasoning-delta`, so a tool-call-only turn (reasoning + functionCall, no
+      // text) delivers its thinking only at stream end. That is the price of
+      // being able to discard the attempt at all — flushing reasoning would make
+      // a thinking model's tool-call turn unretryable, which is the one case this
+      // loop exists to recover.
+      const bufferedChunks: StreamChunk[] = []
+      /**
+       * Thought signatures observed during this attempt, held back with the
+       * chunks that carried them. `onToolSignature` fires as soon as the parser
+       * sees a signature, i.e. BEFORE the attempt is known to be keepable, so
+       * caching eagerly would let a discarded attempt write the process-global
+       * signature cache (keyed by `toolCallId` — and issue #99 records those ids
+       * colliding across distant turns, which would poison the very retry it
+       * triggered).
+       */
+      const pendingSignatures: Array<readonly [string, string]> = []
+      let yieldedDirect = false
       let usage: { input: number; output: number; cacheRead: number; cacheWrite: number } | undefined
       let ttftMs: number | undefined
-      for await (const chunk of parseAgySse(response.body, {
-        signal: options.signal,
-        onToolSignature: (toolCallId, signature) => {
+
+      /**
+       * Persist the signatures observed so far.
+       *
+       * Called at every point where the chunks that carried them have been
+       * handed off — never on the discard path, so a thrown-away attempt leaves
+       * no trace. The hand-off is the only sound anchor: a `functionCall` can
+       * arrive AFTER the first `text-delta` (text-then-tool is a common shape),
+       * so anchoring at stream end would drop the signature of an already
+       * delivered call the moment the stream dies mid-body, silently degrading
+       * the next round to the sentinel.
+       */
+      const commitSignatures = (): void => {
+        for (const [toolCallId, signature] of pendingSignatures) {
           setThoughtSignature(toolCallId, signature)
-        },
-      })) {
-        if (chunk.type === 'usage') {
-          usage = {
-            input: chunk.usage.inputTokens,
-            output: chunk.usage.outputTokens,
-            cacheRead: chunk.usage.cacheReadTokens ?? 0,
-            cacheWrite: chunk.usage.cacheWriteTokens ?? 0,
-          }
-        } else if (ttftMs === undefined && (chunk.type === 'text-delta' || chunk.type === 'reasoning-delta')) {
-          // First model-authored output: the honest end of "time to first token".
-          ttftMs = Date.now() - startedAt
         }
-        yield chunk
+        pendingSignatures.length = 0
       }
-      await this.options.markSuccess?.(session)
-      this.recordUsage(session, options.model, { ok: true, usage, ttftMs }, startedAt)
-    } catch (error) {
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        throw new LlmError('agy stream aborted', 'ABORTED', { cause: error })
+
+      /** Hand the held chunks to the consumer. */
+      const drainBuffer = (): StreamChunk[] => {
+        const drained = bufferedChunks.slice()
+        bufferedChunks.length = 0
+        return drained
       }
-      // An unmapped finishReason (SAFETY, MALFORMED_FUNCTION_CALL, ...) is a
-      // CONTENT-level verdict: the request reached a healthy account and the
-      // upstream chose to stop the response. Reporting network-error would
-      // cool and rotate the account for a wall the next request may never
-      // hit; request-error is a no-op at account level. DSH sees a terminal
-      // UPSTREAM error either way (below).
-      const unmappedFinish = error instanceof UnmappedFinishReasonError
-      await this.options.reportFailure(unmappedFinish ? 'request-error' : 'network-error', session)
-      // A stream that died mid-body may already have delivered billable
-      // content, so the attempt is recorded even though no usage chunk arrived.
-      this.recordUsage(session, options.model, { ok: false, reason: unmappedFinish ? 'request-error' : 'network-error' }, startedAt)
-      // Deliberately UPSTREAM (terminal), not TRANSPORT: content may already
-      // have been emitted, and DSH's retry policy honours TRANSPORT, so retrying
-      // here would replay a partially-delivered turn. The account-level report
-      // above already absorbs the transient case by cooling/rotating. The cause
-      // code is still surfaced so the socket failure is legible in session events.
-      throw new LlmError(
-        error instanceof Error ? describeFetchError(error) : 'agy stream parse failed',
-        UPSTREAM_ERROR_CODE,
-        { cause: error },
-      )
+
+      try {
+        for await (const chunk of parseAgySse(response.body, {
+          signal: options.signal,
+          onToolSignature: (toolCallId, signature) => {
+            pendingSignatures.push([toolCallId, signature])
+          },
+        })) {
+          if (chunk.type === 'usage') {
+            usage = {
+              input: chunk.usage.inputTokens,
+              output: chunk.usage.outputTokens,
+              cacheRead: chunk.usage.cacheReadTokens ?? 0,
+              cacheWrite: chunk.usage.cacheWriteTokens ?? 0,
+            }
+          }
+
+          if (yieldedDirect) {
+            // Past the hand-off, so this chunk leaves immediately: its signature
+            // commits here rather than at stream end. A `functionCall` can arrive
+            // after the first `text-delta`, so a mid-body death must not cost the
+            // consumer a signature it was already delivered.
+            if (pendingSignatures.length !== 0) commitSignatures()
+            yield chunk
+          } else if (chunk.type === 'text-delta') {
+            yieldedDirect = true
+            commitSignatures()
+            // TTFT is when the CONSUMER first sees output, not when the parser
+            // first produced it: a buffered turn holds every chunk until this
+            // point, so measuring at parse time would under-report the user's
+            // wait by the whole thinking period.
+            ttftMs = Date.now() - attemptStartedAt
+            for (const buffered of drainBuffer()) yield buffered
+            yield chunk
+          } else {
+            bufferedChunks.push(chunk)
+          }
+        }
+
+        // Commit whatever the turn left buffered (a tool-call or completed
+        // reasoning turn never emits a text-delta, so it ends up here).
+        if (ttftMs === undefined) ttftMs = Date.now() - attemptStartedAt
+        commitSignatures()
+        for (const buffered of drainBuffer()) yield buffered
+
+        await this.options.markSuccess?.(session)
+        this.recordUsage(session, options.model, { ok: true, usage, ttftMs }, attemptStartedAt)
+        return
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          this.recordUsage(session, options.model, { ok: false, reason: 'aborted', usage }, attemptStartedAt)
+          await response.body?.cancel().catch(() => {})
+          throw new LlmError('agy stream aborted', 'ABORTED', { cause: error })
+        }
+
+        // Idle watchdog (parse.ts): the streaming dispatcher runs with
+        // `bodyTimeout: 0` on purpose, so a body that stops producing bytes has
+        // no other reclaim. While nothing has been handed to the consumer, a
+        // retry replays a turn the user never saw — that one is worth DSH's
+        // retryable TIMEOUT, with the account still absorbing the transient
+        // through `reportFailure`. Past the first committed chunk the turn is
+        // content the consumer already holds, so it falls through to the same
+        // terminal UPSTREAM as any other mid-body death.
+        if (error instanceof AgyStreamIdleTimeoutError && !yieldedDirect) {
+          await this.options.reportFailure('network-error', session)
+          this.recordUsage(session, options.model, { ok: false, reason: 'network-error', usage }, attemptStartedAt)
+          await response.body?.cancel().catch(() => {})
+          throw new LlmError(
+            `${error.message} — nothing was delivered, retrying`,
+            'TIMEOUT',
+            { cause: error },
+          )
+        }
+
+        // MALFORMED_FUNCTION_CALL is a transient model syntax fluke during tool calling.
+        // If no text chunks were committed to DSH, discard the buffered chunks, record
+        // this attempt's usage, and retry after a short linear wait. Across at most
+        // 3 retries the whole schedule is 1.2s, so the shape buys nothing here;
+        // what matters is that the first re-sample is not immediate.
+        const isMalformed = error instanceof UnmappedFinishReasonError && error.reason === 'MALFORMED_FUNCTION_CALL'
+        if (isMalformed && !yieldedDirect && malformedAttempt < MAX_MALFORMED_RETRIES) {
+          // Bill the tokens this attempt really spent. `usage` arrives because
+          // parseAgySse flushes its stashed totals before propagating an
+          // unmapped finishReason; it stays undefined when the stream died too
+          // early to report any.
+          this.recordUsage(session, options.model, { ok: false, reason: 'request-error', usage }, attemptStartedAt)
+          // Abandon the body. The streaming dispatcher runs with `bodyTimeout: 0`
+          // (a reasoning pause must not be killed mid-turn), so nothing else
+          // reclaims this connection: leaving it unread can pin one per discarded
+          // attempt. `parseAgySse`'s finally has already released the reader
+          // lock, so cancelling is safe here.
+          await response.body?.cancel().catch(() => {})
+          // Abort-aware, and converted here rather than in a shared helper: a
+          // `catch` block never catches exceptions thrown by its own body, so
+          // awaiting the sleep inside this handler would let an abort landing in
+          // the backoff escape the generator as a raw `DOMException`. Every other
+          // abort path in this adapter reports the typed `ABORTED` code, which is
+          // what DSH's retry policy reads, so dropping it here would give the
+          // same cancellation two different shapes.
+          try {
+            await sleepWithSignal(200 * (malformedAttempt + 1), options.signal)
+          } catch (sleepError) {
+            if (sleepError instanceof DOMException && sleepError.name === 'AbortError') {
+              throw new LlmError('agy stream aborted', 'ABORTED', { cause: sleepError })
+            }
+            throw sleepError
+          }
+          continue
+        }
+
+        // An unmapped finishReason (SAFETY, unrecovered MALFORMED_FUNCTION_CALL, ...) is a
+        // CONTENT-level verdict: the request reached a healthy account and the
+        // upstream chose to stop the response. Reporting network-error would
+        // cool and rotate the account for a wall the next request may never
+        // hit; request-error is a no-op at account level. DSH sees a terminal
+        // UPSTREAM error either way (below).
+        const unmappedFinish = error instanceof UnmappedFinishReasonError
+        await this.options.reportFailure(unmappedFinish ? 'request-error' : 'network-error', session)
+        // `usage` is defined here exactly when the stream died with an unmapped
+        // finishReason or the idle watchdog fired: `parseAgySse` flushes its
+        // stashed totals before propagating those two and no other. A mid-body
+        // socket death and the EOF completeness guard produce none, so the value
+        // is `undefined` there and passing it is a no-op — the retry path bills
+        // the same way.
+        this.recordUsage(session, options.model, { ok: false, reason: unmappedFinish ? 'request-error' : 'network-error', usage }, attemptStartedAt)
+        await response.body?.cancel().catch(() => {})
+        // Deliberately UPSTREAM (terminal), not TRANSPORT: content may already
+        // have been emitted, and DSH's retry policy honours TRANSPORT, so retrying
+        // here would replay a partially-delivered turn. The account-level report
+        // above already absorbs the transient case by cooling/rotating. The cause
+        // code is still surfaced so the socket failure is legible in session events.
+        throw new LlmError(
+          error instanceof Error ? describeFetchError(error) : 'agy stream parse failed',
+          UPSTREAM_ERROR_CODE,
+          { cause: error },
+        )
+      }
     }
   }
 

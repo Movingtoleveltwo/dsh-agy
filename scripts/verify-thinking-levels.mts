@@ -62,7 +62,7 @@ if (!masterKey) {
 }
 const codec = createAesGcmCodec(deriveKey(masterKey))
 const storage = decryptStorage(
-  JSON.parse(readFileSync(join(dshHome, 'agy-accounts.json'), 'utf8')),
+  JSON.parse(readFileSync(join(dshHome, 'agy', 'agy-accounts.json'), 'utf8')),
   codec,
 )
 const account = storage.accounts[0]

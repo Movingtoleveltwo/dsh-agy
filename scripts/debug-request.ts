@@ -30,8 +30,8 @@ async function main(): Promise<void> {
     process.exit(1)
   }
   const codec = createAesGcmCodec(deriveKey(masterKey))
-  const store = new JsonAccountStore({ file: join(dshHome, 'agy-accounts.json'), codec })
-  const raw = readFileSync(join(dshHome, 'agy-accounts.json'), 'utf8')
+  const store = new JsonAccountStore({ file: join(dshHome, 'agy', 'agy-accounts.json'), codec })
+  const raw = readFileSync(join(dshHome, 'agy', 'agy-accounts.json'), 'utf8')
   const storage = decryptStorage(JSON.parse(raw), codec)
   for (const [i, account] of storage.accounts.entries()) {
     console.log(`account[${i}] email=${account.email ?? '(none)'} projectId=${JSON.stringify(account.projectId)} managedProjectId=${JSON.stringify(account.managedProjectId)}`)
