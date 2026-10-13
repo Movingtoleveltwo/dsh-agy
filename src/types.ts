@@ -315,11 +315,13 @@ export type AgyAuthErrorKind = 'transport' | 'rate-limit' | 'invalid-credential'
  */
 export class AgyAuthError extends Error {
   readonly kind: AgyAuthErrorKind
+  readonly retryAfterMs?: number
 
-  constructor(kind: AgyAuthErrorKind, message: string, options?: ErrorOptions) {
+  constructor(kind: AgyAuthErrorKind, message: string, options?: ErrorOptions & { retryAfterMs?: number }) {
     super(message, options)
     this.name = 'AgyAuthError'
     this.kind = kind
+    this.retryAfterMs = options?.retryAfterMs
   }
 }
 

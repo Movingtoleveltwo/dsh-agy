@@ -19,11 +19,14 @@ interface OAuthErrorPayload {
   error_description?: string
 }
 
+import { parseRetryAfter } from '../runtime/classify.ts'
+
 export class AgyTokenRefreshError extends Error {
   code?: string
   description?: string
   status: number
   statusText: string
+  retryAfterMs?: number
 
   constructor(options: {
     message: string
@@ -31,6 +34,7 @@ export class AgyTokenRefreshError extends Error {
     description?: string
     status: number
     statusText: string
+    retryAfterMs?: number
   }) {
     super(options.message)
     this.name = 'AgyTokenRefreshError'
@@ -38,6 +42,7 @@ export class AgyTokenRefreshError extends Error {
     this.description = options.description
     this.status = options.status
     this.statusText = options.statusText
+    this.retryAfterMs = options.retryAfterMs
   }
 }
 
@@ -133,6 +138,8 @@ export async function refreshAccessToken(auth: OAuthAuthDetails, options?: { cli
           continue // try next candidate if available before revoking
         }
 
+        const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
+
         transientFailure = {
           type: 'failed',
           error: new AgyTokenRefreshError({
@@ -141,6 +148,7 @@ export async function refreshAccessToken(auth: OAuthAuthDetails, options?: { cli
             description: description ?? errorText,
             status: response.status,
             statusText: response.statusText,
+            retryAfterMs,
           }),
         }
         continue

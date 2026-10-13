@@ -1900,5 +1900,62 @@ describe('fingerprint version freshness', () => {
       const after = await store.load()
       expect(after.activeIndex).toBe(1)
     })
+
+    it('H1 & M4: atomically picks next usable account inside mutate and fires rotation only once for concurrent calls', async () => {
+      stubTokenEndpoint()
+      const a = { ...account('a@x'), coolingDownUntil: Date.now() + 60000, cooldownReason: 'quota-exhausted' as const }
+      const b = account('b@x')
+      const store = new InMemoryAccountStore(storage([a, b], 0))
+      let rotateCount = 0
+      const sessions = new AgySessionManager({
+        store,
+        onRotate: () => {
+          rotateCount++
+        },
+      })
+
+      // Two concurrent getSession requests when account 0 is cooling down
+      const [s1, s2] = await Promise.all([
+        sessions.getSession('gemini-3.8-flash'),
+        sessions.getSession('gemini-3.8-flash'),
+      ])
+
+      expect(s1!.index).toBe(1)
+      expect(s2!.index).toBe(1)
+      // Must only rotate once!
+      expect(rotateCount).toBe(1)
+      const after = await store.load()
+      expect(after.activeIndex).toBe(1)
+    })
+
+    it('M2: compound blocking time computes Math.max across coolingDownUntil, rolling quota, and weekly quota without premature truncation', async () => {
+      const now = Date.now()
+      const a: ManagedAccount = {
+        ...account('a@x'),
+        cooldownReason: 'quota-exhausted',
+        coolingDownUntil: now + 5000, // 5s
+        cachedQuota: {
+          google: {
+            remainingFraction: 0,
+            resetTime: new Date(now + 20000).toISOString(), // 20s
+            weeklyFraction: 0,
+            weeklyResetTime: new Date(now + 45000).toISOString(), // 45s
+          },
+        },
+        cachedQuotaUpdatedAt: now - 1000,
+      }
+      const store = new InMemoryAccountStore(storage([a], 0))
+      const sessions = new AgySessionManager({ store })
+
+      try {
+        await sessions.getSession('gemini-3.8-flash')
+        expect.unreachable('should have thrown')
+      } catch (err: any) {
+        expect(err.name).toBe('AgyPoolBlockedError')
+        expect(err.kind).toBe('quota-exhausted')
+        // Blocked until must not be truncated to 5s, but must reach 45s (now + 45000)
+        expect(err.blockedUntil).toBeGreaterThanOrEqual(now + 44000)
+      }
+    })
   })
 })

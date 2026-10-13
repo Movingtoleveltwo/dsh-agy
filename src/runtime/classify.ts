@@ -141,7 +141,7 @@ function extractResetTime(bodyText: string | undefined): string | undefined {
   return undefined
 }
 
-function parseRetryAfter(header: string | null): number | undefined {
+export function parseRetryAfter(header: string | null): number | undefined {
   if (!header) return undefined
   const seconds = Number(header)
   if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000

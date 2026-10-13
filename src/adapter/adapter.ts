@@ -462,6 +462,7 @@ export class AgyAdapter extends LlmAdapter {
         }
         if (error.kind === 'rate-limit') {
           throw new LlmError(error.message, 'RATE_LIMIT', {
+            providerRetryAfterMs: error.retryAfterMs ?? 1000,
             requestId: ProviderRequestId(generateAntigravityRequestId()),
           })
         }

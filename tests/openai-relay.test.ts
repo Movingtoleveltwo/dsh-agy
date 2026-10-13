@@ -1010,6 +1010,44 @@ describe('OpenAI Relay HTTP endpoints', () => {
       server.close()
     }
   })
+
+  it('retries on TRANSPORT network error with backoff and avoids hammering on RATE_LIMIT missing delay', async () => {
+    let callCount = 0
+    const netAdapter = {
+      stream: async function* () {
+        callCount++
+        if (callCount === 1) {
+          throw new LlmError('ECONNRESET network drop', 'TRANSPORT')
+        }
+        yield {
+          type: 'text-delta',
+          text: 'recovered after transport retry',
+        } as StreamChunk
+        yield {
+          type: 'finish',
+          reason: { kind: 'stop' },
+        } as StreamChunk
+      },
+    } as unknown as AgyAdapter
+
+    const server = createServer(createOpenAiRelayHandler({ adapter: netAdapter }))
+    await new Promise<void>((resolve) => server.listen(0, resolve))
+    const port = (server.address() as { port: number }).port
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/agy/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages: [{ role: 'user', content: 'test' }], stream: false }),
+      })
+      expect(res.status).toBe(200)
+      const json = (await res.json()) as { choices: Array<{ message: { content: string } }> }
+      expect(json.choices[0].message.content).toBe('recovered after transport retry')
+      expect(callCount).toBe(2)
+    } finally {
+      server.close()
+    }
+  })
 })
 
 

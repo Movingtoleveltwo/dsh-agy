@@ -490,7 +490,10 @@ export class AgySessionManager {
           : result.error.status === 0 || result.error.status === 408 || result.error.status >= 500
             ? 'transport'
             : 'invalid-credential'
-        throw new AgyAuthError(kind, describeFetchError(result.error), { cause: result.error })
+        throw new AgyAuthError(kind, describeFetchError(result.error), {
+          cause: result.error,
+          retryAfterMs: result.error.retryAfterMs,
+        })
       }
       if (result.type === 'revoked') {
         // Account credentials are dead — mark it disabled and verificationRequired in the store
@@ -858,73 +861,113 @@ export class AgySessionManager {
       return { account: active, index: activeIdx }
     }
 
-    // Active account is unusable. Find next sequential usable account:
-    const next = this.pickNextSequentialAccount(storage, activeIdx, now, model)
-    if (next) {
-      const prevActiveIdx = storage.activeIndex
-      let resolvedNext: { account: ManagedAccount; index: number } = next
-      const targetKey = this.accountKey(next.account)
+    // Active account is unusable. Atomically select next usable account inside the mutation lock:
+    let transition: { from: number; to: number; account: ManagedAccount } | null = null
+    let chosen: { account: ManagedAccount; index: number } | undefined
 
-      if (next.index !== storage.activeIndex) {
-        try {
-          await this.store.mutate((s) => {
-            for (const a of s.accounts) clearExpiredState(a, Date.now())
-            const freshIdx = s.accounts.findIndex((a) => this.accountKey(a) === targetKey)
-            if (freshIdx !== -1 && s.accounts[freshIdx]!.enabled !== false) {
-              s.activeIndex = freshIdx
-              resolvedNext = { account: s.accounts[freshIdx]!, index: freshIdx }
-            } else {
-              const currentValidIdx = typeof s.activeIndex === 'number' && s.activeIndex >= 0 && s.activeIndex < s.accounts.length
-                ? s.activeIndex
-                : 0
-              const fallback = this.pickNextSequentialAccount(s, currentValidIdx, Date.now(), model)
-              if (fallback) {
-                s.activeIndex = fallback.index
-                resolvedNext = fallback
-              }
-            }
-          })
-          storage.activeIndex = resolvedNext.index
-        } catch (err) {
-          console.warn('[dsh-agy] failed to persist sequential rotation activeIndex:', err)
+    try {
+      await this.store.mutate((s) => {
+        const mutateNow = Date.now()
+        for (const a of s.accounts) clearExpiredState(a, mutateNow)
+
+        const sActiveIdx = typeof s.activeIndex === 'number' && s.activeIndex >= 0 && s.activeIndex < s.accounts.length
+          ? s.activeIndex
+          : 0
+        const sActive = s.accounts[sActiveIdx]
+
+        // 1. If currently active account in latest store is usable (e.g. user manually switched,
+        // or a concurrent turn already rotated, or cooldown expired), use it without rotating again!
+        if (sActive && sActive.enabled !== false && !isCoolingDown(sActive, mutateNow) && !isFamilyRateLimited(sActive, familyKey, mutateNow) && !isFamilyQuotaExhausted(sActive, family, mutateNow)) {
+          chosen = { account: sActive, index: sActiveIdx }
+          return
         }
 
-        if (resolvedNext.index !== prevActiveIdx) {
-          this.onRotate?.(prevActiveIdx, resolvedNext.index, 'rate-limit')
-          this.emitUsage({
-            ...(resolvedNext.account.email === undefined && resolvedNext.account.id === undefined
-              ? {}
-              : { account: resolvedNext.account.email ?? resolvedNext.account.id }),
-            source: 'chat',
-            ok: true,
-            rotated: true,
-            poolEvent: true,
-            reason: 'quota-exhausted',
-          })
+        // 2. Otherwise pick next sequential usable account from latest store:
+        const picked = this.pickNextSequentialAccount(s, sActiveIdx, mutateNow, model)
+        if (picked) {
+          if (picked.index !== s.activeIndex) {
+            transition = { from: sActiveIdx, to: picked.index, account: picked.account }
+            s.activeIndex = picked.index
+          }
+          chosen = picked
+        } else {
+          chosen = undefined
         }
+      })
+      if (chosen) {
+        storage.activeIndex = chosen.index
       }
-      return resolvedNext
+    } catch (err) {
+      console.warn('[dsh-agy] failed to mutate sequential rotation activeIndex:', err)
+      const fallback = this.pickNextSequentialAccount(storage, activeIdx, now, model)
+      if (fallback) {
+        chosen = fallback
+      }
+    }
+
+    const recordedTransition = transition as { from: number; to: number; account: ManagedAccount } | null
+    if (recordedTransition) {
+      this.onRotate?.(recordedTransition.from, recordedTransition.to, 'rate-limit')
+      this.emitUsage({
+        ...(recordedTransition.account.email === undefined && recordedTransition.account.id === undefined
+          ? {}
+          : { account: recordedTransition.account.email ?? recordedTransition.account.id }),
+        source: 'chat',
+        ok: true,
+        rotated: true,
+        poolEvent: true,
+        reason: 'quota-exhausted',
+      })
+    }
+
+    if (chosen) {
+      return chosen
     }
 
     // All enabled accounts are unusable/blocked
     const quotaExhausted = (account: ManagedAccount): { exhausted: boolean; resetMs?: number } => {
+      let isExhausted = false
+      let maxResetMs: number | undefined
+
       if (account.cooldownReason === 'quota-exhausted' && (account.coolingDownUntil ?? 0) > now) {
-        return { exhausted: true, resetMs: account.coolingDownUntil }
+        isExhausted = true
+        maxResetMs = account.coolingDownUntil
       }
-      if (isQuotaStale(account, now)) return { exhausted: false }
-      const quota = familyQuotaFor(account, family, now)
-      if (!quota) return { exhausted: false }
-      const spent = (fraction: number | undefined, resetTime: string | undefined, threshold = 0): number | undefined => {
-        if (typeof fraction !== 'number' || fraction > threshold || !resetTime) return undefined
-        return parseFutureResetMs(resetTime, now)
+
+      if (!isQuotaStale(account, now)) {
+        const quota = familyQuotaFor(account, family, now)
+        if (quota) {
+          const spent = (fraction: number | undefined, resetTime: string | undefined, threshold = 0): number | undefined => {
+            if (typeof fraction !== 'number' || fraction > threshold || !resetTime) return undefined
+            return parseFutureResetMs(resetTime, now)
+          }
+          const r1 = spent(quota.remainingFraction, quota.resetTime, 0)
+          const r2 = spent(quota.weeklyFraction, quota.weeklyResetTime, WEEKLY_QUOTA_THRESHOLD)
+          if (r1 !== undefined || r2 !== undefined) {
+            isExhausted = true
+            const quotaReset = Math.max(r1 ?? 0, r2 ?? 0)
+            if (quotaReset > 0) {
+              maxResetMs = maxResetMs !== undefined ? Math.max(maxResetMs, quotaReset) : quotaReset
+            }
+          }
+        }
       }
-      const r1 = spent(quota.remainingFraction, quota.resetTime, 0)
-      const r2 = spent(quota.weeklyFraction, quota.weeklyResetTime, WEEKLY_QUOTA_THRESHOLD)
-      if (r1 !== undefined || r2 !== undefined) {
-        const resetMs = Math.max(r1 ?? 0, r2 ?? 0)
-        return { exhausted: true, resetMs: resetMs > 0 ? resetMs : undefined }
+
+      if (account.cachedLimits?.groups) {
+        for (const g of account.cachedLimits.groups) {
+          for (const w of g.windows) {
+            if (w.remainingFraction === 0 || (w.window === 'weekly' && (w.remainingFraction ?? 1) <= WEEKLY_QUOTA_THRESHOLD)) {
+              const wReset = parseFutureResetMs(w.resetTime ?? undefined, now)
+              if (wReset !== undefined) {
+                isExhausted = true
+                maxResetMs = maxResetMs !== undefined ? Math.max(maxResetMs, wReset) : wReset
+              }
+            }
+          }
+        }
       }
-      return { exhausted: false }
+
+      return { exhausted: isExhausted, resetMs: maxResetMs }
     }
 
     const exhaustionMap = new Map(eligible.map((e) => [e.index, quotaExhausted(e.account)]))
