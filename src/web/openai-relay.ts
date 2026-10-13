@@ -333,6 +333,42 @@ async function handleChatCompletions(
   }
 }
 
+interface RelayRetryDecision {
+  shouldRetry: boolean
+  backoffMs: number
+}
+
+function checkRelayRetry(error: unknown, attempt: number, maxAttempts: number): RelayRetryDecision {
+  if (attempt >= maxAttempts - 1) return { shouldRetry: false, backoffMs: 0 }
+  if (!(error instanceof LlmError)) return { shouldRetry: false, backoffMs: 0 }
+  if (error.code === 'QUOTA' || error.code === 'QUOTA_EXCEEDED') {
+    return { shouldRetry: true, backoffMs: 0 }
+  }
+  if (error.code === 'RATE_LIMIT') {
+    const failure = (error as { failure?: { providerRetryAfterMs?: number } }).failure
+    const delay = typeof failure?.providerRetryAfterMs === 'number'
+      ? failure.providerRetryAfterMs
+      : (typeof (error as { providerRetryAfterMs?: number }).providerRetryAfterMs === 'number'
+        ? (error as { providerRetryAfterMs?: number }).providerRetryAfterMs!
+        : 0)
+    return { shouldRetry: true, backoffMs: Math.max(0, delay) }
+  }
+  return { shouldRetry: false, backoffMs: 0 }
+}
+
+async function waitRetryDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (delayMs <= 0) return
+  if (signal?.aborted) throw new Error('Aborted')
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(resolve, delayMs)
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new Error('Aborted'))
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 /**
  * Streams chat completion chunks via SSE with deferred HTTP headers and contiguous tool indexing.
  */
@@ -366,10 +402,14 @@ async function handleStreamingCompletion(
         firstResult = first
         break
       } catch (initialError) {
-        const isQuotaOrRateLimit = initialError instanceof LlmError &&
-          (initialError.code === 'RATE_LIMIT' || initialError.code === 'QUOTA_EXCEEDED' || initialError.code === 'QUOTA')
-        if (attempt === 0 && isQuotaOrRateLimit) {
-          logger?.warn?.('[dsh-agy relay] upstream rate-limited/quota-exhausted on initial attempt, failing over to next sequential account')
+        const decision = checkRelayRetry(initialError, attempt, maxRelayAttempts)
+        if (decision.shouldRetry) {
+          if (decision.backoffMs > 0) {
+            logger?.warn?.(`[dsh-agy relay] rate-limited on attempt ${attempt + 1}, backing off ${decision.backoffMs}ms before retry`)
+            await waitRetryDelay(decision.backoffMs, options.signal)
+          } else {
+            logger?.warn?.(`[dsh-agy relay] quota-exhausted on attempt ${attempt + 1}, failing over to next sequential account`)
+          }
           continue
         }
         handleError(res, initialError)
@@ -651,9 +691,11 @@ async function handleNonStreamingCompletion(
       sendJson(res, 200, response)
       return
     } catch (error) {
-      const isQuotaOrRateLimit = error instanceof LlmError &&
-        (error.code === 'RATE_LIMIT' || error.code === 'QUOTA_EXCEEDED' || error.code === 'QUOTA')
-      if (attempt === 0 && isQuotaOrRateLimit) {
+      const decision = checkRelayRetry(error, attempt, maxRelayAttempts)
+      if (decision.shouldRetry) {
+        if (decision.backoffMs > 0) {
+          await waitRetryDelay(decision.backoffMs, options.signal)
+        }
         continue
       }
       handleError(res, error)

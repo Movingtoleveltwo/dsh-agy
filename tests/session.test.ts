@@ -1790,5 +1790,115 @@ describe('fingerprint version freshness', () => {
       const nextSession = await sessions.getSession()
       expect(nextSession!.index).toBe(0)
     })
+
+    it('H1 & M4: pickAccount auto-shift commits atomically by key, logs poolEvent, and fires onRotate', async () => {
+      stubTokenEndpoint()
+      const a = { ...account('a@x'), coolingDownUntil: Date.now() + 100_000, cooldownReason: 'quota-exhausted' as const }
+      const b = account('b@x')
+      const c = account('c@x')
+      const store = new InMemoryAccountStore(storage([a, b, c], 0))
+      const rotations: string[] = []
+      const usageRecords: any[] = []
+      const sessions = new AgySessionManager({
+        store,
+        onRotate: (from, to) => rotations.push(`${from}->${to}`),
+        recordUsage: (rec) => usageRecords.push(rec),
+      })
+
+      // Account 0 is cooling, so pickAccount must auto-shift to B (1)
+      const session = await sessions.getSession()
+      expect(session!.index).toBe(1)
+      expect(session!.account.email).toBe('b@x')
+      expect((await store.load()).activeIndex).toBe(1)
+      expect(rotations).toEqual(['0->1'])
+      expect(usageRecords.some((r) => r.poolEvent && r.rotated)).toBe(true)
+    })
+
+    it('H2: late failure report from an old inactive account does NOT overwrite active account', async () => {
+      stubTokenEndpoint()
+      const a = account('a@x')
+      const b = account('b@x')
+      const c = account('c@x')
+      const store = new InMemoryAccountStore(storage([a, b, c], 0))
+      const rotations: string[] = []
+      const sessions = new AgySessionManager({
+        store,
+        onRotate: (from, to) => rotations.push(`${from}->${to}`),
+      })
+
+      // 1. Session A was acquired
+      const sessionA = await sessions.getSession()
+      expect(sessionA!.index).toBe(0)
+
+      // 2. User manually activates C (index 2)
+      await sessions.activateAccount(2)
+      expect((await store.load()).activeIndex).toBe(2)
+
+      // 3. Late failure arrives from old session A
+      await sessions.reportFailure('rate-limit', sessionA!, {
+        status: 429,
+        rateLimitCategory: 'quota_exhausted',
+      })
+
+      // A is in cooldown, but activeIndex must REMAIN C (2), NOT be overwritten by A -> B
+      const after = await store.load()
+      expect(after.accounts[0]!.coolingDownUntil).toBeDefined()
+      expect(after.activeIndex).toBe(2)
+      // onRotate must not have fired for a stale report
+      expect(rotations).toHaveLength(0)
+    })
+
+    it('M1 & M2: compound blocking conditions take Math.max per account, and stale quota is not exhausted', async () => {
+      stubTokenEndpoint()
+      const now = Date.now()
+      // Account A has global cooling for 5s, but model family rate limit for 60s
+      const a = {
+        ...account('a@x'),
+        coolingDownUntil: now + 5000,
+        rateLimitResetTimes: { google: now + 60000 },
+        // Stale quota with 0 remaining: should be ignored per M1
+        cachedQuota: { google: { remainingFraction: 0, resetTime: new Date(now + 100000).toISOString() } },
+        cachedQuotaUpdatedAt: now - 30 * 60 * 1000, // 30m old, stale
+      }
+      const store = new InMemoryAccountStore(storage([a], 0))
+      const sessions = new AgySessionManager({ store })
+
+      // When blocked, blockedUntil must be max(5000, 60000) = ~60000, not 5000
+      try {
+        await sessions.getSession('gemini-3.8-flash')
+        expect.unreachable('should have thrown')
+      } catch (err: any) {
+        expect(err.name).toBe('AgyPoolBlockedError')
+        // Must be retryable (because stale 0 quota was ignored per M1)
+        expect(err.kind).toBe('retryable')
+        // Blocked until must be approximately now + 60000 per M2
+        expect(err.blockedUntil).toBeGreaterThanOrEqual(now + 55000)
+      }
+    })
+
+    it('M3: revoke failure passes model parameter to sequential selection', async () => {
+      stubTokenEndpoint()
+      const a = account('a@x')
+      // B has Gemini quota exhausted, but Anthropic is healthy
+      const b = {
+        ...account('b@x'),
+        rateLimitResetTimes: { google: Date.now() + 100000 },
+      }
+      const c = account('c@x')
+      const store = new InMemoryAccountStore(storage([a, b, c], 0))
+      const sessions = new AgySessionManager({ store })
+
+      const sessionA = await sessions.getSession('claude-opus-4-6-thinking')
+      expect(sessionA!.index).toBe(0)
+
+      // A credentials revoked for Claude model request
+      await sessions.reportFailure('auth-failure', sessionA!, {
+        model: 'claude-opus-4-6-thinking',
+      })
+
+      // Must rotate to B (index 1) because B is healthy for anthropic, instead of skipping to C
+      const after = await store.load()
+      expect(after.activeIndex).toBe(1)
+    })
   })
 })

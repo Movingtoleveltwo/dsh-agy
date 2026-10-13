@@ -861,13 +861,49 @@ export class AgySessionManager {
     // Active account is unusable. Find next sequential usable account:
     const next = this.pickNextSequentialAccount(storage, activeIdx, now, model)
     if (next) {
+      const prevActiveIdx = storage.activeIndex
+      let resolvedNext: { account: ManagedAccount; index: number } = next
+      const targetKey = this.accountKey(next.account)
+
       if (next.index !== storage.activeIndex) {
-        storage.activeIndex = next.index
-        await this.store.mutate((s) => {
-          s.activeIndex = next.index
-        }).catch(() => {})
+        try {
+          await this.store.mutate((s) => {
+            for (const a of s.accounts) clearExpiredState(a, Date.now())
+            const freshIdx = s.accounts.findIndex((a) => this.accountKey(a) === targetKey)
+            if (freshIdx !== -1 && s.accounts[freshIdx]!.enabled !== false) {
+              s.activeIndex = freshIdx
+              resolvedNext = { account: s.accounts[freshIdx]!, index: freshIdx }
+            } else {
+              const currentValidIdx = typeof s.activeIndex === 'number' && s.activeIndex >= 0 && s.activeIndex < s.accounts.length
+                ? s.activeIndex
+                : 0
+              const fallback = this.pickNextSequentialAccount(s, currentValidIdx, Date.now(), model)
+              if (fallback) {
+                s.activeIndex = fallback.index
+                resolvedNext = fallback
+              }
+            }
+          })
+          storage.activeIndex = resolvedNext.index
+        } catch (err) {
+          console.warn('[dsh-agy] failed to persist sequential rotation activeIndex:', err)
+        }
+
+        if (resolvedNext.index !== prevActiveIdx) {
+          this.onRotate?.(prevActiveIdx, resolvedNext.index, 'rate-limit')
+          this.emitUsage({
+            ...(resolvedNext.account.email === undefined && resolvedNext.account.id === undefined
+              ? {}
+              : { account: resolvedNext.account.email ?? resolvedNext.account.id }),
+            source: 'chat',
+            ok: true,
+            rotated: true,
+            poolEvent: true,
+            reason: 'quota-exhausted',
+          })
+        }
       }
-      return next
+      return resolvedNext
     }
 
     // All enabled accounts are unusable/blocked
@@ -875,6 +911,7 @@ export class AgySessionManager {
       if (account.cooldownReason === 'quota-exhausted' && (account.coolingDownUntil ?? 0) > now) {
         return { exhausted: true, resetMs: account.coolingDownUntil }
       }
+      if (isQuotaStale(account, now)) return { exhausted: false }
       const quota = familyQuotaFor(account, family, now)
       if (!quota) return { exhausted: false }
       const spent = (fraction: number | undefined, resetTime: string | undefined, threshold = 0): number | undefined => {
@@ -895,15 +932,22 @@ export class AgySessionManager {
     const isExhaustedPool = retryable.length === 0
     const candidates = isExhaustedPool ? eligible : retryable
 
-    const blockedTimes = candidates.map((e) => {
-      const qRes = exhaustionMap.get(e.index)
-      if (qRes?.resetMs && qRes.resetMs > now) return qRes.resetMs
-      if (e.account.coolingDownUntil && e.account.coolingDownUntil > now) return e.account.coolingDownUntil
-      const familyLimit = e.account.rateLimitResetTimes?.[familyKey]
-      if (familyLimit && familyLimit > now) return familyLimit
-      return now + 5 * 60 * 1000
-    })
+    const accountBlockedUntil = (account: ManagedAccount, qRes?: { exhausted: boolean; resetMs?: number }): number => {
+      let maxBlock = now
+      if (qRes?.exhausted && typeof qRes.resetMs === 'number' && qRes.resetMs > now) {
+        maxBlock = Math.max(maxBlock, qRes.resetMs)
+      }
+      if (account.coolingDownUntil && account.coolingDownUntil > now) {
+        maxBlock = Math.max(maxBlock, account.coolingDownUntil)
+      }
+      const familyLimit = account.rateLimitResetTimes?.[familyKey]
+      if (familyLimit && familyLimit > now) {
+        maxBlock = Math.max(maxBlock, familyLimit)
+      }
+      return maxBlock > now ? maxBlock : now + 5 * 60 * 1000
+    }
 
+    const blockedTimes = candidates.map((e) => accountBlockedUntil(e.account, exhaustionMap.get(e.index)))
     const blockedUntil = Math.min(...blockedTimes)
     throw new AgyPoolBlockedError(isExhaustedPool ? 'quota-exhausted' : 'retryable', blockedUntil)
   }
@@ -1078,6 +1122,7 @@ export class AgySessionManager {
     const consecutive = (this.failureCounts.get(key) ?? 0) + 1
     this.failureCounts.set(key, consecutive)
     let nextIndexToRotate: number | null = null
+    let fromIndexBeforeRotate: number | null = null
     const fpCachedVersion = kind === 'rate-limit' ? peekCachedAntigravityVersion() : null
     // The version a newly generated fingerprint advertises. Cache first (no I/O),
     // then a bounded live resolve, then `currentAgyVersion()` (the resolved version
@@ -1117,12 +1162,17 @@ export class AgySessionManager {
       if (decision.action === 'revoke') {
         this.tokenCache.delete(key)
         this.failureCounts.delete(key)
+        const now = Date.now()
+        for (const a of storage.accounts) clearExpiredState(a, now)
         const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
-        const effectiveIndex = currentIndex >= 0 ? currentIndex : storage.activeIndex
-        const next = this.pickNextSequentialAccount(storage, effectiveIndex, Date.now())
-        if (next && next.index !== storage.activeIndex) {
-          storage.activeIndex = next.index
-          nextIndexToRotate = next.index
+        const isCurrentActive = currentIndex !== -1 && currentIndex === storage.activeIndex
+        if (isCurrentActive) {
+          const next = this.pickNextSequentialAccount(storage, currentIndex, now, info?.model)
+          if (next && next.index !== storage.activeIndex) {
+            fromIndexBeforeRotate = storage.activeIndex
+            storage.activeIndex = next.index
+            nextIndexToRotate = next.index
+          }
         }
         this.clearAffinityForAccount(key)
         return
@@ -1166,18 +1216,21 @@ export class AgySessionManager {
         const now = Date.now()
         for (const a of storage.accounts) clearExpiredState(a, now)
         const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
-        const effectiveIndex = currentIndex >= 0 ? currentIndex : storage.activeIndex
-        const next = this.pickNextSequentialAccount(storage, effectiveIndex, now, info?.model)
-        if (next && next.index !== storage.activeIndex) {
-          storage.activeIndex = next.index
-          nextIndexToRotate = next.index
+        const isCurrentActive = currentIndex !== -1 && currentIndex === storage.activeIndex
+        if (isCurrentActive) {
+          const next = this.pickNextSequentialAccount(storage, currentIndex, now, info?.model)
+          if (next && next.index !== storage.activeIndex) {
+            fromIndexBeforeRotate = storage.activeIndex
+            storage.activeIndex = next.index
+            nextIndexToRotate = next.index
+          }
         }
         this.clearAffinityForAccount(key)
       }
     })
 
     if (nextIndexToRotate !== null) {
-      this.onRotate?.(session.index, nextIndexToRotate, kind)
+      this.onRotate?.(fromIndexBeforeRotate ?? session.index, nextIndexToRotate, kind)
       // Counted as a pool event, not a request: the adapter already recorded
       // the request that failed, and counting it again here would inflate it.
       this.emitUsage({

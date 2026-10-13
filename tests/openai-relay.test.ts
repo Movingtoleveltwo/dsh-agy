@@ -938,14 +938,20 @@ describe('OpenAI Relay HTTP endpoints', () => {
     }
   })
 
-  it('fails over to next account attempt when first attempt hits 429 RATE_LIMIT before headers sent', async () => {
+  it('fails over to next account attempt on quota exhaustion, and respects backoff on soft rate-limit', async () => {
     let callCount = 0
+    let streamStartTime = 0
+    let retryTime = 0
     const failoverAdapter = {
       stream: async function* () {
         callCount++
         if (callCount === 1) {
-          throw new LlmError('account 0 rate limited', 'RATE_LIMIT')
+          streamStartTime = Date.now()
+          throw new LlmError('account 0 soft rate limited', 'RATE_LIMIT', {
+            providerRetryAfterMs: 40,
+          })
         }
+        retryTime = Date.now()
         yield {
           type: 'text-delta',
           text: 'failover success from account 1',
@@ -962,7 +968,7 @@ describe('OpenAI Relay HTTP endpoints', () => {
     const port = (server.address() as { port: number }).port
 
     try {
-      // 1. Streaming completion failover
+      // 1. Streaming completion: should wait ~40ms before second attempt
       const streamRes = await fetch(`http://127.0.0.1:${port}/agy/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -972,9 +978,25 @@ describe('OpenAI Relay HTTP endpoints', () => {
       const streamText = await streamRes.text()
       expect(streamText).toContain('failover success from account 1')
       expect(callCount).toBe(2)
+      expect(retryTime - streamStartTime).toBeGreaterThanOrEqual(30)
 
-      // 2. Non-streaming completion failover
+      // 2. Non-streaming completion with immediate QUOTA exhaustion failover
       callCount = 0
+      failoverAdapter.stream = async function* () {
+        callCount++
+        if (callCount === 1) {
+          throw new LlmError('account 0 quota exhausted', 'QUOTA_EXCEEDED')
+        }
+        yield {
+          type: 'text-delta',
+          text: 'quota failover success from account 1',
+        } as StreamChunk
+        yield {
+          type: 'finish',
+          reason: { kind: 'stop' },
+        } as StreamChunk
+      }
+
       const nonStreamRes = await fetch(`http://127.0.0.1:${port}/agy/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -982,7 +1004,7 @@ describe('OpenAI Relay HTTP endpoints', () => {
       })
       expect(nonStreamRes.status).toBe(200)
       const json = (await nonStreamRes.json()) as { choices: Array<{ message: { content: string } }> }
-      expect(json.choices[0].message.content).toBe('failover success from account 1')
+      expect(json.choices[0].message.content).toBe('quota failover success from account 1')
       expect(callCount).toBe(2)
     } finally {
       server.close()
