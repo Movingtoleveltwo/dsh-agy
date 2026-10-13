@@ -532,6 +532,14 @@ describe('rotation state machine', () => {
     expect(d5.backoffMs).toBeGreaterThan(d0.backoffMs)
   })
 
+  it('retries on network-error without cooling or rotating the account', () => {
+    const acc = account()
+    const decision = decideRotation('network-error', acc, 0)
+    expect(decision.action).toBe('retry')
+    expect(acc.coolingDownUntil).toBeUndefined()
+    expect(acc.cooldownReason).toBeUndefined()
+  })
+
   it('cools quota until the real reset time (e.g. 2h or multi-day weekly, capped at 7d)', () => {
     const before = Date.now()
     const acc = account()

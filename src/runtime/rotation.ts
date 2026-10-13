@@ -270,10 +270,10 @@ export function decideRotation(
       return { action: 'cool', backoffMs: VERIFICATION_COOLDOWN_MS }
     }
     case 'network-error': {
-      account.coolingDownUntil = now + backoffMs
-      account.cooldownReason = 'network-error'
-      account.cooldownSetAt = now
-      return { action: 'rotate', backoffMs }
+      // 网络抖动/超时/连接断开属于链路层或代理层抖动，与具体 Google 账号无关。
+      // 在单机单出口代理环境下换号没有任何意义，反而会导致账号频繁非理性横跳。
+      // 策略：绝不写入 coolingDownUntil，绝不修改 cooldownReason，绝不触发切号，原地退避重试。
+      return { action: 'retry', backoffMs }
     }
     case 'project-error': {
       account.coolingDownUntil = now + backoffMs

@@ -1759,5 +1759,36 @@ describe('fingerprint version freshness', () => {
       const s0Recovered = await sessions.getSession()
       expect(s0Recovered!.index).toBe(0)
     })
+
+    it('does NOT rotate or cool account on transient network-error, preserving active account sticky state', async () => {
+      stubTokenEndpoint()
+      const a = account('a@x')
+      const b = account('b@x')
+      const store = new InMemoryAccountStore(storage([a, b], 0))
+      const rotations: string[] = []
+      const sessions = new AgySessionManager({
+        store,
+        onRotate: (from, to) => rotations.push(`${from}->${to}`),
+      })
+
+      const session = await sessions.getSession()
+      expect(session!.index).toBe(0)
+      expect((await store.load()).activeIndex).toBe(0)
+
+      // Network blip occurs
+      await sessions.reportFailure('network-error', session!)
+
+      const after = await store.load()
+      // Account 0 must NOT be in cooldown
+      expect(after.accounts[0]!.coolingDownUntil).toBeUndefined()
+      expect(after.accounts[0]!.cooldownReason).toBeUndefined()
+      // activeIndex must NOT rotate to 1
+      expect(after.activeIndex).toBe(0)
+      expect(rotations).toHaveLength(0)
+
+      // Next turn continues cleanly on account 0
+      const nextSession = await sessions.getSession()
+      expect(nextSession!.index).toBe(0)
+    })
   })
 })
