@@ -483,6 +483,57 @@ describe('rotation state machine', () => {
     expect(acc.cooldownReason).toBeUndefined()
   })
 
+  it('does NOT unfreeze if coolingDownUntil elapsed but weekly quota is still 0 with future reset, and extends cooldown', () => {
+    const now = Date.now()
+    const acc = account()
+    // 5h cooldown has elapsed (now - 1000)
+    acc.coolingDownUntil = now - 1000
+    acc.cooldownReason = 'quota-exhausted'
+    acc.cooldownSetAt = now - 5 * 3600 * 1000
+    const weeklyFutureReset = now + 12 * 3600 * 1000
+    acc.cachedLimits = {
+      updatedAt: now - 60000,
+      groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            // 5h window is 1 and reset has passed
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1, resetTime: new Date(now - 10000).toISOString() },
+            // Weekly window is 0 and resets in 12 hours
+            { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0, resetTime: new Date(weeklyFutureReset).toISOString() },
+          ],
+        },
+      ],
+    }
+    clearExpiredState(acc, now)
+    expect(acc.coolingDownUntil).toBeDefined()
+    expect(acc.coolingDownUntil).toBe(weeklyFutureReset)
+    expect(acc.cooldownReason).toBe('quota-exhausted')
+  })
+
+  it('aligns quota_exhausted cooldown with known exhausted weekly window when upstream provides no resetTime', () => {
+    const now = Date.now()
+    const acc = account()
+    const weeklyFutureReset = now + 18 * 3600 * 1000
+    acc.cachedLimits = {
+      updatedAt: now - 60000,
+      groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1, resetTime: new Date(now - 10000).toISOString() },
+            { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0, resetTime: new Date(weeklyFutureReset).toISOString() },
+          ],
+        },
+      ],
+    }
+    // Upstream 429 error with no resetTime provided
+    const decision = decideRotation('rate-limit', acc, 0, undefined, 'quota_exhausted')
+    expect(decision.action).toBe('cool')
+    expect(acc.coolingDownUntil).toBe(weeklyFutureReset)
+    expect(acc.cooldownReason).toBe('quota-exhausted')
+  })
+
   it('revokes on auth-failure and disables the account', () => {
     const acc = account()
     const decision = decideRotation('auth-failure', acc, 2)

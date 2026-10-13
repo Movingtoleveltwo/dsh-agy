@@ -114,6 +114,28 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
   }
   let expired = account.coolingDownUntil !== undefined && account.coolingDownUntil <= now
 
+  // Guard against premature unfreezing: even if coolingDownUntil has passed, check whether
+  // any quota window (e.g. weekly) is still exhausted (0 remaining fraction) with a future reset.
+  if (expired && account.cooldownReason === 'quota-exhausted' && account.cachedLimits?.groups) {
+    let latestExhaustedResetMs: number | undefined
+    for (const group of account.cachedLimits.groups) {
+      for (const w of group.windows) {
+        if (w.remainingFraction === 0 || (w.window === 'weekly' && (w.remainingFraction ?? 1) <= WEEKLY_QUOTA_THRESHOLD)) {
+          const resetAt = w.resetTime ? Date.parse(w.resetTime) : Number.NaN
+          if (!Number.isNaN(resetAt) && resetAt > now) {
+            if (latestExhaustedResetMs === undefined || resetAt > latestExhaustedResetMs) {
+              latestExhaustedResetMs = resetAt
+            }
+          }
+        }
+      }
+    }
+    if (latestExhaustedResetMs !== undefined) {
+      account.coolingDownUntil = Math.min(latestExhaustedResetMs, now + MAX_QUOTA_COOLDOWN_MS)
+      expired = false
+    }
+  }
+
   // If the cooldown was due to quota exhaustion, evaluate whether the quota has affirmatively recovered:
   if (!expired && account.cooldownReason === 'quota-exhausted' && account.cachedLimits?.groups) {
     const groups = account.cachedLimits.groups
@@ -221,7 +243,19 @@ export function decideRotation(
       if (category === 'quota_exhausted') {
         // Quota exhausted: cool until the real reset reported by upstream (5h rolling or weekly window, capped at 7 days).
         // Defaults to 5h window when unspecified (never a blind 24h).
-        const resetMs = parseFutureResetMs(resetTime, now)
+        let resetMs = parseFutureResetMs(resetTime, now)
+        if (resetMs === undefined && account.cachedLimits?.groups) {
+          for (const group of account.cachedLimits.groups) {
+            for (const w of group.windows) {
+              if (w.remainingFraction === 0 || (w.window === 'weekly' && (w.remainingFraction ?? 1) <= WEEKLY_QUOTA_THRESHOLD)) {
+                const wReset = parseFutureResetMs(w.resetTime ?? undefined, now)
+                if (wReset !== undefined && (resetMs === undefined || wReset > resetMs)) {
+                  resetMs = wReset
+                }
+              }
+            }
+          }
+        }
         const cooldownMs = resetMs !== undefined
           ? Math.min(Math.max(resetMs - now, 60_000), MAX_QUOTA_COOLDOWN_MS)
           : DEFAULT_QUOTA_COOLDOWN_MS

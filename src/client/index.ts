@@ -31,7 +31,7 @@ import { aliasVar, installAgyStyles } from './styles.ts'
 import { en, zh, type AgyLocaleKey } from './locales.ts'
 import { h } from './element.ts'
 import { AgyQuotaBadge } from './quota-badge.ts'
-import { agoText, quotaColor, stateLabel, untilText, windowLabel, MINUTE_MS, HOUR_MS } from './quota-view.ts'
+import { agoText, quotaColor, resetText, stateLabel, untilText, windowLabel, MINUTE_MS, HOUR_MS } from './quota-view.ts'
 import type { AccountView, AgyRpcClient, AgyRpcResult, ModelView, MultimodalView, StatsView, ThinkingBudgets } from '../rpc-contract.ts'
 import { CLAUDE_BUDGET_MAX, CLAUDE_BUDGET_MIN, THINKING_BUDGET_MAX, THINKING_BUDGET_MIN, THINKING_LEVELS } from '../thinking-types.ts'
 import { MULTIMODAL_DEFAULT_MB, MULTIMODAL_MAX_MB, MULTIMODAL_MIN_MB } from '../multimodal-types.ts'
@@ -656,7 +656,7 @@ function LimitsCard(props: {
               h('div', { className: 'agy-limit-header' },
                 h('span', { className: 'agy-limit-k' }, windowLabel(window.window, t)),
                 h('div', { className: 'agy-limit-status' },
-                  window.resetTime === null ? null : h('span', { className: 'agy-limit-reset' }, untilText(window.resetTime, t, now)),
+                  window.resetTime === null ? null : h('span', { className: 'agy-limit-reset' }, resetText(window.resetTime, t, now)),
                   h('span', {
                     className: 'agy-limit-p',
                     style: fraction === null ? undefined : { color: quotaColor(fraction) },
