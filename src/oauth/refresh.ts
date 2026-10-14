@@ -138,7 +138,11 @@ export async function refreshAccessToken(auth: OAuthAuthDetails, options?: { cli
           continue // try next candidate if available before revoking
         }
 
-        const retryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
+        const currentRetryAfterMs = parseRetryAfter(response.headers.get('retry-after'))
+        const prevRetryAfterMs = transientFailure?.type === 'failed' ? transientFailure.error.retryAfterMs : undefined
+        const effectiveRetryAfterMs = prevRetryAfterMs !== undefined || currentRetryAfterMs !== undefined
+          ? Math.max(prevRetryAfterMs ?? 0, currentRetryAfterMs ?? 0)
+          : undefined
 
         transientFailure = {
           type: 'failed',
@@ -148,7 +152,7 @@ export async function refreshAccessToken(auth: OAuthAuthDetails, options?: { cli
             description: description ?? errorText,
             status: response.status,
             statusText: response.statusText,
-            retryAfterMs,
+            retryAfterMs: effectiveRetryAfterMs,
           }),
         }
         continue

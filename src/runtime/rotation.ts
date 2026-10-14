@@ -118,6 +118,10 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
   // any quota window (e.g. weekly) is still exhausted (0 remaining fraction) with a future reset.
   if (expired && account.cooldownReason === 'quota-exhausted' && account.cachedLimits?.groups) {
     let latestExhaustedResetMs: number | undefined
+    let hasFreshExhaustedWindow = false
+    const updatedAt = account.cachedLimits.updatedAt
+    const cooldownSetAt = account.cooldownSetAt
+
     for (const group of account.cachedLimits.groups) {
       for (const w of group.windows) {
         if (w.remainingFraction === 0 || (w.window === 'weekly' && (w.remainingFraction ?? 1) <= WEEKLY_QUOTA_THRESHOLD)) {
@@ -126,12 +130,21 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
             if (latestExhaustedResetMs === undefined || resetAt > latestExhaustedResetMs) {
               latestExhaustedResetMs = resetAt
             }
+          } else {
+            const measuredAfterCooldown = typeof updatedAt === 'number' && cooldownSetAt !== undefined && updatedAt >= cooldownSetAt
+            const measuredAfterReset = typeof updatedAt === 'number' && (!Number.isNaN(resetAt) ? updatedAt >= resetAt : true)
+            if (measuredAfterCooldown && measuredAfterReset) {
+              hasFreshExhaustedWindow = true
+            }
           }
         }
       }
     }
     if (latestExhaustedResetMs !== undefined) {
       account.coolingDownUntil = Math.min(latestExhaustedResetMs, now + MAX_QUOTA_COOLDOWN_MS)
+      expired = false
+    } else if (hasFreshExhaustedWindow) {
+      account.coolingDownUntil = now + DEFAULT_QUOTA_COOLDOWN_MS
       expired = false
     }
   }

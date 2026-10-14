@@ -864,11 +864,15 @@ export class AgySessionManager {
     // Active account is unusable. Atomically select next usable account inside the mutation lock:
     let transition: { from: number; to: number; account: ManagedAccount } | null = null
     let chosen: { account: ManagedAccount; index: number } | undefined
+    let latestEligibleAccounts: Array<{ account: ManagedAccount; index: number }> = []
 
     try {
       await this.store.mutate((s) => {
         const mutateNow = Date.now()
         for (const a of s.accounts) clearExpiredState(a, mutateNow)
+        latestEligibleAccounts = s.accounts
+          .map((account, index) => ({ account, index }))
+          .filter(({ account }) => account.enabled !== false)
 
         const sActiveIdx = typeof s.activeIndex === 'number' && s.activeIndex >= 0 && s.activeIndex < s.accounts.length
           ? s.activeIndex
@@ -898,11 +902,9 @@ export class AgySessionManager {
         storage.activeIndex = chosen.index
       }
     } catch (err) {
-      console.warn('[dsh-agy] failed to mutate sequential rotation activeIndex:', err)
-      const fallback = this.pickNextSequentialAccount(storage, activeIdx, now, model)
-      if (fallback) {
-        chosen = fallback
-      }
+      transition = null
+      chosen = undefined
+      throw err
     }
 
     const recordedTransition = transition as { from: number; to: number; account: ManagedAccount } | null
@@ -925,6 +927,7 @@ export class AgySessionManager {
     }
 
     // All enabled accounts are unusable/blocked
+    const poolCandidates = latestEligibleAccounts.length > 0 ? latestEligibleAccounts : eligible
     const quotaExhausted = (account: ManagedAccount): { exhausted: boolean; resetMs?: number } => {
       let isExhausted = false
       let maxResetMs: number | undefined
@@ -955,6 +958,15 @@ export class AgySessionManager {
 
       if (account.cachedLimits?.groups) {
         for (const g of account.cachedLimits.groups) {
+          const groupNameLower = g.name.toLowerCase()
+          const matchesFamily =
+            family === 'google'
+              ? (groupNameLower.includes('gemini') || groupNameLower.includes('google'))
+              : (family === 'anthropic' || family === 'openai')
+                ? (groupNameLower.includes('claude') || groupNameLower.includes('gpt') || groupNameLower.includes('3p'))
+                : false
+          if (!matchesFamily) continue
+
           for (const w of g.windows) {
             if (w.remainingFraction === 0 || (w.window === 'weekly' && (w.remainingFraction ?? 1) <= WEEKLY_QUOTA_THRESHOLD)) {
               const wReset = parseFutureResetMs(w.resetTime ?? undefined, now)
@@ -970,10 +982,10 @@ export class AgySessionManager {
       return { exhausted: isExhausted, resetMs: maxResetMs }
     }
 
-    const exhaustionMap = new Map(eligible.map((e) => [e.index, quotaExhausted(e.account)]))
-    const retryable = eligible.filter((e) => !exhaustionMap.get(e.index)?.exhausted)
+    const exhaustionMap = new Map(poolCandidates.map((e) => [e.index, quotaExhausted(e.account)]))
+    const retryable = poolCandidates.filter((e) => !exhaustionMap.get(e.index)?.exhausted)
     const isExhaustedPool = retryable.length === 0
-    const candidates = isExhaustedPool ? eligible : retryable
+    const candidates = isExhaustedPool ? poolCandidates : retryable
 
     const accountBlockedUntil = (account: ManagedAccount, qRes?: { exhausted: boolean; resetMs?: number }): number => {
       let maxBlock = now
