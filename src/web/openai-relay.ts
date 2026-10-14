@@ -354,7 +354,13 @@ function checkRelayRetry(error: unknown, attempt: number, maxAttempts: number): 
     return { shouldRetry: true, backoffMs: Math.max(1000, delay) }
   }
   if (error.code === 'TRANSPORT') {
-    return { shouldRetry: true, backoffMs: 500 }
+    const failure = (error as { failure?: { providerRetryAfterMs?: number } }).failure
+    const delay = typeof failure?.providerRetryAfterMs === 'number'
+      ? failure.providerRetryAfterMs
+      : (typeof (error as { providerRetryAfterMs?: number }).providerRetryAfterMs === 'number'
+        ? (error as { providerRetryAfterMs?: number }).providerRetryAfterMs!
+        : 500)
+    return { shouldRetry: true, backoffMs: Math.max(500, delay) }
   }
   return { shouldRetry: false, backoffMs: 0 }
 }

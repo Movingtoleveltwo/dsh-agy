@@ -824,10 +824,9 @@ export class AgySessionManager {
     conversationKey?: string,
   ): Promise<{ account: ManagedAccount; index: number } | undefined> {
     const now = Date.now()
-    for (const account of storage.accounts) clearExpiredState(account, now)
-
     const family = modelFamilyOf(model)
     const familyKey = familyKeyOf(model)
+    for (const account of storage.accounts) clearExpiredState(account, now, family)
 
     const isUsable = (acc: ManagedAccount | undefined): acc is ManagedAccount =>
       acc !== undefined &&
@@ -865,11 +864,15 @@ export class AgySessionManager {
     let transition: { from: number; to: number; account: ManagedAccount } | null = null
     let chosen: { account: ManagedAccount; index: number } | undefined
     let latestEligibleAccounts: Array<{ account: ManagedAccount; index: number }> = []
+    let mutateRan = false
+    let lockNow: number | undefined
 
     try {
       await this.store.mutate((s) => {
+        mutateRan = true
         const mutateNow = Date.now()
-        for (const a of s.accounts) clearExpiredState(a, mutateNow)
+        lockNow = mutateNow
+        for (const a of s.accounts) clearExpiredState(a, mutateNow, family)
         latestEligibleAccounts = s.accounts
           .map((account, index) => ({ account, index }))
           .filter(({ account }) => account.enabled !== false)
@@ -926,23 +929,23 @@ export class AgySessionManager {
       return chosen
     }
 
+    if (mutateRan && latestEligibleAccounts.length === 0) {
+      return undefined
+    }
+
     // All enabled accounts are unusable/blocked
+    const poolNow = lockNow ?? now
     const poolCandidates = latestEligibleAccounts.length > 0 ? latestEligibleAccounts : eligible
     const quotaExhausted = (account: ManagedAccount): { exhausted: boolean; resetMs?: number } => {
       let isExhausted = false
       let maxResetMs: number | undefined
 
-      if (account.cooldownReason === 'quota-exhausted' && (account.coolingDownUntil ?? 0) > now) {
-        isExhausted = true
-        maxResetMs = account.coolingDownUntil
-      }
-
-      if (!isQuotaStale(account, now)) {
-        const quota = familyQuotaFor(account, family, now)
+      if (!isQuotaStale(account, poolNow)) {
+        const quota = familyQuotaFor(account, family, poolNow)
         if (quota) {
           const spent = (fraction: number | undefined, resetTime: string | undefined, threshold = 0): number | undefined => {
             if (typeof fraction !== 'number' || fraction > threshold || !resetTime) return undefined
-            return parseFutureResetMs(resetTime, now)
+            return parseFutureResetMs(resetTime, poolNow)
           }
           const r1 = spent(quota.remainingFraction, quota.resetTime, 0)
           const r2 = spent(quota.weeklyFraction, quota.weeklyResetTime, WEEKLY_QUOTA_THRESHOLD)
@@ -969,13 +972,20 @@ export class AgySessionManager {
 
           for (const w of g.windows) {
             if (w.remainingFraction === 0 || (w.window === 'weekly' && (w.remainingFraction ?? 1) <= WEEKLY_QUOTA_THRESHOLD)) {
-              const wReset = parseFutureResetMs(w.resetTime ?? undefined, now)
+              const wReset = parseFutureResetMs(w.resetTime ?? undefined, poolNow)
               if (wReset !== undefined) {
                 isExhausted = true
                 maxResetMs = maxResetMs !== undefined ? Math.max(maxResetMs, wReset) : wReset
               }
             }
           }
+        }
+      }
+
+      if (account.cooldownReason === 'quota-exhausted' && (account.coolingDownUntil ?? 0) > poolNow) {
+        isExhausted = true
+        if (maxResetMs === undefined || account.coolingDownUntil! > maxResetMs) {
+          maxResetMs = account.coolingDownUntil
         }
       }
 
@@ -988,18 +998,18 @@ export class AgySessionManager {
     const candidates = isExhaustedPool ? poolCandidates : retryable
 
     const accountBlockedUntil = (account: ManagedAccount, qRes?: { exhausted: boolean; resetMs?: number }): number => {
-      let maxBlock = now
-      if (qRes?.exhausted && typeof qRes.resetMs === 'number' && qRes.resetMs > now) {
+      let maxBlock = poolNow
+      if (qRes?.exhausted && typeof qRes.resetMs === 'number' && qRes.resetMs > poolNow) {
         maxBlock = Math.max(maxBlock, qRes.resetMs)
       }
-      if (account.coolingDownUntil && account.coolingDownUntil > now) {
+      if (account.cooldownReason !== 'quota-exhausted' && account.coolingDownUntil && account.coolingDownUntil > poolNow) {
         maxBlock = Math.max(maxBlock, account.coolingDownUntil)
       }
       const familyLimit = account.rateLimitResetTimes?.[familyKey]
-      if (familyLimit && familyLimit > now) {
+      if (familyLimit && familyLimit > poolNow) {
         maxBlock = Math.max(maxBlock, familyLimit)
       }
-      return maxBlock > now ? maxBlock : now + 5 * 60 * 1000
+      return maxBlock > poolNow ? maxBlock : poolNow + 5 * 60 * 1000
     }
 
     const blockedTimes = candidates.map((e) => accountBlockedUntil(e.account, exhaustionMap.get(e.index)))

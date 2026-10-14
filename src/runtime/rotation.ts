@@ -4,6 +4,7 @@
  */
 
 import type { CachedQuota, FailureKind, ManagedAccount, RotationAction } from '../types.ts'
+import type { ModelFamily } from './quota.ts'
 import type { RateLimitCategory } from './classify.ts'
 
 export const BACKOFF_TIERS_MS = [5_000, 10_000, 20_000, 30_000, 60_000] as const
@@ -105,7 +106,7 @@ export function recordRateLimit(account: ManagedAccount, modelKey: string, reset
 }
 
 /** Clear expired rate limits and cooldowns in place. */
-export function clearExpiredState(account: ManagedAccount, now = Date.now()): void {
+export function clearExpiredState(account: ManagedAccount, now = Date.now(), family?: ModelFamily): void {
   if (account.rateLimitResetTimes) {
     const fresh = Object.fromEntries(
       Object.entries(account.rateLimitResetTimes).filter(([, reset]) => reset > now),
@@ -123,6 +124,17 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
     const cooldownSetAt = account.cooldownSetAt
 
     for (const group of account.cachedLimits.groups) {
+      if (family) {
+        const groupNameLower = group.name.toLowerCase()
+        const matchesFamily =
+          family === 'google'
+            ? (groupNameLower.includes('gemini') || groupNameLower.includes('google'))
+            : (family === 'anthropic' || family === 'openai')
+              ? (groupNameLower.includes('claude') || groupNameLower.includes('gpt') || groupNameLower.includes('3p'))
+              : false
+        if (!matchesFamily) continue
+      }
+
       for (const w of group.windows) {
         if (w.remainingFraction === 0 || (w.window === 'weekly' && (w.remainingFraction ?? 1) <= WEEKLY_QUOTA_THRESHOLD)) {
           const resetAt = w.resetTime ? Date.parse(w.resetTime) : Number.NaN
@@ -131,7 +143,7 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
               latestExhaustedResetMs = resetAt
             }
           } else {
-            const measuredAfterCooldown = typeof updatedAt === 'number' && cooldownSetAt !== undefined && updatedAt >= cooldownSetAt
+            const measuredAfterCooldown = typeof updatedAt === 'number' && (cooldownSetAt !== undefined ? updatedAt >= cooldownSetAt : true)
             const measuredAfterReset = typeof updatedAt === 'number' && (!Number.isNaN(resetAt) ? updatedAt >= resetAt : true)
             if (measuredAfterCooldown && measuredAfterReset) {
               hasFreshExhaustedWindow = true
@@ -169,8 +181,8 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now()): vo
 
         return group.windows.every((w) => {
           const resetAt = w.resetTime ? Date.parse(w.resetTime) : Number.NaN
-          // If we took a measurement AFTER resetAt and remainingFraction is 0, it's explicitly STILL exhausted:
-          if (measuredAfterFailure && typeof updatedAt === 'number' && !Number.isNaN(resetAt) && updatedAt > resetAt && w.remainingFraction === 0) {
+          // If we took a measurement AFTER resetAt (or at resetAt) and remainingFraction is 0, it's explicitly STILL exhausted:
+          if (measuredAfterFailure && typeof updatedAt === 'number' && !Number.isNaN(resetAt) && updatedAt >= resetAt && w.remainingFraction === 0) {
             return false
           }
           // A window with a valid resetTime: if that reset occurred after the failure and <= now, the window has reset!

@@ -458,7 +458,10 @@ export class AgyAdapter extends LlmAdapter {
     } catch (error) {
       if (error instanceof AgyAuthError) {
         if (error.kind === 'transport') {
-          throw new LlmError(error.message, 'TRANSPORT', { cause: error })
+          throw new LlmError(error.message, 'TRANSPORT', {
+            cause: error,
+            providerRetryAfterMs: error.retryAfterMs,
+          })
         }
         if (error.kind === 'rate-limit') {
           throw new LlmError(error.message, 'RATE_LIMIT', {

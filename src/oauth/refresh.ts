@@ -182,12 +182,14 @@ export async function refreshAccessToken(auth: OAuthAuthDetails, options?: { cli
       const raw = error instanceof Error ? error : new Error(String(error))
       const code = (error as unknown as { code?: string })?.code
       const errorCode = (error as unknown as { errorCode?: string })?.errorCode
+      const prevRetryAfterMs = transientFailure?.type === 'failed' ? transientFailure.error.retryAfterMs : undefined
       const wrapped = new AgyTokenRefreshError({
         message: raw.message,
         status: 0,
         statusText: 'Network Error',
         code: code ?? errorCode,
         description: raw.message,
+        retryAfterMs: prevRetryAfterMs,
       })
       // Preserve original cause/code for isProxyUnreachableError chain
       ;(wrapped as unknown as { cause?: unknown }).cause = error
