@@ -37,7 +37,7 @@ import {
   generateAntigravityRequestId,
 } from '../src/runtime/identity.ts'
 import { _clearVersionCacheForTest, resolveAntigravityVersion } from '../src/runtime/version.ts'
-import { parseQuotaSummary } from '../src/adapter/quota-summary.ts'
+import { fetchQuotaSummary, parseQuotaSummary } from '../src/adapter/quota-summary.ts'
 import {
   FAMILY_UNKNOWN,
   familiesForBucketId,
@@ -1322,6 +1322,60 @@ describe('quota summary (5h / weekly windows)', () => {
       }],
     })
     expect(groups[0]!.windows.map((w) => w.bucketId)).toEqual(['ok'])
+  })
+
+  it('asks the prod host first because the daily host omits the Gemini group', async () => {
+    // Measured 2026-10-20 on live accounts: `daily` answers with the Claude/GPT
+    // group only, `prod` answers with that group AND Gemini. Taking the first 200
+    // in generation order hid the Gemini card entirely, so this pins the order.
+    const asked: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      asked.push(url)
+      if (url.startsWith('https://daily-cloudcode-pa.googleapis.com')) {
+        return Response.json({
+          groups: [{ displayName: 'Claude and GPT models', buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 1 }] }],
+        })
+      }
+      if (url.startsWith('https://cloudcode-pa.googleapis.com')) {
+        return Response.json({
+          groups: [
+            { displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 1 }] },
+            { displayName: 'Claude and GPT models', buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 1 }] },
+          ],
+        })
+      }
+      return new Response('unavailable', { status: 503 })
+    })
+
+    const groups = await fetchQuotaSummary('at', 'proj', fetchImpl as unknown as typeof fetch)
+    expect(groups.map((group) => group.name)).toEqual(['Gemini Models', 'Claude and GPT models'])
+    // One request in the healthy case; the poorer daily answer is never needed.
+    expect(asked).toHaveLength(1)
+    expect(asked[0]).toContain('cloudcode-pa.googleapis.com')
+  })
+
+  it('falls back down the chain when the prod host answers nothing usable', async () => {
+    const asked: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      asked.push(url)
+      if (url.includes('retrieveUserQuotaSummary') && !url.startsWith('https://daily-cloudcode-pa.googleapis.com')) {
+        return new Response('upstream error', { status: 500 })
+      }
+      return Response.json({
+        groups: [{ displayName: 'Claude and GPT models', buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 1 }] }],
+      })
+    })
+
+    const groups = await fetchQuotaSummary('at', undefined, fetchImpl as unknown as typeof fetch)
+    expect(groups.map((group) => group.name)).toEqual(['Claude and GPT models'])
+    expect(asked.length).toBeGreaterThan(1)
+  })
+
+  it('answers an empty list, not a throw, when every endpoint fails', async () => {
+    const fetchImpl = vi.fn(async () => { throw new TypeError('fetch failed') })
+    await expect(fetchQuotaSummary('at', undefined, fetchImpl as unknown as typeof fetch)).resolves.toEqual([])
   })
 })
 

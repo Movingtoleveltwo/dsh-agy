@@ -25,7 +25,7 @@
  * (that pair is what answers 200 here), so nothing new is impersonated.
  */
 
-import { AGY_ENDPOINT_FALLBACKS, getAgyBootstrapUserAgent } from '../oauth/constants.ts'
+import { AGY_ENDPOINT_FALLBACKS, AGY_ENDPOINT_PROD, getAgyBootstrapUserAgent } from '../oauth/constants.ts'
 import { proxiedFetch } from '../proxy.ts'
 import { QUOTA_WINDOWS } from '../types.ts'
 import type { QuotaGroup, QuotaWindow } from '../types.ts'
@@ -117,10 +117,27 @@ export function parseQuotaSummary(raw: unknown): QuotaGroup[] {
 /**
  * Fetch and parse the grouped windows for one account.
  *
- * Mirrors `fetchAvailableModels`: the endpoint fallback chain is walked here, and
- * the caller injects only the routed+time-bounded fetch, so the account's proxy
- * is honoured (omitting it would go direct and leak the account's real IP) and
- * one shared budget bounds both calls.
+ * Mirrors `fetchAvailableModels`: the endpoint chain is walked here, and the
+ * caller injects only the routed+time-bounded fetch, so the account's proxy is
+ * honoured (omitting it would go direct and leak the account's real IP) and one
+ * shared budget bounds both calls.
+ *
+ * ORDER DIFFERS FROM GENERATION, ON PURPOSE. The endpoints do not report the same
+ * group set. Measured on all four accounts, 2026-10-20, with identical numbers
+ * wherever they overlap:
+ *
+ *   prod           -> Claude and GPT AND Gemini
+ *   daily          -> Claude and GPT only
+ *   daily-sandbox  -> Claude and GPT only
+ *   autopush       -> 3p-weekly only
+ *
+ * Taking the first 200 in the GENERATION order (daily) therefore hid the whole
+ * Gemini card and left the `google` family unreadable, which the rotation verdict
+ * can only call "unknown" — no Gemini limit could ever be judged. The prod host is
+ * the superset for this READ, so it is asked first here and the rest of the chain
+ * stays as the fallback. This is deliberately scoped to this read: the generation
+ * path's `daily -> prod -> ...` order is untouched, because prod answers
+ * RESOURCE_EXHAUSTED to consumer accounts for GENERATION (see `oauth/constants.ts`).
  *
  * @param accessToken - a live access token for the account.
  * @param projectId - the account's Cloud Code project id, when known.
@@ -134,19 +151,27 @@ export async function fetchQuotaSummary(
   fetchImpl: typeof fetch = proxiedFetch,
 ): Promise<QuotaGroup[]> {
   const body = JSON.stringify(projectId ? { project: projectId } : {})
-  for (const baseEndpoint of AGY_ENDPOINT_FALLBACKS) {
+  const attempt = async (baseEndpoint: string): Promise<QuotaGroup[] | undefined> => {
+    const response = await fetchImpl(`${baseEndpoint}${QUOTA_SUMMARY_PATH}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'User-Agent': getAgyBootstrapUserAgent(),
+      },
+      body,
+    })
+    if (!response.ok) return undefined
+    const groups = parseQuotaSummary(await response.json())
+    return groups.length > 0 ? groups : undefined
+  }
+
+  // Richest-and-earliest: the prod host first (see above), then the chain, so a
+  // prod outage degrades to a smaller answer instead of an empty one.
+  for (const baseEndpoint of [AGY_ENDPOINT_PROD, ...AGY_ENDPOINT_FALLBACKS.filter((e) => e !== AGY_ENDPOINT_PROD)]) {
     try {
-      const response = await fetchImpl(`${baseEndpoint}${QUOTA_SUMMARY_PATH}`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': 'application/json',
-          'User-Agent': getAgyBootstrapUserAgent(),
-        },
-        body,
-      })
-      if (!response.ok) continue
-      return parseQuotaSummary(await response.json())
+      const groups = await attempt(baseEndpoint)
+      if (groups !== undefined) return groups
     } catch {
       // Try the next endpoint; the caller treats an empty result as "unknown".
     }
