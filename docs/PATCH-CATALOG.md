@@ -1,21 +1,21 @@
 # dsh-agy 自研定制补丁全景清单与维护台账 (Patch Catalog)
 
 > **版本基线**：Upstream `chaos-03x/dsh-agy` v0.4.6  
-> **生产检查锚点**：Tag `v0.4.6-custom.1`（Commit `bfd30d0`）  
+> **生产检查锚点**：Tag `v0.4.6-custom.1`（Commit `bfd30d0`）+ 谷歌后台端点与真实账本补丁（Commit `b75ee24`）  
 > **维护仓库**：`Movingtoleveltwo/dsh-agy`  
-> **验证基线**：26 个测试套件，**763 项测试全部通过**（含 34 项 Codex 零网络极端边界与并发破坏性探针）  
-> **审查验收凭证**：Codex Round 1~4 复审缺陷彻底闭环 + 官方 `agy` CLI 无头模式独立终审通过  
-> **更新指南**：未来每次跟进官方更新（v0.4.7+）时，切勿盲目全量覆盖，必须对照本台账的 14 项补丁逐项核对与验收。
+> **验证基线**：27 个测试套件，**796 项测试全部通过**（含 34 项 Codex 零网络极端边界与并发破坏性探针 + 15 项真实账本裁决测试）  
+> **审查验收凭证**：Codex Round 1~4 复审缺陷彻底闭环 + 谷歌后台端点漂移与配额账本裁决实测闭环  
+> **更新指南**：未来每次跟进官方更新（v0.4.7+）时，切勿盲目全量覆盖，必须对照本台账的 18 项补丁逐项核对与验收。
 
 ---
 
 ## 一、补丁总览与依赖拓扑
 
 ```
-[模块一：Hermes 中继生命线] ──> /agy/v1 端点 (P1~P5) ──> 供给 Hermes Agent 外部直连
-[模块二：调度与生命周期]   ──> 贪心串行接力 + 严格单号探测 + 网络抖动禁切号 (P6~P10)
+[模块一：Hermes 中继生命线] ──> /agy/v1 端点与账本错误分类 (P1~P5, P17) ──> 供给外部直连
+[模块二：调度与生命周期]   ──> 串行接力 + Prod探针优先 + 真实账本裁决锁号 (P6~P10, P15~P16)
 [模块三：协议正规化]       ──> Gemini 轮次交替与孤立响应清洗 (P11)
-[模块四：前端交互 UI]       ──> 双栏主从布局 + 上下双层满宽进度条 + 复合高精度倒计时 (P12~P14)
+[模块四：前端交互 UI]       ──> 双栏主从 + 双层进度条 + 高精度倒计时 + 真实模型余量 (P12~P14, P18)
 ```
 
 ---
@@ -31,6 +31,7 @@
 | **P3** | 延迟头提交与重试退避 | `src/web/openai-relay.ts` | 首个 Chunk 到达前不发 HTTP 200；429 硬耗尽自动向顺延新号重试一次；`RATE_LIMIT` 突发软限流严格执行 `waitRetryDelay`。 |
 | **P4** | 多工具 Fallback ID 独立递增 | `src/adapter/parse.ts` | `closeBlock()` 必须在计算 fallback `upstreamId` 前执行，确保 `blockIndex` 递增，防止连续 tool call 参数被拼成非法 JSON。 |
 | **P5** | 内存图像直通与安全清理 | `src/adapter/adapter.ts` | `registerMemoryImage` / `clearMemoryImage`：支持 Base64 内存图片直通与单次请求后自动释放，杜绝多模态图片丢失。 |
+| **P17** | 账本证实终端错误分类 | `src/adapter/adapter.ts` | `reportFailure` 返回 `{ quotaExhausted }` 标记；Adapter 严格仅在账本确认该族配额耗尽时抛出终端 `QUOTA`；普通限流/文本模糊提示降级为可重试错误，不打死会话。 |
 
 ---
 
@@ -43,6 +44,8 @@
 | **P8** | 网络波动禁切号策略 | `src/runtime/rotation.ts` | `network-error` 严格返回 `{ action: 'retry' }` 原地退避重试，**严禁写入 `coolingDownUntil`，严禁触发切号**。 |
 | **P9** | 精确重置对齐与防早解冻 | `src/runtime/rotation.ts` | 429 报错优先对齐已知的真实周/5h 重置时间；`clearExpiredState` 在到期解冻时核验周限额，若仍为 0% 严禁提前解冻并自动顺延。 |
 | **P10** | 游标原子锁与迟到保护 | `src/session.ts` | 选号与游标写入在 `store.mutate` 锁内按稳定账号 Key 完成；迟到的旧会话失败若当前号已变化，绝不覆盖当前活跃号。 |
+| **P15** | 配额读取 Prod 端点优先探针 | `src/adapter/quota-summary.ts` | Google 后台 2026-10-20 变更，`daily` 端点不再返回 Gemini 配额分组。`fetchQuotaSummary` 调整探针顺序，优先请求 `cloudcode-pa.googleapis.com` (prod)，保底 fallback 到其它端点；模型生成推理（Generation）路径保持 `daily -> prod` 不变。 |
+| **P16** | 真实账本裁决锁号机制 | `src/runtime/quota-verdict.ts`<br>`src/runtime/rotation.ts`<br>`src/session.ts` | 拒绝单凭 Google 模糊报错文本 (`Resource has been exhausted (e.g. check quota)`) 误锁账号；引入 `judgeQuotaExhaustion` 查验单模型真实消耗账本与分组窗口，仅在判定为 `drained` 时进冷却；判定为 `available` 或 `unknown` 时坚决不进冷却（park nothing）；探针执行 1 分钟节流防 429 放大。 |
 
 ---
 
@@ -61,6 +64,7 @@
 | **P12** | 左主右详双栏布局 | `src/client/index.ts` | 左侧垂直排布【账号列表】+【限额进度条卡片】；右侧完整保留【详情】+【操作】+【用量】+【代理】卡片。 |
 | **P13** | 上下双层满宽进度条 | `src/client/styles.ts` | 上层（两端对齐）：周期名称 + 倒计时 + 彩色百分比；下层独占一行 100% 满宽轨道，采用宿主主题语义 Token。 |
 | **P14** | 复合高精度倒计时语义 | `src/client/quota-view.ts`<br>`src/client/locales.ts` | 已过重置时间明确显示「重置周期已过」（杜绝“即将”歧义）；未到时间复合格式化为「将在 X 小时 Y 分钟后重置」与「将在 D 天 H 小时后重置」。 |
+| **P18** | Gemini 真实单模型余量呈现 | `src/client/index.ts`<br>`src/client/styles.ts`<br>`src/rpc-contract.ts` | 针对 Gemini 组后台 5h 分组读数固定为 100% 的上游缺陷，5 小时行改用 per-model 实测消耗余量；保留周限额行；保持倒计时优先、两端对齐、双层满宽进度条的原生增量规范。 |
 
 ---
 
