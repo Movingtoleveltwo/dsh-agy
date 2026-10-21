@@ -78,7 +78,15 @@ export interface AgyAdapterOptions {
    * conversations hold independent pins.
    */
   getSession(model?: string, conversationKey?: string): Promise<AgyAccountSession | undefined>
-  /** Report a classified upstream failure so the shell can cool/rotate/revoke. */
+  /**
+   * Report a classified upstream failure so the shell can cool/rotate/revoke.
+   *
+   * Returns what the shell concluded about the requested family's quota, when it
+   * could judge it: the surfaced error code must AGREE with the account decision
+   * (`quotaExhausted` decides QUOTA vs RATE_LIMIT), or a throttle the ledger
+   * disproved would still kill the turn as a terminal exhaustion. `void` means
+   * "not judged" and the body-based classification stays authoritative.
+   */
   reportFailure(
     kind: FailureKind,
     session: AgyAccountSession,
@@ -93,7 +101,7 @@ export interface AgyAdapterOptions {
       /** Appeal link from a `verification-required` body; surfaced to the user. */
       verificationUrl?: string
     },
-  ): Promise<void>
+  ): Promise<{ quotaExhausted?: boolean } | void>
   /** Report a clean stream completion (resets the failure counter). */
   markSuccess?(session: AgyAccountSession): Promise<void>
   /**
@@ -604,7 +612,7 @@ export class AgyAdapter extends LlmAdapter {
 
       if (!response.ok) {
         const classified = classifyHttpError(response.status, response.headers, bodyText)
-        await this.options.reportFailure(classified.kind, session, {
+        const reportOutcome = await this.options.reportFailure(classified.kind, session, {
           retryAfterMs: classified.retryAfterMs,
           status: response.status,
           rateLimitCategory: classified.rateLimitCategory,
@@ -619,10 +627,19 @@ export class AgyAdapter extends LlmAdapter {
         }, attemptStartedAt)
         if (classified.kind === 'rate-limit') {
           // soft/rate limits are retryable by the harness (RATE_LIMIT + delay);
-          // daily quota exhaustion is terminal (QUOTA, 24h cooldown already set).
-          if (classified.rateLimitCategory === 'quota_exhausted') {
+          // CONFIRMED quota exhaustion is terminal (QUOTA, cooldown already set).
+          //
+          // Which one this is comes from the shell's LEDGER verdict when it has
+          // one, never from the failure body's prose: the generic 429
+          // (`Resource has been exhausted (e.g. check quota)`) matches a quota
+          // keyword while describing a throttle, and trusting it killed live
+          // turns as "quota exhausted" for accounts that still had quota. The
+          // classification stays the fallback for callers that cannot judge.
+          const quotaExhausted = reportOutcome?.quotaExhausted
+            ?? (classified.rateLimitCategory === 'quota_exhausted')
+          if (quotaExhausted) {
             throw new LlmError(
-              `agy daily quota exhausted (${response.status}): ${classified.message ?? ''}`,
+              `agy quota exhausted (${response.status}): ${classified.message ?? ''}`,
               QUOTA_EXCEEDED_CODE,
             )
           }

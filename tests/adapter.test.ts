@@ -3002,6 +3002,31 @@ describe('AgyAdapter', () => {
     expect(failures[0]?.session.account.email).toBe('a@b.c')
   })
 
+  it('throws RATE_LIMIT when the ledger disproves a quota-worded 429', async () => {
+    // The generic Google 429 body matches a quota keyword while describing a
+    // throttle. The shell probed the ledger and found quota left, so the turn must
+    // stay retryable instead of dying as a terminal exhaustion.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":{"status":"RESOURCE_EXHAUSTED"}}', { status: 429 })))
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => ({ quotaExhausted: false }),
+    })
+    const thrown = await adapter.stream(generateOptions()).next().catch((error: unknown) => error)
+    expect(thrown).toMatchObject({ code: 'RATE_LIMIT' })
+  })
+
+  it('throws QUOTA when the ledger confirms exhaustion the body did not spell out', async () => {
+    // Evidence outranks prose in the other direction too: an opaque 429 is still a
+    // spent bucket when the ledger says so.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 429 })))
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => ({ quotaExhausted: true }),
+    })
+    const thrown = await adapter.stream(generateOptions()).next().catch((error: unknown) => error)
+    expect(thrown).toMatchObject({ code: 'QUOTA' })
+  })
+
   it('throws RATE_LIMIT with retry delay on soft/rate limits (harness retries)', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{}', { status: 429, headers: { 'retry-after': '2' } })))
     const adapter = new AgyAdapter({
