@@ -19,6 +19,50 @@ function stubTokenEndpoint(overrides: Partial<{ ok: boolean; body: unknown; stat
   vi.stubGlobal('fetch', vi.fn(async () => new Response(ok ? JSON.stringify(body) : JSON.stringify(body), { status })))
 }
 
+/**
+ * A drained 5-hour Gemini bucket, in the raw `retrieveUserQuotaSummary` shape.
+ *
+ * A rate-limit report only PARKS an account when the ledger confirms the family
+ * is spent, so every test that asserts a cooldown must supply this reading —
+ * otherwise the report is `unknown` and (correctly) cools nothing.
+ */
+function drainedGemini5h(): unknown[] {
+  return [{
+    displayName: 'Gemini Models',
+    buckets: [{
+      bucketId: 'gemini-5h',
+      window: '5h',
+      remainingFraction: 0,
+      resetTime: new Date(Date.now() + 3600_000).toISOString(),
+    }],
+  }]
+}
+
+/**
+ * Stub the token exchange plus the two quota ledgers.
+ *
+ * `groups` feeds `retrieveUserQuotaSummary`; `models` feeds the per-model
+ * `quotaInfo` of `fetchAvailableModels`. The per-model view outranks the grouped
+ * one whenever it reports a fraction, so a test that wants the GROUPED answer to
+ * decide must leave `models` empty (the default).
+ */
+function stubQuotaLedger(groups: unknown[] | 'fail', models: Record<string, { remainingFraction?: number, resetTime?: string }> = {}): void {
+  vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('retrieveUserQuotaSummary')) {
+      if (groups === 'fail') throw new TypeError('fetch failed')
+      return new Response(JSON.stringify({ groups }), { status: 200 })
+    }
+    if (url.includes('fetchAvailableModels')) {
+      const payload = Object.fromEntries(
+        Object.entries(models).map(([id, quota]) => [id, { quotaInfo: quota }]),
+      )
+      return new Response(JSON.stringify({ models: payload }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 })
+  }))
+}
+
 describe('sampleLimitBurn', () => {
   it('yields nothing on the first sample or when two samples are too close', () => {
     const first = { at: 0, fractions: { 'g-5h': 0.8 } }
@@ -1593,6 +1637,173 @@ describe('proxyless transport failover (issue #29)', () => {
 })
 
 /**
+ * A rate limit is only parked when the quota LEDGER confirms the requested family
+ * is spent. These cases cover the three answers a probe can give, plus the 403
+ * quota wall that must stay classified as rate-limit (never auth-failure) while
+ * still not costing an account hours of rest on a default guess.
+ */
+describe('rate-limit quota verification', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  function availableGemini(): unknown[] {
+    const resetTime = new Date(Date.now() + 3600_000).toISOString()
+    return [{
+      displayName: 'Gemini Models',
+      buckets: [
+        { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.9, resetTime },
+        { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.8, resetTime },
+      ],
+    }]
+  }
+
+  it('does not park an account whose ledger still has quota', async () => {
+    stubQuotaLedger(availableGemini())
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    const outcome = await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    const after = await store.load()
+    expect(after.accounts[0]!.coolingDownUntil).toBeUndefined()
+    expect(after.accounts[0]!.cooldownReason).toBeUndefined()
+    expect(outcome).toEqual({ quotaExhausted: false })
+  })
+
+  it('parks the account for five hours when the ledger confirms the 5h bucket is spent', async () => {
+    stubQuotaLedger(drainedGemini5h())
+    const before = Date.now()
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    const outcome = await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    const after = await store.load()
+    expect(after.accounts[0]!.cooldownReason).toBe('quota-exhausted')
+    expect(after.accounts[0]!.coolingDownUntil! - before).toBeGreaterThan(4 * 60 * 60 * 1000)
+    expect(outcome).toEqual({ quotaExhausted: true })
+  })
+
+  it('parks nothing when the ledger cannot be read', async () => {
+    // "Could not tell" is not "spent": the account keeps serving and the caller
+    // must not surface a terminal quota error either.
+    stubQuotaLedger('fail')
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    const outcome = await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    const after = await store.load()
+    expect(after.accounts[0]!.coolingDownUntil).toBeUndefined()
+    expect(after.accounts[0]!.cooldownReason).toBeUndefined()
+    expect(outcome).toEqual({ quotaExhausted: false })
+  })
+
+  it('stays rate-limit (not auth-failure) on a quota 403 while leaving the account usable', async () => {
+    // AGENTS.md invariant: a quota-phrased 403 must never revoke an account. It is
+    // probed like a 429 now, so a healthy ledger leaves it in service.
+    stubQuotaLedger(availableGemini())
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    await sessions.reportFailure('rate-limit', session!, {
+      status: 403,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    const after = await store.load()
+    expect(after.accounts[0]!.enabled).not.toBe(false)
+    expect(after.accounts[0]!.verificationRequired).not.toBe(true)
+    expect(after.accounts[0]!.coolingDownUntil).toBeUndefined()
+  })
+
+  it('parks on the PER-MODEL reading even when the grouped window still reads 100%', async () => {
+    // The measured Gemini case: `gemini-5h` sat at a flat 100% with a reset that
+    // never arrived, while the per-model fraction was the number actually falling.
+    stubQuotaLedger(availableGemini(), {
+      'gemini-3-flash': { remainingFraction: 0, resetTime: new Date(Date.now() + 3 * 3600_000).toISOString() },
+    })
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    const outcome = await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    const after = await store.load()
+    expect(after.accounts[0]!.cooldownReason).toBe('quota-exhausted')
+    expect(outcome).toEqual({ quotaExhausted: true })
+  })
+
+  it('lets a healthy PER-MODEL reading override a drained-looking grouped window', async () => {
+    // The inverse direction: the grouped bucket reads 0 but this model still has
+    // quota left, so parking would be the false positive we are removing.
+    stubQuotaLedger(drainedGemini5h(), { 'gemini-3-flash': { remainingFraction: 0.4 } })
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    const outcome = await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    const after = await store.load()
+    expect(after.accounts[0]!.coolingDownUntil).toBeUndefined()
+    expect(outcome).toEqual({ quotaExhausted: false })
+  })
+
+  it('probing the ledger once per account+family inside the throttle window', async () => {
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      calls.push(url)
+      if (url.includes('retrieveUserQuotaSummary')) {
+        return new Response(JSON.stringify({ groups: availableGemini() }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 })
+    }))
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+    const probes = (): number => calls.filter((url) => url.includes('retrieveUserQuotaSummary')).length
+    const before = probes()
+
+    for (let index = 0; index < 3; index++) {
+      await sessions.reportFailure('rate-limit', session!, {
+        status: 429,
+        rateLimitCategory: 'quota_exhausted',
+        model: 'gemini-3-flash',
+      })
+    }
+
+    // A burst of 429s must not turn into a burst of ledger probes (that would
+    // amplify the throttle it is diagnosing).
+    expect(probes() - before).toBe(1)
+  })
+})
+
+/**
  * Kept last on purpose: it clears the version feed caches, and the 750 ms bounded
  * resolve its hang forces would otherwise be paid again by every later
  * rate-limit test in this file.
@@ -1620,6 +1831,16 @@ describe('fingerprint version freshness', () => {
       vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         if (String(input).includes('oauth2.googleapis.com/token')) {
           return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 })
+        }
+        // The rate-limit report now asks the ledger whether the family is really
+        // spent; answering it keeps this test on the fingerprint path instead of
+        // waiting out the probe's 3s cap.
+        if (String(input).includes('retrieveUserQuotaSummary')) {
+          return new Response(JSON.stringify({ groups: drainedGemini5h() }), { status: 200 })
+        }
+        // No per-model reading, so the grouped window above decides.
+        if (String(input).includes('fetchAvailableModels')) {
+          return new Response(JSON.stringify({ models: {} }), { status: 200 })
         }
         // Accept and never answer. Rejecting fast would NOT reproduce the case: the
         // public resolver applies the pinned fallback itself, so a fast failure
@@ -1662,6 +1883,15 @@ describe('fingerprint version freshness', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).includes('oauth2.googleapis.com/token')) {
         return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 })
+      }
+      // Ledger probe for the rate-limit report: answered (not recorded), so the
+      // egress assertions below stay about the version feeds alone.
+      if (String(input).includes('retrieveUserQuotaSummary')) {
+        return new Response(JSON.stringify({ groups: drainedGemini5h() }), { status: 200 })
+      }
+      // No per-model reading, so the grouped window above decides.
+      if (String(input).includes('fetchAvailableModels')) {
+        return new Response(JSON.stringify({ models: {} }), { status: 200 })
       }
       probed.push((init as { dispatcher?: unknown } | undefined)?.dispatcher)
       // Never answer: the bounded resolve gives up, and all we assert is WHICH
@@ -1815,7 +2045,7 @@ describe('fingerprint version freshness', () => {
     })
 
     it('H2: late failure report from an old inactive account does NOT overwrite active account', async () => {
-      stubTokenEndpoint()
+      stubQuotaLedger(drainedGemini5h())
       const a = account('a@x')
       const b = account('b@x')
       const c = account('c@x')
@@ -1838,6 +2068,7 @@ describe('fingerprint version freshness', () => {
       await sessions.reportFailure('rate-limit', sessionA!, {
         status: 429,
         rateLimitCategory: 'quota_exhausted',
+        model: 'gemini-3-flash',
       })
 
       // A is in cooldown, but activeIndex must REMAIN C (2), NOT be overwritten by A -> B

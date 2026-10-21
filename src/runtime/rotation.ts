@@ -6,6 +6,7 @@
 import type { CachedQuota, FailureKind, ManagedAccount, RotationAction } from '../types.ts'
 import type { ModelFamily } from './quota.ts'
 import type { RateLimitCategory } from './classify.ts'
+import type { QuotaVerdict } from './quota-verdict.ts'
 
 export const BACKOFF_TIERS_MS = [5_000, 10_000, 20_000, 30_000, 60_000] as const
 
@@ -213,8 +214,17 @@ export function clearExpiredState(account: ManagedAccount, now = Date.now(), fam
 
 /** Default 5h cooldown for quota exhaustion (aligned with Antigravity 5h rolling window). */
 export const DEFAULT_QUOTA_COOLDOWN_MS = 5 * 60 * 60 * 1000
+/**
+ * Cooldown for a probe-confirmed WEEKLY exhaustion.
+ *
+ * A drained weekly bucket cannot refill before a week has passed, so a shorter
+ * rest would only re-enter the pool to be rejected again. Deliberately the same
+ * number as {@link MAX_QUOTA_COOLDOWN_MS}: the cap and the weekly tier coincide
+ * because a week is the longest window upstream reports.
+ */
+export const WEEKLY_QUOTA_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
 /** Max 7 days cooldown cap for weekly quota exhaustion. */
-export const MAX_QUOTA_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
+export const MAX_QUOTA_COOLDOWN_MS = WEEKLY_QUOTA_COOLDOWN_MS
 /** Alias for backwards compatibility. */
 export const FULL_QUOTA_COOLDOWN_MS = DEFAULT_QUOTA_COOLDOWN_MS
 /** 5min cooldown for per-minute rate limits. */
@@ -247,6 +257,12 @@ export function parseFutureResetMs(resetTime: string | undefined, now = Date.now
  * @param consecutiveFailures - consecutive failures on this account.
  * @param retryAfterMs - server-provided retry delay when present.
  * @param resetTime - server-provided absolute reset time; cooldowns use it (capped) instead of fixed windows.
+ * @param quotaVerdict - Ledger reading for the requested family, when a probe ran.
+ *   It OUTRANKS `category`, which is only a reading of the failure body's prose:
+ *   a probe-confirmed drain cools (5h window -> 5 hours, weekly -> a week), while
+ *   a probe that found quota left means the 429 was a throttle, so the account is
+ *   NOT parked. Absent means "no evidence either way" — the 403 quota path and
+ *   any caller that could not probe keep the documented body-based behaviour.
  */
 export function decideRotation(
   kind: FailureKind,
@@ -255,6 +271,7 @@ export function decideRotation(
   retryAfterMs?: number,
   category: RateLimitCategory = 'unknown',
   resetTime?: string,
+  quotaVerdict?: QuotaVerdict,
 ): RotationAction {
   const now = Date.now()
   const backoffMs = backoffFor(consecutiveFailures)
@@ -264,6 +281,26 @@ export function decideRotation(
       if (category === 'soft_rate_limit') {
         // Transient burst: retry the same account almost immediately.
         return { action: 'retry', backoffMs: Math.min(retryAfterMs ?? backoffMs, 3000) }
+      }
+      if (quotaVerdict?.state === 'drained') {
+        // The ledger says the family is spent in this window: rest exactly one
+        // window's worth. The tier comes from which bucket was zero, never from
+        // the wording of the 429 and never from a guessed fraction of the window.
+        const cooldownMs = quotaVerdict.tier === 'weekly' ? WEEKLY_QUOTA_COOLDOWN_MS : DEFAULT_QUOTA_COOLDOWN_MS
+        account.coolingDownUntil = now + cooldownMs
+        account.cooldownReason = 'quota-exhausted'
+        account.cooldownSetAt = now
+        return { action: 'cool', backoffMs: cooldownMs }
+      }
+      if (category === 'quota_exhausted' && quotaVerdict !== undefined) {
+        // Probed and NOT spent (or the family could not be read): this 429 was a
+        // throttle. Park nothing — a false park costs hours of capacity, a missed
+        // throttle costs one retry — and skip only this model family for the
+        // short window the caller already records.
+        return {
+          action: 'rotate',
+          backoffMs: Math.min(retryAfterMs ?? RATE_LIMIT_COOLDOWN_MS, MAX_RATE_LIMIT_COOLDOWN_MS),
+        }
       }
       if (category === 'quota_exhausted') {
         // Quota exhausted: cool until the real reset reported by upstream (5h rolling or weekly window, capped at 7 days).

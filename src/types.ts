@@ -150,6 +150,32 @@ export interface CachedLimits {
   updatedAt: number
 }
 
+/** One model's `quotaInfo` reading, kept for the limits card. */
+export interface ModelQuotaView {
+  /** The model that produced the tightest reading in its group. */
+  modelId: string
+  /** 0..1 remaining for that model. */
+  remainingFraction: number
+  /** That model's window reset (RFC3339), when upstream reported one. */
+  resetTime: string | null
+}
+
+/**
+ * Per-MODEL quota, keyed by the GROUP display name it belongs to, display-only.
+ *
+ * This exists because the two ledgers disagree, measured 2026-10-20: the grouped
+ * `gemini-5h` window read a flat 100% (with a reset that never arrived) on three
+ * accounts while `fetchAvailableModels` reported that same family falling —
+ * 92.7% / 91.9% / 98.3% — and the card showed only the grouped number, so the
+ * Gemini bar could never move. The MAP KEY is the group label so the card needs no
+ * family taxonomy of its own.
+ */
+export interface ModelQuotaSnapshot {
+  byGroup: Record<string, ModelQuotaView>
+  /** When this snapshot was taken (Unix ms). */
+  updatedAt: number
+}
+
 /** One account in the pool. `refresh` is the packed `refreshToken|projectId|managedProjectId` string. */
 export interface ManagedAccount {
   id?: string
@@ -185,6 +211,8 @@ export interface ManagedAccount {
   cachedQuotaUpdatedAt?: number
   /** Grouped 5h/weekly windows, display-only (see `CachedLimits`). */
   cachedLimits?: CachedLimits
+  /** Per-model quota for the same card, display-only (see `ModelQuotaSnapshot`). */
+  cachedModelQuota?: ModelQuotaSnapshot
   /** Per-account proxy URL (e.g. http://user:pass@host:8080 or socks5://host:1080). Undefined = follow env. */
   proxy?: string
 }

@@ -11,12 +11,14 @@ import {
   clearExpiredState,
   computeSoftQuotaCacheTtlMs,
   decideRotation,
+  DEFAULT_QUOTA_COOLDOWN_MS,
   isCoolingDown,
   isFamilyRateLimited,
   pickNextAccountIndex,
   pickProbeProxyUrl,
   recordRateLimit,
   VERIFICATION_COOLDOWN_MS,
+  WEEKLY_QUOTA_COOLDOWN_MS,
   WEEKLY_QUOTA_THRESHOLD,
 } from '../src/runtime/rotation.ts'
 import {
@@ -621,6 +623,63 @@ describe('rotation state machine', () => {
     const pastDecision = decideRotation('rate-limit', past, 0, undefined, 'rate_limited', new Date(before - 60 * 1000).toISOString())
     expect(pastDecision.backoffMs).toBeGreaterThanOrEqual(5 * 60 * 1000 - 1000)
     expect(pastDecision.backoffMs).toBeLessThan(5 * 60 * 1000 + 5000)
+  })
+
+  it('parks a probe-confirmed 5h exhaustion for the 5-hour tier', () => {
+    // The ledger said the 5-hour bucket is spent: cool exactly one 5-hour window,
+    // regardless of what the 429's prose claimed.
+    const before = Date.now()
+    const acc = account()
+    const decision = decideRotation('rate-limit', acc, 0, undefined, 'quota_exhausted', undefined, {
+      state: 'drained', tier: '5h', buckets: ['gemini-5h'],
+    })
+    expect(decision.action).toBe('cool')
+    expect(acc.cooldownReason).toBe('quota-exhausted')
+    expect(acc.coolingDownUntil! - before).toBeGreaterThanOrEqual(DEFAULT_QUOTA_COOLDOWN_MS - 1000)
+    expect(acc.coolingDownUntil! - before).toBeLessThanOrEqual(DEFAULT_QUOTA_COOLDOWN_MS + 1000)
+  })
+
+  it('parks a probe-confirmed weekly exhaustion for a week', () => {
+    const before = Date.now()
+    const acc = account()
+    const decision = decideRotation('rate-limit', acc, 0, undefined, 'quota_exhausted', undefined, {
+      state: 'drained', tier: 'weekly', buckets: ['gemini-weekly'],
+    })
+    expect(decision.action).toBe('cool')
+    expect(acc.coolingDownUntil! - before).toBeGreaterThanOrEqual(WEEKLY_QUOTA_COOLDOWN_MS - 1000)
+    expect(acc.coolingDownUntil! - before).toBeLessThanOrEqual(WEEKLY_QUOTA_COOLDOWN_MS + 1000)
+  })
+
+  it('does NOT park an account whose ledger says quota is left, whatever the 429 said', () => {
+    // The 2026-10-20 defect: a generic 429 body matched a quota keyword while
+    // describing a throttle, and two healthy accounts were parked for five hours.
+    const acc = account()
+    const decision = decideRotation('rate-limit', acc, 0, 4000, 'quota_exhausted', undefined, { state: 'available' })
+    expect(decision.action).toBe('rotate')
+    expect(acc.coolingDownUntil).toBeUndefined()
+    expect(acc.cooldownReason).toBeUndefined()
+    expect(acc.cooldownSetAt).toBeUndefined()
+  })
+
+  it('does NOT park an account when the ledger could not be read', () => {
+    const acc = account()
+    const decision = decideRotation('rate-limit', acc, 0, 4000, 'quota_exhausted', undefined, {
+      state: 'unknown', reason: 'probe-failed',
+    })
+    expect(decision.action).toBe('rotate')
+    expect(acc.coolingDownUntil).toBeUndefined()
+    expect(acc.cooldownReason).toBeUndefined()
+  })
+
+  it('lets the ledger upgrade a per-minute classification to a quota cooldown', () => {
+    // Evidence outranks wording in both directions: a body that read as a plain
+    // throttle is still a spent bucket when the ledger says so.
+    const acc = account()
+    const decision = decideRotation('rate-limit', acc, 0, 4000, 'rate_limited', undefined, {
+      state: 'drained', tier: '5h', buckets: ['gemini-5h'],
+    })
+    expect(decision.action).toBe('cool')
+    expect(acc.cooldownReason).toBe('quota-exhausted')
   })
 
   it('picks the next eligible account round-robin', () => {

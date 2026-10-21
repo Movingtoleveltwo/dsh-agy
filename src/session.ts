@@ -5,7 +5,7 @@
  */
 
 import { AgyAuthError, AgyPoolBlockedError } from './types.ts'
-import type { AccountStorageV4, AgyAccountSession, CachedQuota, FailureKind, ManagedAccount, OAuthAuthDetails, QuotaGroup } from './types.ts'
+import type { AccountStorageV4, AgyAccountSession, CachedQuota, FailureKind, ManagedAccount, ModelQuotaView, OAuthAuthDetails, QuotaGroup } from './types.ts'
 import { refreshAccessToken } from './oauth/refresh.ts'
 import { accessTokenExpired, formatRefreshParts, parseRefreshParts } from './oauth/auth.ts'
 import type { AccountStore } from './store/accounts.ts'
@@ -23,6 +23,7 @@ import {
   recordRateLimit,
 } from './runtime/rotation.ts'
 import {
+  familiesForGroup,
   familyKeyOf,
   familyQuotaFor,
   ingestFamilyQuotas,
@@ -32,6 +33,8 @@ import {
   isQuotaStale,
   modelFamilyOf,
 } from './runtime/quota.ts'
+import { judgeQuotaExhaustion } from './runtime/quota-verdict.ts'
+import type { ModelQuotaReading, QuotaVerdict } from './runtime/quota-verdict.ts'
 import {
   generateFingerprint,
   getFingerprintData,
@@ -46,6 +49,20 @@ import { currentAgyVersion } from './oauth/constants.ts'
 import { accountFetch, isProxyUnreachableError, probeFetch, proxiedFetch } from './proxy.ts'
 import { describeFetchError } from './runtime/classify.ts'
 import type { Fingerprint } from './types.ts'
+
+/**
+ * What one failure report concluded about the requested family's quota.
+ *
+ * It exists so the caller can choose an error code that AGREES with the account
+ * decision just made: a turn may only be declared terminally quota-exhausted when
+ * the LEDGER confirmed the family is spent. Absent means the report did not judge
+ * (not a rate limit, or no model id to scope the family) and the caller falls back
+ * to the body-based classification.
+ */
+export interface FailureReportOutcome {
+  /** True only when the ledger CONFIRMED the requested family is spent. */
+  quotaExhausted?: boolean
+}
 
 export interface SessionManagerOptions {
   store: AccountStore
@@ -228,12 +245,24 @@ export class AgySessionManager {
    * that for itself.
    */
   private readonly quotaSummaryInFlight = new Map<string, Promise<QuotaGroup[]>>()
+  /**
+   * Last rate-limit ledger verdict per `account|family`.
+   *
+   * A 429 storm would otherwise fire one ledger probe per failed attempt and make
+   * the throttle worse; one minute lets a burst of retries share one reading
+   * while still re-reading a bucket soon after it refills. Only successful state
+   * transitions are cached — an `unknown` verdict is cached too, because
+   * re-probing a failing endpoint immediately is the amplification this prevents.
+   */
+  private readonly quotaVerdicts = new Map<string, { at: number; verdict: QuotaVerdict }>()
   private readonly failureCounts = new Map<string, number>()
   /** Accounts whose request-time project discovery already failed (no retry per request). */
   private readonly projectRetryFailed = new Set<string>()
 
   /** Bound for one quota poll so selection never stalls on a hung endpoint. */
   private static readonly QUOTA_FETCH_TIMEOUT_MS = 3_000
+  /** How long one rate-limit verdict answers for the same account+family. */
+  private static readonly QUOTA_VERDICT_TTL_MS = 60_000
   /** Refresh the token this far ahead of expiry so a request never blocks on the token endpoint. */
   private static readonly REFRESH_SKEW_MS = 2 * 60 * 1000
 
@@ -584,6 +613,116 @@ export class AgySessionManager {
   }
 
   /**
+   * Ask the quota LEDGER whether a 429 for `model` really exhausted that family.
+   *
+   * A 429 does not say which limit refused it — per-minute rate, token
+   * throughput, concurrency, capacity, a shared project's budget or a spent
+   * 5-hour/weekly bucket all arrive as the same status — and the generic body
+   * (`Resource has been exhausted (e.g. check quota)`) matches a quota keyword
+   * while describing a throttle. Prose therefore cannot be the judge; the ledger
+   * can, because it reports `remainingFraction` per window per family.
+   *
+   * Rides the SAME shared fetch as `refreshLimits` (in-flight dedupe, 3s cap, the
+   * account's own proxy) and never writes a cache: this is evidence for one
+   * decision, not a display refresh. A failed probe is `unknown`, which cools
+   * nothing by policy (see `quota-verdict.ts`).
+   */
+  private async judgeRateLimitVerdict(account: ManagedAccount, model?: string): Promise<QuotaVerdict> {
+    const family = modelFamilyOf(model)
+    // Without a model there is no family to judge, so probing would spend a round
+    // trip to learn nothing. The report stays unjudged and cools nothing.
+    if (family === undefined) return { state: 'unknown', reason: 'no-model' }
+    const key = `${this.accountKey(account)}|${model ?? family}`
+    const cached = this.quotaVerdicts.get(key)
+    if (cached !== undefined && Date.now() - cached.at < AgySessionManager.QUOTA_VERDICT_TTL_MS) {
+      return cached.verdict
+    }
+
+    // Per-model reading first: it is the ledger the request actually draws from
+    // (measured 2026-10-20: the Gemini per-model fraction falls — 92.7% on one
+    // account while a sibling sat at 98.3% — while the grouped `gemini-5h` window
+    // read a flat 100% for all of them). Only when upstream reports no fraction
+    // for this model do we spend the second round trip on the grouped windows.
+    const readings = await this.probeModelQuotas(account)
+    const modelQuota = model === undefined ? undefined : readings?.[model]
+    let verdict = judgeQuotaExhaustion({ family, groups: [], modelQuota, modelId: model })
+    if (verdict.state === 'unknown') {
+      const groups = await this.probeQuotaSummary(account)
+      verdict = judgeQuotaExhaustion({ family, groups, modelQuota, modelId: model })
+    }
+    this.quotaVerdicts.set(key, { at: Date.now(), verdict })
+    return verdict
+  }
+
+  /**
+   * Per-model `quotaInfo` from `fetchAvailableModels`: one bounded, proxied probe
+   * serving BOTH consumers — the rate-limit verdict (one model) and the limits
+   * card (the tightest model per group).
+   *
+   * Returns `undefined` when the probe fails. A model reported without a
+   * `remainingFraction` keeps `null`, which every consumer reads as "no reading"
+   * rather than as zero.
+   */
+  private async probeModelQuotas(account: ManagedAccount): Promise<Record<string, ModelQuotaReading> | undefined> {
+    try {
+      const auth = await this.accessTokenFor(account)
+      if (!auth) return undefined
+      const { fetchAvailableModels } = await import('./adapter/models.ts')
+      const routed = accountFetch({ proxyUrl: account.proxy })
+      const bounded = (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const timeout = AbortSignal.timeout(AgySessionManager.QUOTA_FETCH_TIMEOUT_MS)
+        const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout
+        return routed(input, { ...init, signal })
+      }
+      const discovered = await fetchAvailableModels(auth.access, account.projectId, bounded)
+      const readings: Record<string, ModelQuotaReading> = {}
+      for (const [modelId, entry] of Object.entries(discovered.models ?? {})) {
+        const quotaInfo = entry?.quotaInfo
+        if (quotaInfo === undefined) continue
+        readings[modelId] = {
+          remainingFraction: typeof quotaInfo.remainingFraction === 'number' ? quotaInfo.remainingFraction : null,
+          resetTime: typeof quotaInfo.resetTime === 'string' ? quotaInfo.resetTime : null,
+        }
+      }
+      return readings
+    } catch {
+      // Best-effort evidence: a failed probe is "no reading", never a throw into
+      // the failure path.
+      return undefined
+    }
+  }
+
+  /**
+   * The tightest per-model reading for each group, keyed by the group's display
+   * name so the card needs no family taxonomy of its own.
+   *
+   * A group's models are found with `familiesForGroup` + `modelFamilyOf` — the
+   * same attribution the cache uses — and only a NUMERIC fraction can win, so a
+   * model upstream reported without a number never appears as "0%".
+   */
+  private modelQuotaByGroup(
+    groups: readonly QuotaGroup[],
+    readings: Record<string, ModelQuotaReading>,
+  ): Record<string, ModelQuotaView> {
+    const byGroup: Record<string, ModelQuotaView> = {}
+    for (const group of groups) {
+      const families = familiesForGroup(group)
+      let tightest: ModelQuotaView | undefined
+      for (const [modelId, reading] of Object.entries(readings)) {
+        const fraction = reading.remainingFraction
+        if (typeof fraction !== 'number' || !Number.isFinite(fraction)) continue
+        const family = modelFamilyOf(modelId)
+        if (family === undefined || !families.includes(family)) continue
+        if (tightest === undefined || fraction < tightest.remainingFraction) {
+          tightest = { modelId, remainingFraction: fraction, resetTime: reading.resetTime }
+        }
+      }
+      if (tightest !== undefined) byGroup[group.name] = tightest
+    }
+    return byGroup
+  }
+
+  /**
    * Refresh the display-only 5h/weekly windows for every enabled account.
    *
    * SEPARATE from `refreshQuotaCache`, and deliberately so. That method writes
@@ -646,9 +785,22 @@ export class AgySessionManager {
         // for this account, so one cycle pays one round trip and both caches read
         // the same groups. It only carries the FETCH — this path still writes
         // `cachedLimits` and nothing else.
-        const groups = await this.probeQuotaSummary(account)
+        //
+        // The per-model ledger is probed alongside it (one extra call, same TTL
+        // gate) because the grouped Gemini window does not move while those models
+        // are being spent — without it the card could only ever show 100%.
+        const [groups, readings] = await Promise.all([
+          this.probeQuotaSummary(account),
+          this.probeModelQuotas(account),
+        ])
         if (groups.length === 0) return { key, ok: false as const }
-        return { key, ok: true as const, groups, updatedAt: Date.now() }
+        return {
+          key,
+          ok: true as const,
+          groups,
+          modelQuota: readings === undefined ? undefined : this.modelQuotaByGroup(groups, readings),
+          updatedAt: Date.now(),
+        }
       } catch {
         // Best-effort: a failed probe leaves the previous windows in place.
         return { key, ok: false as const }
@@ -656,7 +808,7 @@ export class AgySessionManager {
     }))
 
     const updates = probes.filter((probe): probe is
-      { key: string, ok: true, groups: QuotaGroup[], updatedAt: number } => probe.ok)
+      { key: string, ok: true, groups: QuotaGroup[], modelQuota: Record<string, ModelQuotaView> | undefined, updatedAt: number } => probe.ok)
     const failed = probes.filter((probe) => !probe.ok).map((probe) => probe.key)
     // Report the skip count so a caller can distinguish "nothing was due" from
     // "everything failed" — the two read identically on screen otherwise.
@@ -675,6 +827,9 @@ export class AgySessionManager {
       // incapable of blocking an account.
       if (target) {
         target.cachedLimits = { groups: update.groups, updatedAt: update.updatedAt }
+        if (update.modelQuota !== undefined) {
+          target.cachedModelQuota = { byGroup: update.modelQuota, updatedAt: update.updatedAt }
+        }
         // Burn-rate sampling rides the same successful probe: memory only, so
         // it cannot affect the store or the scheduling path.
         this.noteLimitSample(update.key, update.groups, update.updatedAt)
@@ -693,7 +848,11 @@ export class AgySessionManager {
       await this.store.mutate((s) => {
         for (const update of updates) {
           const target = s.accounts.find((candidate) => this.accountKey(candidate) === update.key)
-          if (target) target.cachedLimits = { groups: update.groups, updatedAt: update.updatedAt }
+          if (!target) continue
+          target.cachedLimits = { groups: update.groups, updatedAt: update.updatedAt }
+          if (update.modelQuota !== undefined) {
+            target.cachedModelQuota = { byGroup: update.modelQuota, updatedAt: update.updatedAt }
+          }
         }
       })
     } catch {
@@ -1181,8 +1340,8 @@ export class AgySessionManager {
       /** Appeal link from a `verification-required` body; surfaced to the user. */
       verificationUrl?: string
     },
-  ): Promise<void> {
-    if (!session?.account) return
+  ): Promise<FailureReportOutcome> {
+    if (!session?.account) return {}
     const key = this.accountKey(session.account)
     const consecutive = (this.failureCounts.get(key) ?? 0) + 1
     this.failureCounts.set(key, consecutive)
@@ -1202,11 +1361,30 @@ export class AgySessionManager {
       ? (fpCachedVersion ?? (await resolveAntigravityVersionBounded(750, probeFetch(session.account.proxy))) ?? currentAgyVersion())
       : currentAgyVersion()
 
+    // Quota evidence, collected BEFORE the store mutation: a rate limit is only
+    // parked when the ledger says the requested family is really spent, because
+    // the same 429 also carries throttles that must not cost an account hours of
+    // rest. A 403 quota wall is probed the same way — its CLASSIFICATION stays
+    // `rate-limit` either way (never auth-failure, see AGENTS.md), but whether it
+    // parks the account is the ledger's answer, not a default 5 hours. Soft
+    // limits are transient bursts that are never parked, so they do not probe.
+    const quotaVerdict = kind === 'rate-limit' && info?.rateLimitCategory !== 'soft_rate_limit'
+      ? await this.judgeRateLimitVerdict(session.account, info?.model)
+      : undefined
+
     await this.store.mutate((storage) => {
       const account = storage.accounts.find((a) => this.accountKey(a) === key)
       if (!account) return
 
-      const decision = decideRotation(kind, account, consecutive, info?.retryAfterMs, info?.rateLimitCategory, info?.resetTime)
+      const decision = decideRotation(
+        kind,
+        account,
+        consecutive,
+        info?.retryAfterMs,
+        info?.rateLimitCategory,
+        info?.resetTime,
+        quotaVerdict,
+      )
 
       // Keep the appeal link beside the challenge state so a user can act on it.
       // Only overwritten when the upstream actually supplied one, so a later
@@ -1310,6 +1488,11 @@ export class AgySessionManager {
         reason: kind,
       })
     }
+
+    // Report the quota verdict, not the classified category: the caller must not
+    // turn this 429 into a terminal "quota exhausted" turn when the ledger said
+    // the family still has quota (or could not be read). `undefined` = no judgement.
+    return quotaVerdict === undefined ? {} : { quotaExhausted: quotaVerdict.state === 'drained' }
   }
   /** Adapter hook: reset the failure counter after a clean completion. */
   async markSuccess(session: AgyAccountSession): Promise<void> {
