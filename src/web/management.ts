@@ -259,6 +259,7 @@ export function createAgyManagement(options: AgyManagementOptions): AgyManagemen
         // zero, which would read as an exhausted account.
         limits: account.cachedLimits?.groups ?? null,
         limitsUpdatedAt: account.cachedLimits?.updatedAt ?? null,
+        modelQuota: account.cachedModelQuota ?? null,
         // The burn rate arrives via `account.limits` (it exists only after the
         // sampling path has run twice); `account.list` stays probe-free.
         limitBurn: null,
@@ -405,6 +406,7 @@ export function createAgyManagement(options: AgyManagementOptions): AgyManagemen
           index,
           groups: account.cachedLimits?.groups ?? null,
           updatedAt: account.cachedLimits?.updatedAt ?? null,
+          modelQuota: account.cachedModelQuota ?? null,
           burn: burnByIndex.get(index) ?? null,
         })),
         measured: result.measured.length,

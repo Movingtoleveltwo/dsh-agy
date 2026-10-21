@@ -16,7 +16,7 @@
 
 import type { MultimodalSource, MultimodalView } from './multimodal-types.ts'
 import type { ThinkingBudgets } from './thinking-types.ts'
-import type { QuotaGroup } from './types.ts'
+import type { ModelQuotaSnapshot, QuotaGroup } from './types.ts'
 import type { SetUiPrefsPayload, UiPrefsView } from './ui-prefs-types.ts'
 import type { UsageCounters, UsageSource } from './usage-types.ts'
 
@@ -102,6 +102,14 @@ export interface AccountView {
    * the sampling path has run twice.
    */
   limitBurn: Record<string, number> | null
+  /**
+   * Per-MODEL quota keyed by the group label it belongs to, or null when never
+   * measured. Display-only, and it is a different ledger from `limits`: measured
+   * 2026-10-20, the grouped `gemini-5h` window read a flat 100% on three accounts
+   * while this same family was at 92.7/91.9/98.3% per model, so the card needs
+   * both to say anything true about Gemini.
+   */
+  modelQuota: ModelQuotaSnapshot | null
   /** This account's ledger entry, when it has recorded traffic. */
   usage: AccountUsageView | null
 }
@@ -269,6 +277,8 @@ export interface AgyRpcMethods {
         index: number
         groups: QuotaGroup[] | null
         updatedAt: number | null
+        /** Per-model readings for the same card; null when the probe missed them. */
+        modelQuota: ModelQuotaSnapshot | null
         /**
          * Burn rate per window bucket (bucketId -> fraction/hour), or null.
          *

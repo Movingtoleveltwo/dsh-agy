@@ -109,6 +109,54 @@ describe('solo-account limits', () => {
     expect(calls.filter((url) => url.includes('retrieveUserQuotaSummary')).length).toBe(2)
   })
 
+  it('records the tightest per-MODEL reading for each group alongside the windows', async () => {
+    // Measured 2026-10-20: the grouped `gemini-5h` window reads a flat 100% while
+    // these models are being spent (92.7/91.9/98.3%), so the card needs the
+    // per-model number or the Gemini bar can never move.
+    const calls: string[] = []
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      calls.push(url)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 })
+      }
+      if (url.includes('retrieveUserQuotaSummary')) {
+        return new Response(JSON.stringify({
+          groups: [
+            { displayName: 'Gemini Models', buckets: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 1 }] },
+            { displayName: 'Claude and GPT models', buckets: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 1 }] },
+          ],
+        }), { status: 200 })
+      }
+      if (url.includes('fetchAvailableModels')) {
+        return new Response(JSON.stringify({
+          models: {
+            'gemini-3.8-flash-tiered': { quotaInfo: { remainingFraction: 0.927, resetTime: '2026-10-20T15:39:21Z' } },
+            'gemini-3-flash': { quotaInfo: { remainingFraction: 0.99 } },
+            'claude-sonnet-4-6': { quotaInfo: { remainingFraction: 1 } },
+          },
+        }), { status: 200 })
+      }
+      throw new Error(`unexpected fetch: ${url}`)
+    }))
+
+    const store = new InMemoryAccountStore(storage([account('solo@x')]))
+    const sessions = new AgySessionManager({ store })
+    const loaded = await store.load()
+    await sessions.refreshLimits(loaded)
+    const after = (await store.load()).accounts[0]!
+    expect(after.cachedModelQuota?.byGroup['Gemini Models']).toEqual({
+      modelId: 'gemini-3.8-flash-tiered',
+      remainingFraction: 0.927,
+      resetTime: '2026-10-20T15:39:21Z',
+    })
+    expect(after.cachedModelQuota?.byGroup['Claude and GPT models']).toEqual({
+      modelId: 'claude-sonnet-4-6',
+      remainingFraction: 1,
+      resetTime: null,
+    })
+  })
+
   it('force re-probes INSIDE the TTL, which is what an explicit refresh needs', async () => {
     // The toolbar's Refresh button is the only caller allowed to do this: without
     // it, clicking Refresh while the snapshot was still fresh could not deliver

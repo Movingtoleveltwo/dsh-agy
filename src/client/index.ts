@@ -616,61 +616,108 @@ function AccountDetail(props: {
   return h('div', { className: 'agy-detail' }, identity, actions, usageBlock, proxyBlock)
 }
 
-/** One account's 5h / weekly quota limits card. */
+/**
+ * One account's quota card.
+ *
+ * Product decisions (user, 2026-10-20), each from a measurement:
+ *
+ *   - GEMINI group only; the Claude/GPT group is not in use here.
+ *   - The 5-HOUR row takes its figure from the per-MODEL ledger, not from the
+ *     grouped `gemini-5h` window: the grouped one read a flat 100% with a reset
+ *     that never arrived while the models were being drained (92.71% -> 90.79% in
+ *     15 minutes of traffic). A re-measured 100% with "resets in 4h59m" is a
+ *     genuinely fresh window, and must still be shown as such.
+ *   - The WEEKLY row stays: it has no per-model counterpart, and it is the only
+ *     place a weekly limit is visible at all.
+ */
 function LimitsCard(props: {
   account: AccountView
   now: number
   t: T
 }): ReactNode {
   const { account, now, t } = props
-  return card(t('limitsTitle'),
-    account.limits === null || account.limits.length === 0
-      ? h('div', { className: 'agy-empty' }, t('limitsUnavailable'))
-      // The snapshot's age is shown, not just its values. These windows come from
-      // a TTL cache and a FAILED refresh keeps the previous numbers rather than
-      // clearing them, so an unlabelled figure could be arbitrarily old with
-      // nothing on screen to say so — the same trap as an undated cooldown reason.
-      : h('div', { className: 'agy-limits' },
-        account.limitsUpdatedAt === null
+  const allGroups = account.limits ?? []
+
+  // The snapshot's age is shown, not just its values. These come from a TTL cache
+  // and a FAILED refresh keeps the previous numbers rather than clearing them, so
+  // an unlabelled figure could be arbitrarily old with nothing on screen saying
+  // so — the same trap as an undated cooldown reason.
+  const age = account.limitsUpdatedAt === null
+    ? null
+    : h('div', { className: 'agy-limit-age' },
+      t('limitsMeasured', { ago: agoText(new Date(account.limitsUpdatedAt).toISOString(), t, now) }))
+
+  /** One labelled window row: countdown on the right, figure last, bar under it. */
+  const row = (
+    key: string,
+    label: string,
+    fraction: number | null,
+    resetTime: string | null,
+    bucketId?: string,
+  ): ReactNode => {
+    // Burn projection: rate (fraction/hour) over remaining fraction gives
+    // hours-to-empty. Spoken ONLY when that lands BEFORE the window's reset —
+    // otherwise the reset time this row already shows is the answer.
+    const burn = bucketId === undefined ? undefined : account.limitBurn?.[bucketId]
+    const hoursLeft = fraction !== null && burn !== undefined && burn > 0
+      ? fraction / burn
+      : null
+    const resetHours = resetTime === null
+      ? null
+      : (new Date(resetTime).getTime() - now) / HOUR_MS
+    const exhaustsFirst = hoursLeft !== null && resetHours !== null
+      && hoursLeft < resetHours
+    return h('div', { key, className: 'agy-limit-item' },
+      h('div', { className: 'agy-limit-header' },
+        h('span', { className: 'agy-limit-k' }, label),
+        h('div', { className: 'agy-limit-status' },
+          resetTime === null ? null : h('span', { className: 'agy-limit-reset' }, resetText(resetTime, t, now)),
+          h('span', {
+            className: 'agy-limit-p',
+            style: fraction === null ? undefined : { color: quotaColor(fraction) },
+          }, fraction === null ? t('valueUnknown') : `${Math.round(fraction * 100)}%`))),
+      h('div', { className: 'agy-limit-track' },
+        fraction === null
           ? null
-          : h('div', { className: 'agy-limit-age' },
-            t('limitsMeasured', { ago: agoText(new Date(account.limitsUpdatedAt).toISOString(), t, now) })),
-        ...account.limits.map((group) => h('div', { className: 'agy-limit-group', key: group.name },
-          h('div', { className: 'agy-limit-group-name' }, group.name),
-          ...group.windows.map((window) => {
-            const fraction = window.remainingFraction
-            // Burn projection: rate (fraction/hour) over remaining fraction
-            // gives hours-to-empty. Spoken ONLY when that lands BEFORE the
-            // window's reset — otherwise the reset time this row already shows
-            // is the answer, and a "won't run dry" line is noise.
-            const burn = account.limitBurn?.[window.bucketId]
-            const hoursLeft = fraction !== null && burn !== undefined && burn > 0
-              ? fraction / burn
-              : null
-            const resetHours = window.resetTime === null
-              ? null
-              : (new Date(window.resetTime).getTime() - now) / HOUR_MS
-            const exhaustsFirst = hoursLeft !== null && resetHours !== null
-              && hoursLeft < resetHours
-            return h('div', { key: window.bucketId, className: 'agy-limit-item' },
-              h('div', { className: 'agy-limit-header' },
-                h('span', { className: 'agy-limit-k' }, windowLabel(window.window, t)),
-                h('div', { className: 'agy-limit-status' },
-                  window.resetTime === null ? null : h('span', { className: 'agy-limit-reset' }, resetText(window.resetTime, t, now)),
-                  h('span', {
-                    className: 'agy-limit-p',
-                    style: fraction === null ? undefined : { color: quotaColor(fraction) },
-                  }, fraction === null ? t('valueUnknown') : `${Math.round(fraction * 100)}%`),
-                )),
-              h('div', { className: 'agy-limit-track' },
-                fraction === null
-                  ? null
-                  : h('i', { style: { width: `${Math.round(fraction * 100)}%`, background: quotaColor(fraction) } })),
-              exhaustsFirst
-                ? h('div', { className: 'agy-limit-burn' },
-                  t('limitBurnWarn', { value: burnHorizon(hoursLeft!, t) }))
-                : null)
-          })))))
+          : h('i', { style: { width: `${Math.round(fraction * 100)}%`, background: quotaColor(fraction) } })),
+      exhaustsFirst
+        ? h('div', { className: 'agy-limit-burn' },
+          t('limitBurnWarn', { value: burnHorizon(hoursLeft!, t) }))
+        : null)
+  }
+
+  /** A group's rows: the 5-hour figure from the per-model ledger, the weekly one as reported. */
+  const groupRows = (groupName: string): ReactNode[] => {
+    const group = allGroups.find((candidate) => candidate.name === groupName)
+    const family = account.modelQuota?.byGroup[groupName]
+    const rows: ReactNode[] = []
+
+    const fiveHour = group?.windows.find((window) => window.window === '5h')
+    if (family !== undefined) {
+      rows.push(row('family', windowLabel('5h', t), family.remainingFraction, family.resetTime))
+    } else if (fiveHour !== undefined) {
+      rows.push(row(fiveHour.bucketId, windowLabel('5h', t), fiveHour.remainingFraction, fiveHour.resetTime, fiveHour.bucketId))
+    }
+
+    for (const window of group?.windows.filter((candidate) => candidate.window !== '5h') ?? []) {
+      rows.push(row(window.bucketId, windowLabel(window.window, t), window.remainingFraction, window.resetTime, window.bucketId))
+    }
+    return rows
+  }
+
+  // Gemini only, as asked; falling back to every group when upstream reports no
+  // Gemini group at all (the `daily` host answered that way on 2026-10-20), so the
+  // card is never blank when there IS something to show.
+  const geminiGroups = allGroups.filter((group) => /gemini/i.test(group.name))
+  const shown = geminiGroups.length > 0 ? geminiGroups : allGroups
+
+  const groups = shown.map((group) => h('div', { className: 'agy-limit-group', key: group.name },
+    ...groupRows(group.name)))
+
+  return card(t('limitsTitle'),
+    allGroups.length === 0
+      ? h('div', { className: 'agy-empty' }, t('limitsUnavailable'))
+      : h('div', { className: 'agy-limits' }, age, ...groups))
 }
 
 /**
@@ -2047,6 +2094,9 @@ export function AgySettings(props: {
           ...account,
           limits: entry.groups,
           limitsUpdatedAt: entry.updatedAt,
+          // Per-model readings ride the same probe; a miss keeps the previous
+          // snapshot so a single failed fetch cannot blank the card.
+          modelQuota: entry.modelQuota ?? account.modelQuota,
           // A null rate keeps the previous one: "these two samples saw no drop"
           // is not evidence the burn stopped.
           limitBurn: entry.burn ?? account.limitBurn,

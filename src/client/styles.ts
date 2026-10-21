@@ -351,6 +351,7 @@ export const AGY_STYLES_CSS = `
 }
 .agy-limit-item { display: flex; flex-direction: column; gap: 6px; padding: 2px 0; }
 .agy-limit-header { display: flex; justify-content: space-between; align-items: center; font: var(--dsw-font-xxs-12); }
+.agy-limit-header-end { justify-content: flex-end; }
 .agy-limit-k { color: ${aliasVar('label-secondary')}; font: var(--dsw-font-xxs-strong-12); }
 .agy-limit-status { display: flex; align-items: center; gap: 8px; }
 .agy-limit-reset { font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')}; }
@@ -367,6 +368,10 @@ export const AGY_STYLES_CSS = `
 /* The burn projection: warn-tinted because "this window runs dry before it resets"
    is the one projection that asks the reader to act. */
 .agy-limit-burn { font: var(--dsw-font-xxxs-11); color: ${aliasVar('state-warn-primary')}; }
+/* Per-MODEL reading under a group's windows. It is a DIFFERENT ledger from the
+   bar above it, so it is set quieter and cannot be read as another window. */
+.agy-limit-model { display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  font: var(--dsw-font-xxxs-11); color: ${aliasVar('label-tertiary')}; }
 
 /* ── Dense breakdown tables (Usage tab only) ─────────────────────────────── */
 .agy-table-wrap { padding: 6px 0 2px; }
