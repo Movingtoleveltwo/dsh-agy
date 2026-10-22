@@ -62,6 +62,18 @@ import type { Fingerprint } from './types.ts'
 export interface FailureReportOutcome {
   /** True only when the ledger CONFIRMED the requested family is spent. */
   quotaExhausted?: boolean
+  /**
+   * How long the caller should wait before retrying a TRANSPORT failure, when the
+   * account has been failing repeatedly at that level.
+   *
+   * A flaky link turns DSH's ordinary 500ms backoff into a retry storm: six
+   * exactly-20s connection timeouts on one account were enough to make the
+   * upstream answer 429 (measured 2026-10-22), which then read as the account's
+   * fault. Stretching the wait keeps the retries from being counted against the
+   * account. Capped below DSH's own `maxDelayMs`, because a hint ABOVE it makes
+   * the normal retry mode give up entirely.
+   */
+  networkBackoffMs?: number
 }
 
 export interface SessionManagerOptions {
@@ -255,6 +267,12 @@ export class AgySessionManager {
    * re-probing a failing endpoint immediately is the amplification this prevents.
    */
   private readonly quotaVerdicts = new Map<string, { at: number; verdict: QuotaVerdict }>()
+  /**
+   * Per-account TRANSPORT failure trail: how many in a row, and when the last one
+   * was. Used to tell a 429 caused by a dying link apart from one the account
+   * earned, and to stretch the retry pacing while the link is down.
+   */
+  private readonly networkTrail = new Map<string, { streak: number; lastAt: number }>()
   private readonly failureCounts = new Map<string, number>()
   /** Accounts whose request-time project discovery already failed (no retry per request). */
   private readonly projectRetryFailed = new Set<string>()
@@ -263,6 +281,19 @@ export class AgySessionManager {
   private static readonly QUOTA_FETCH_TIMEOUT_MS = 3_000
   /** How long one rate-limit verdict answers for the same account+family. */
   private static readonly QUOTA_VERDICT_TTL_MS = 60_000
+  /**
+   * A 429 this soon after a TRANSPORT failure is treated as the outage's doing.
+   * Generous on purpose: the outage pattern measured on 2026-10-22 was six timeouts
+   * spread over ~70 seconds before the 429 arrived.
+   */
+  private static readonly NETWORK_STORM_WINDOW_MS = 120_000
+  /** First stretched wait after a TRANSPORT failure; doubles per consecutive failure. */
+  private static readonly NETWORK_BACKOFF_BASE_MS = 1_000
+  /**
+   * Ceiling for that wait. Deliberately under DSH's default `maxDelayMs` (10s): a
+   * provider hint ABOVE it makes the normal retry mode give up instead of waiting.
+   */
+  private static readonly NETWORK_BACKOFF_MAX_MS = 8_000
   /** Refresh the token this far ahead of expiry so a request never blocks on the token endpoint. */
   private static readonly REFRESH_SKEW_MS = 2 * 60 * 1000
 
@@ -1361,6 +1392,22 @@ export class AgySessionManager {
       ? (fpCachedVersion ?? (await resolveAntigravityVersionBounded(750, probeFetch(session.account.proxy))) ?? currentAgyVersion())
       : currentAgyVersion()
 
+    // Network trail first: a 429 that follows TRANSPORT failures belongs to the
+    // outage, not to the account (see `NETWORK_STORM_WINDOW_MS`).
+    const trail = this.networkTrail.get(key)
+    const networkStorm = kind === 'rate-limit'
+      && trail !== undefined
+      && Date.now() - trail.lastAt <= AgySessionManager.NETWORK_STORM_WINDOW_MS
+    const networkBackoffMs = kind === 'network-error'
+      ? Math.min(
+        AgySessionManager.NETWORK_BACKOFF_BASE_MS * 2 ** Math.min((trail?.streak ?? 0), 4),
+        AgySessionManager.NETWORK_BACKOFF_MAX_MS,
+      )
+      : undefined
+    if (kind === 'network-error') {
+      this.networkTrail.set(key, { streak: (trail?.streak ?? 0) + 1, lastAt: Date.now() })
+    }
+
     // Quota evidence, collected BEFORE the store mutation: a rate limit is only
     // parked when the ledger says the requested family is really spent, because
     // the same 429 also carries throttles that must not cost an account hours of
@@ -1384,6 +1431,7 @@ export class AgySessionManager {
         info?.rateLimitCategory,
         info?.resetTime,
         quotaVerdict,
+        networkStorm,
       )
 
       // Keep the appeal link beside the challenge state so a user can act on it.
@@ -1393,8 +1441,10 @@ export class AgySessionManager {
         account.verificationUrl = info.verificationUrl
       }
 
-      if (kind === 'rate-limit' && info?.rateLimitCategory !== 'soft_rate_limit') {
+      if (kind === 'rate-limit' && info?.rateLimitCategory !== 'soft_rate_limit' && !networkStorm) {
         // Family-scoped bookkeeping of the real reset (display + ranking wall).
+        // Suppressed during a network storm: skipping the family there would send
+        // later requests to another account for a fault this account did not cause.
         // Soft rate limits are transient bursts handled via immediate retry — do not block the family.
         const familyKey = familyKeyOf(info?.model)
         const resetMs = parseFutureResetMs(info?.resetTime, Date.now()) ??
@@ -1492,13 +1542,19 @@ export class AgySessionManager {
     // Report the quota verdict, not the classified category: the caller must not
     // turn this 429 into a terminal "quota exhausted" turn when the ledger said
     // the family still has quota (or could not be read). `undefined` = no judgement.
-    return quotaVerdict === undefined ? {} : { quotaExhausted: quotaVerdict.state === 'drained' }
+    return {
+      ...(quotaVerdict === undefined ? {} : { quotaExhausted: quotaVerdict.state === 'drained' }),
+      ...(networkBackoffMs === undefined ? {} : { networkBackoffMs }),
+    }
   }
   /** Adapter hook: reset the failure counter after a clean completion. */
   async markSuccess(session: AgyAccountSession): Promise<void> {
     const account = session.account
     const key = this.accountKey(account)
     this.failureCounts.delete(key)
+    // The link is healthy again: stop stretching the retries and stop blaming it
+    // for the next 429.
+    this.networkTrail.delete(key)
   }
 
   /**

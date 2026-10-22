@@ -257,6 +257,11 @@ export function parseFutureResetMs(resetTime: string | undefined, now = Date.now
  * @param consecutiveFailures - consecutive failures on this account.
  * @param retryAfterMs - server-provided retry delay when present.
  * @param resetTime - server-provided absolute reset time; cooldowns use it (capped) instead of fixed windows.
+ * @param networkStorm - The account has been failing at the TRANSPORT level moments
+ *   before this report. A 429 arriving inside a network storm is not evidence that
+ *   the account is over its rate: the retries the outage caused are what the
+ *   upstream counted, so the account must not be rotated on it. Either way the
+ *   call itself is retried — the request has nowhere better to go.
  * @param quotaVerdict - Ledger reading for the requested family, when a probe ran.
  *   It OUTRANKS `category`, which is only a reading of the failure body's prose:
  *   a probe-confirmed drain cools (5h window -> 5 hours, weekly -> a week), while
@@ -272,6 +277,7 @@ export function decideRotation(
   category: RateLimitCategory = 'unknown',
   resetTime?: string,
   quotaVerdict?: QuotaVerdict,
+  networkStorm = false,
 ): RotationAction {
   const now = Date.now()
   const backoffMs = backoffFor(consecutiveFailures)
@@ -291,6 +297,13 @@ export function decideRotation(
         account.cooldownReason = 'quota-exhausted'
         account.cooldownSetAt = now
         return { action: 'cool', backoffMs: cooldownMs }
+      }
+      if (networkStorm) {
+        // The failure in front of us is a 429, but the account was recently dying
+        // at the TRANSPORT level: this is the retry storm's own doing, not the
+        // account's throughput. Changing accounts cannot fix the network, and
+        // parking or skipping the family would blame the account for it.
+        return { action: 'retry', backoffMs }
       }
       if (category === 'quota_exhausted' && quotaVerdict !== undefined) {
         // Probed and NOT spent (or the family could not be read): this 429 was a

@@ -1773,6 +1773,66 @@ describe('rate-limit quota verification', () => {
     expect(outcome).toEqual({ quotaExhausted: false })
   })
 
+  it('does not rotate on a 429 that follows transport failures: the link is the fault', async () => {
+    stubQuotaLedger(availableGemini())
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const rotations: string[] = []
+    const sessions = new AgySessionManager({ store, onRotate: (from, to) => rotations.push(`${from}->${to}`) })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    // The outage: a few transport failures, then the upstream answers 429 because
+    // those retries were counted against the account.
+    await sessions.reportFailure('network-error', session!)
+    await sessions.reportFailure('network-error', session!)
+    await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    const after = await store.load()
+    expect(after.activeIndex).toBe(0)
+    expect(rotations).toEqual([])
+    expect(after.accounts[0]!.coolingDownUntil).toBeUndefined()
+    // No family skip either: that would send the next request to another account.
+    expect(after.accounts[0]!.rateLimitResetTimes).toBeUndefined()
+  })
+
+  it('still rotates on a 429 when the link is healthy', async () => {
+    stubQuotaLedger(availableGemini())
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const rotations: string[] = []
+    const sessions = new AgySessionManager({ store, onRotate: (from, to) => rotations.push(`${from}->${to}`) })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    expect(rotations).toEqual(['0->1'])
+    expect((await store.load()).accounts[0]!.coolingDownUntil).toBeUndefined()
+  })
+
+  it('stretches the retry delay while transport failures keep coming, and stops after success', async () => {
+    stubQuotaLedger(availableGemini())
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+
+    const first = await sessions.reportFailure('network-error', session!)
+    const second = await sessions.reportFailure('network-error', session!)
+    const third = await sessions.reportFailure('network-error', session!)
+    expect(first.networkBackoffMs).toBe(1_000)
+    expect(second.networkBackoffMs).toBe(2_000)
+    expect(third.networkBackoffMs).toBe(4_000)
+
+    // A clean turn clears the trail: the next blip starts from the base again.
+    await sessions.markSuccess(session!)
+    expect((await sessions.reportFailure('network-error', session!)).networkBackoffMs).toBe(1_000)
+  })
+
   it('probing the ledger once per account+family inside the throttle window', async () => {
     const calls: string[] = []
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {

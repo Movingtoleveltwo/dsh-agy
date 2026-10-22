@@ -3002,6 +3002,18 @@ describe('AgyAdapter', () => {
     expect(failures[0]?.session.account.email).toBe('a@b.c')
   })
 
+  it("passes the shell transport backoff as providerRetryAfterMs", async () => {
+    // A flaky link: the ordinary 500ms backoff hammers the dying connection and the
+    // upstream counts those attempts against the account, so the shell stretches it.
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('fetch failed') }))
+    const adapter = new AgyAdapter({
+      getSession: async () => session(),
+      reportFailure: async () => ({ networkBackoffMs: 4_000 }),
+    })
+    const thrown = await adapter.stream(generateOptions()).next().catch((error: unknown) => error)
+    expect(thrown).toMatchObject({ code: 'TRANSPORT', failure: { providerRetryAfterMs: 4_000 } })
+  })
+
   it('throws RATE_LIMIT when the ledger disproves a quota-worded 429', async () => {
     // The generic Google 429 body matches a quota keyword while describing a
     // throttle. The shell probed the ledger and found quota left, so the turn must

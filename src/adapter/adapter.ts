@@ -86,6 +86,8 @@ export interface AgyAdapterOptions {
    * (`quotaExhausted` decides QUOTA vs RATE_LIMIT), or a throttle the ledger
    * disproved would still kill the turn as a terminal exhaustion. `void` means
    * "not judged" and the body-based classification stays authoritative.
+   * `networkBackoffMs` is the shell's advice for pacing a TRANSPORT retry while the
+   * link is failing, and it overrides the ordinary 500ms backoff.
    */
   reportFailure(
     kind: FailureKind,
@@ -101,7 +103,7 @@ export interface AgyAdapterOptions {
       /** Appeal link from a `verification-required` body; surfaced to the user. */
       verificationUrl?: string
     },
-  ): Promise<{ quotaExhausted?: boolean } | void>
+  ): Promise<{ quotaExhausted?: boolean; networkBackoffMs?: number } | void>
   /** Report a clean stream completion (resets the failure counter). */
   markSuccess?(session: AgyAccountSession): Promise<void>
   /**
@@ -570,11 +572,18 @@ export class AgyAdapter extends LlmAdapter {
           )
         } catch (error) {
           const classified = classifyFetchError(error, { proxyUrl: session.account.proxy })
-          await this.options.reportFailure(classified.kind, session)
+          const reportOutcome = await this.options.reportFailure(classified.kind, session)
           // A transport failure consumed no tokens, but it is a real attempt
           // against this account's quota — record the request, not the usage.
           this.recordUsage(session, options.model, { ok: false, reason: 'network-error' }, attemptStartedAt)
-          throw new LlmError(classified.message ?? 'agy fetch failed', 'TRANSPORT', { cause: error })
+          // A stretched retry delay is the only lever against a flaky link: the
+          // ordinary backoff hammers a dying connection and the upstream starts
+          // counting those attempts against the account (see `reportFailure`).
+          const retryAfter = reportOutcome?.networkBackoffMs
+          throw new LlmError(classified.message ?? 'agy fetch failed', 'TRANSPORT', {
+            cause: error,
+            ...(retryAfter === undefined ? {} : { providerRetryAfterMs: retryAfter }),
+          })
         }
         if (response.ok) return { response }
         const bodyText = await response.text().catch(() => undefined)

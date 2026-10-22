@@ -682,6 +682,27 @@ describe('rotation state machine', () => {
     expect(acc.cooldownReason).toBe('quota-exhausted')
   })
 
+  it('keeps the account on a 429 that arrived inside a network storm', () => {
+    // Measured 2026-10-22: six exactly-20s connection timeouts on one account were
+    // followed by a 429, which rotated the pool away from an account that had done
+    // nothing wrong. A flaky link cannot be fixed by changing accounts.
+    const acc = account()
+    const decision = decideRotation('rate-limit', acc, 3, undefined, 'quota_exhausted', undefined, undefined, true)
+    expect(decision.action).toBe('retry')
+    expect(acc.coolingDownUntil).toBeUndefined()
+    expect(acc.cooldownReason).toBeUndefined()
+  })
+
+  it('still cools on a ledger-confirmed drain even while the link is flaky', () => {
+    // The storm explains a 429, not a spent bucket: real evidence still wins.
+    const acc = account()
+    const decision = decideRotation('rate-limit', acc, 3, undefined, 'quota_exhausted', undefined, {
+      state: 'drained', tier: '5h', buckets: ['gemini-5h'],
+    }, true)
+    expect(decision.action).toBe('cool')
+    expect(acc.cooldownReason).toBe('quota-exhausted')
+  })
+
   it('picks the next eligible account round-robin', () => {
     const a = { ...account(), email: 'a' }
     const b = { ...account(), email: 'b' }
