@@ -92,6 +92,44 @@ describe('sampleLimitBurn', () => {
 describe('AgySessionManager', () => {
   afterEach(() => vi.unstubAllGlobals())
 
+  it('manual mode keeps using the active account even when it is cooling', async () => {
+    // The behaviour the owner asked for: no automatic switching at all. A rot caused
+    // by an unreliable link is pure churn, and a low-volume pool rarely needs it.
+    stubQuotaLedger(drainedGemini5h())
+    const a = account('a@x')
+    const b = account('b@x')
+    const store = new InMemoryAccountStore(storage([a, b], 0))
+    const sessions = new AgySessionManager({ store, accountMode: 'manual' })
+    const session = await sessions.getSession('gemini-3-flash')
+    expect(session!.index).toBe(0)
+
+    await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+
+    const after = await store.load()
+    // The cooldown is still RECORDED (the panel can explain it), but the pool did
+    // not move and the next request still uses account 0.
+    expect(after.activeIndex).toBe(0)
+    expect(after.accounts[0]!.coolingDownUntil).toBeDefined()
+    expect((await sessions.getSession('gemini-3-flash'))!.index).toBe(0)
+  })
+
+  it('auto mode still shifts, so the relay stays available', async () => {
+    stubQuotaLedger(drainedGemini5h())
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
+    const sessions = new AgySessionManager({ store, accountMode: 'auto' })
+    const session = await sessions.getSession('gemini-3-flash')
+    await sessions.reportFailure('rate-limit', session!, {
+      status: 429,
+      rateLimitCategory: 'quota_exhausted',
+      model: 'gemini-3-flash',
+    })
+    expect((await store.load()).activeIndex).toBe(1)
+  })
+
   it('returns undefined when no accounts exist', async () => {
     const sessions = new AgySessionManager({ store: new InMemoryAccountStore() })
     expect(await sessions.getSession()).toBeUndefined()

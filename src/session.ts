@@ -76,8 +76,33 @@ export interface FailureReportOutcome {
   networkBackoffMs?: number
 }
 
+/**
+ * How the pool chooses the account for a request.
+ *
+ * `auto` is the sequential-relay behaviour: when the active account is cooling,
+ * rate-limited or drained, selection shifts to the next usable one and writes the
+ * new index. `manual` is the strict form: the active account is used no matter
+ * what, and only `activateAccount` (the panel's 设置当前账号) ever changes it.
+ *
+ * Manual exists because a rotation caused by an unreliable LINK is pure churn —
+ * measured 2026-10-22/23, a bad proxy produced 17 transport failures and 2 shifts
+ * in one evening while the accounts were all healthy. A low-volume user would
+ * rather see one failing account than a pool that hops by itself.
+ */
+export type AccountMode = 'auto' | 'manual'
+
+/** Env override for the mode; the shells read it, the manager takes it as an option. */
+export const ACCOUNT_MODE_ENV = 'DSH_AGY_ACCOUNT_MODE'
+
+/** Resolve the configured mode, defaulting to `manual`. */
+export function resolveAccountMode(raw: string | undefined): AccountMode {
+  return raw?.trim().toLowerCase() === 'auto' ? 'auto' : 'manual'
+}
+
 export interface SessionManagerOptions {
   store: AccountStore
+  /** Defaults to `auto` so existing callers/tests keep the relay behaviour. */
+  accountMode?: AccountMode
   /** Called after rotation changes the active index (for logging/UI). */
   onRotate?: (fromIndex: number, toIndex: number, reason: FailureKind) => void
   /** Called after a health check finishes (batch probe results). */
@@ -233,6 +258,8 @@ export function impersonationHeadersFor(account: ManagedAccount): AgyAccountSess
 
 export class AgySessionManager {
   private readonly store: AccountStore
+  /** `manual` pins selection to the active account; see `AccountMode`. */
+  private readonly accountMode: AccountMode
   private readonly onRotate: SessionManagerOptions['onRotate']
   private readonly onHealthReport: SessionManagerOptions['onHealthReport']
   private readonly recordUsageOption: SessionManagerOptions['recordUsage']
@@ -488,6 +515,7 @@ export class AgySessionManager {
 
   constructor(options: SessionManagerOptions) {
     this.store = options.store
+    this.accountMode = options.accountMode ?? 'auto'
     this.onRotate = options.onRotate
     this.onHealthReport = options.onHealthReport
     this.recordUsageOption = options.recordUsage
@@ -1073,6 +1101,15 @@ export class AgySessionManager {
       : 0
     const active = storage.accounts[activeIdx]
 
+    if (this.accountMode === 'manual') {
+      // Strict manual mode: the active account is the answer, cooling and
+      // rate-limit state included. Only `activateAccount` moves the pool, so a
+      // request never silently lands on an account the user did not pick.
+      return active !== undefined && active.enabled !== false
+        ? { account: active, index: activeIdx }
+        : undefined
+    }
+
     if (isUsable(active)) {
       return { account: active, index: activeIdx }
     }
@@ -1486,7 +1523,10 @@ export class AgySessionManager {
         for (const a of storage.accounts) clearExpiredState(a, now)
         const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
         const isCurrentActive = currentIndex !== -1 && currentIndex === storage.activeIndex
-        if (isCurrentActive) {
+        // Manual mode: a dead account stays dead in place. Shifting to a sibling
+        // would be a rotation the user never asked for, and the next request
+        // surfaces the failure instead.
+        if (isCurrentActive && this.accountMode === 'auto') {
           const next = this.pickNextSequentialAccount(storage, currentIndex, now, info?.model)
           if (next && next.index !== storage.activeIndex) {
             fromIndexBeforeRotate = storage.activeIndex
@@ -1537,7 +1577,9 @@ export class AgySessionManager {
         for (const a of storage.accounts) clearExpiredState(a, now)
         const currentIndex = storage.accounts.findIndex((a) => this.accountKey(a) === key)
         const isCurrentActive = currentIndex !== -1 && currentIndex === storage.activeIndex
-        if (isCurrentActive) {
+        // Manual mode: cooling/quota bookkeeping still records WHY the account is
+        // parked, but the pool does not move — the active account keeps serving.
+        if (isCurrentActive && this.accountMode === 'auto') {
           const next = this.pickNextSequentialAccount(storage, currentIndex, now, info?.model)
           if (next && next.index !== storage.activeIndex) {
             fromIndexBeforeRotate = storage.activeIndex

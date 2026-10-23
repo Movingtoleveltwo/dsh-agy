@@ -20,7 +20,7 @@ import { probeFetch, proxiedFetch } from './proxy.ts'
 import { pickProbeProxyUrl } from './runtime/rotation.ts'
 import { resolveAntigravityVersion } from './runtime/version.ts'
 import type { FetchLike } from './runtime/version.ts'
-import { AgySessionManager } from './session.ts'
+import { ACCOUNT_MODE_ENV, AgySessionManager, resolveAccountMode } from './session.ts'
 import { JsonAccountStore } from './store/accounts.ts'
 import type { AccountStore } from './store/accounts.ts'
 import {
@@ -186,6 +186,10 @@ async function buildAgyRuntime(ctx: Context): Promise<AgyRuntime> {
   let invalidateModelCache: () => void = () => {}
   const sessions = new AgySessionManager({
     store,
+    // MANUAL by default: this pool serves one user at low volume, and an
+    // unreliable proxy made automatic rotation pure churn (2026-10-22/23). Set
+    // `DSH_AGY_ACCOUNT_MODE=auto` to bring the sequential relay back.
+    accountMode: resolveAccountMode(process.env[ACCOUNT_MODE_ENV]),
     recordUsage: (record) => { stats.record(record) },
     onRotate: () => { invalidateModelCache() },
   })
