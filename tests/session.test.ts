@@ -1642,6 +1642,80 @@ describe('proxyless transport failover (issue #29)', () => {
  * quota wall that must stay classified as rate-limit (never auth-failure) while
  * still not costing an account hours of rest on a default guess.
  */
+describe('refresh revocation needs confirmation', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  function invalidGrant(): Response {
+    return new Response(JSON.stringify({ error: 'invalid_grant', error_description: 'Bad Request' }), { status: 400 })
+  }
+
+  it('does not disable when the retry proves the credential is alive', async () => {
+    // 2026-10-22/23: a flaky proxy made two healthy accounts report `revoked`; both
+    // refreshed fine minutes later, but they had already been disabled.
+    let calls = 0
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        calls += 1
+        return calls === 1
+          ? invalidGrant()
+          : new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 })
+    }))
+    const store = new InMemoryAccountStore(storage([account('a@x')]))
+    const sessions = new AgySessionManager({ store })
+    await expect(sessions.getSession('gemini-3-flash')).resolves.toBeDefined()
+    const after = await store.load()
+    expect(after.accounts[0]!.enabled).not.toBe(false)
+    expect(after.accounts[0]!.verificationRequired).not.toBe(true)
+  })
+
+  it('does not disable when the account was failing at the transport level moments ago', async () => {
+    // The measured 2026-10-22 case: `revoked` arrived 2 minutes after a transport
+    // failure, and the credential was healthy. One `invalid_grant` during an outage
+    // is not evidence of a dead account.
+    let revoke = false
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) {
+        // The first token is already due for a refresh (well inside the skew), so
+        // the second `getSession` really performs the exchange that says revoked.
+        return revoke
+          ? invalidGrant()
+          : new Response(JSON.stringify({ access_token: 'at', expires_in: 1 }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ access_token: 'at', expires_in: 1 }), { status: 200 })
+    }))
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')]))
+    const sessions = new AgySessionManager({ store })
+    const session = await sessions.getSession('gemini-3-flash')
+    expect(session).toBeDefined()
+
+    await sessions.reportFailure('network-error', session!)
+    revoke = true
+
+    await expect(sessions.getSession('gemini-3-flash')).rejects.toMatchObject({ name: 'AgyAuthError', kind: 'transport' })
+    const after = await store.load()
+    expect(after.accounts[0]!.enabled).not.toBe(false)
+    expect(after.accounts[0]!.verificationRequired).not.toBe(true)
+  })
+
+  it('still disables on a confirmed revocation', async () => {
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('oauth2.googleapis.com/token')) return invalidGrant()
+      return new Response(JSON.stringify({ access_token: 'at', expires_in: 3600 }), { status: 200 })
+    }))
+    const store = new InMemoryAccountStore(storage([account('a@x')]))
+    const sessions = new AgySessionManager({ store })
+    await expect(sessions.getSession('gemini-3-flash')).rejects.toThrow()
+    const after = await store.load()
+    expect(after.accounts[0]!.enabled).toBe(false)
+    expect(after.accounts[0]!.verificationRequired).toBe(true)
+  })
+})
+
 describe('rate-limit quota verification', () => {
   afterEach(() => vi.unstubAllGlobals())
 

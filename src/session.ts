@@ -556,6 +556,33 @@ export class AgySessionManager {
         })
       }
       if (result.type === 'revoked') {
+        // CONFIRM BEFORE DISABLING. A single `invalid_grant` used to be enough, and
+        // that was a defensible decision while the link was reliable. It is not:
+        // on 2026-10-22/23 a flaky proxy made two healthy accounts report
+        // `revoked` — one 2 minutes after a transport failure, the other 17
+        // seconds after one — and both were disabled, then both refreshed fine
+        // minutes later (verified by hand). Disabling is the one action the user
+        // must repair by hand, so it now needs a second, independent opinion:
+        // either the same account was failing at the TRANSPORT level moments
+        // before, or the immediate retry says `invalid_grant` again.
+        const trail = this.networkTrail.get(key)
+        const recentTransportFailure = trail !== undefined
+          && Date.now() - trail.lastAt <= AgySessionManager.NETWORK_STORM_WINDOW_MS
+        const retry = recentTransportFailure
+          ? undefined
+          : await refreshAccessToken(
+            { access: '', expires: 0, refresh: account.refresh },
+            { clientId: account.clientId, proxyUrl: account.proxy },
+          )
+        if (retry?.type === 'success') {
+          this.tokenCache.set(key, { access: retry.auth.access, expires: retry.auth.expires })
+          return retry.auth
+        }
+        if (recentTransportFailure || retry?.type === 'failed') {
+          throw new AgyAuthError('transport', 'token refresh inconclusive (link failing)', {
+            cause: retry?.type === 'failed' ? retry.error : undefined,
+          })
+        }
         // Account credentials are dead — mark it disabled and verificationRequired in the store
         this.tokenCache.delete(key)
         await this.store.mutate((s) => {
