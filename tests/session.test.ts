@@ -310,7 +310,7 @@ describe('AgySessionManager', () => {
     expect((await store.load()).accounts[0]!.fingerprintHistory).toHaveLength(2)
   })
 
-  it('revokes on auth-failure: disables and marks verification required', async () => {
+  it('parks on auth-failure: marks verification required without disabling', async () => {
     stubTokenEndpoint()
     const store = new InMemoryAccountStore(storage([account()]))
     const sessions = new AgySessionManager({ store })
@@ -318,7 +318,7 @@ describe('AgySessionManager', () => {
     const session = await sessions.getSession()
     await sessions.reportFailure('auth-failure', session!)
     const after = await store.load()
-    expect(after.accounts[0]!.enabled).toBe(false)
+    expect(after.accounts[0]!.enabled).not.toBe(false)
     expect(after.accounts[0]!.verificationRequired).toBe(true)
   })
 
@@ -1094,7 +1094,8 @@ describe('usage-driven selection', () => {
     await expect(sessions.getSession()).rejects.toThrow(/credential is no longer valid/)
 
     const after = await store.load()
-    expect(after.accounts[0]!.enabled).toBe(false)
+    // Parked, not disabled: the pool can never lose a working account to a bad link.
+    expect(after.accounts[0]!.enabled).not.toBe(false)
     expect(after.accounts[0]!.verificationRequired).toBe(true)
     expect(after.accounts[0]!.verificationRequiredReason).toBe('auth-failure')
   })
@@ -1756,7 +1757,7 @@ describe('refresh revocation needs confirmation', () => {
     expect(after.accounts[0]!.verificationRequired).not.toBe(true)
   })
 
-  it('still disables on a confirmed revocation', async () => {
+  it('parks on a confirmed revocation instead of disabling the account', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('oauth2.googleapis.com/token')) return invalidGrant()
@@ -1766,7 +1767,7 @@ describe('refresh revocation needs confirmation', () => {
     const sessions = new AgySessionManager({ store })
     await expect(sessions.getSession('gemini-3-flash')).rejects.toThrow()
     const after = await store.load()
-    expect(after.accounts[0]!.enabled).toBe(false)
+    expect(after.accounts[0]!.enabled).not.toBe(false)
     expect(after.accounts[0]!.verificationRequired).toBe(true)
   })
 })

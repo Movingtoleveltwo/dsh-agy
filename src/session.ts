@@ -584,7 +584,7 @@ export class AgySessionManager {
         })
       }
       if (result.type === 'revoked') {
-        // CONFIRM BEFORE DISABLING. A single `invalid_grant` used to be enough, and
+        // CONFIRM BEFORE PARKING. A single `invalid_grant` used to be enough, and
         // that was a defensible decision while the link was reliable. It is not:
         // on 2026-10-22/23 a flaky proxy made two healthy accounts report
         // `revoked` — one 2 minutes after a transport failure, the other 17
@@ -611,18 +611,20 @@ export class AgySessionManager {
             cause: retry?.type === 'failed' ? retry.error : undefined,
           })
         }
-        // Account credentials are dead — mark it disabled and verificationRequired in the store
+        // Park it, never disable it: this verdict comes from the SAME untrusted link
+        // that produced every false positive so far (2026-10-22/23 — four accounts
+        // disabled in one evening, all of them healthy minutes later). The marker is
+        // enough to keep it out of automatic selection, and a later successful
+        // refresh or verify clears it without human action.
         this.tokenCache.delete(key)
         await this.store.mutate((s) => {
           const target = s.accounts.find((candidate) => this.accountKey(candidate) === key)
           if (target) {
-            target.enabled = false
             target.verificationRequired = true
             target.verificationRequiredAt = Date.now()
             target.verificationRequiredReason = 'auth-failure'
           }
         })
-        account.enabled = false
         account.verificationRequired = true
         account.verificationRequiredAt = Date.now()
         account.verificationRequiredReason = 'auth-failure'
@@ -1041,6 +1043,8 @@ export class AgySessionManager {
     const isUsable = (acc: ManagedAccount | undefined): acc is ManagedAccount =>
       acc !== undefined &&
       acc.enabled !== false &&
+      // A parked account is waiting on a verification marker, not on a clock.
+      acc.verificationRequired !== true &&
       !isCoolingDown(acc, now) &&
       !isFamilyRateLimited(acc, familyKey, now) &&
       !isFamilyQuotaExhausted(acc, family, now)

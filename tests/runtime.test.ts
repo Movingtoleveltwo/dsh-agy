@@ -536,12 +536,18 @@ describe('rotation state machine', () => {
     expect(acc.cooldownReason).toBe('quota-exhausted')
   })
 
-  it('revokes on auth-failure and disables the account', () => {
+  it('parks an auth-failure instead of disabling the account', () => {
+    // 2026-10-22/23: every "revocation" this pool reported was a false positive
+    // from a flaky proxy, and one of them had already been taken out of service by
+    // hand before anyone could check. A credential verdict therefore parks the
+    // account (marker + timed window) and never flips `enabled`.
     const acc = account()
     const decision = decideRotation('auth-failure', acc, 2)
-    expect(decision.action).toBe('revoke')
-    expect(acc.enabled).toBe(false)
+    expect(decision.action).toBe('cool')
+    expect(acc.enabled).not.toBe(false)
     expect(acc.verificationRequired).toBe(true)
+    expect(acc.verificationRequiredReason).toBe('auth-failure')
+    expect(acc.coolingDownUntil! - Date.now()).toBeGreaterThan(0)
   })
 
   it('parks a verification challenge instead of disabling the account', () => {

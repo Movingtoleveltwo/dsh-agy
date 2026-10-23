@@ -350,19 +350,26 @@ export function decideRotation(
       return { action: 'rotate', backoffMs: Math.max(cooldownMs, 1000) }
     }
     case 'auth-failure': {
-      // Terminal: account credentials are dead; never auto-recover.
+      // NEVER DISABLE ON THE PLUGIN'S OWN JUDGEMENT.
       //
-      // One `invalid_grant` is enough, and that is a decision: the code means the
-      // refresh token no longer works, and rotating/re-probing a dead credential
-      // only burns requests. Another implementation demands repeated
-      // confirmation, but it has more failure modes to tell apart (its own
-      // decrypt path, a swappable OAuth app); here a false positive costs one
-      // `dsh-agy verify`, which re-enables the account on success.
+      // This used to be terminal ("one `invalid_grant` is enough"), and that was a
+      // defensible decision while the network could be trusted. It cannot be here:
+      // on 2026-10-22/23 a flaky proxy made EVERY reported revocation a false
+      // positive — the owner's words, after four accounts were disabled in one
+      // evening and every one of them refreshed successfully minutes later.
+      //
+      // So the account is PARKED, not killed: it keeps `enabled: true`, gains the
+      // verification marker (which the panel shows), and is excluded from
+      // automatic selection by `isUsable`. Recovery needs no human action — a
+      // successful verify, or a later successful refresh, clears the marker — and
+      // the pool never permanently loses a working account to a bad link.
       account.verificationRequired = true
       account.verificationRequiredAt = now
       account.verificationRequiredReason = 'auth-failure'
-      account.enabled = false
-      return { action: 'revoke' }
+      account.coolingDownUntil = now + VERIFICATION_COOLDOWN_MS
+      account.cooldownReason = 'validation-required'
+      account.cooldownSetAt = now
+      return { action: 'cool', backoffMs: VERIFICATION_COOLDOWN_MS }
     }
     case 'verification-required': {
       // Recoverable, and NOT a credential failure: the upstream is asking the
