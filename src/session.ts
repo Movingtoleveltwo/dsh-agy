@@ -1080,6 +1080,22 @@ export class AgySessionManager {
       !isFamilyRateLimited(acc, familyKey, now) &&
       !isFamilyQuotaExhausted(acc, family, now)
 
+    const activeIdx = typeof storage.activeIndex === 'number' && storage.activeIndex >= 0 && storage.activeIndex < storage.accounts.length
+      ? storage.activeIndex
+      : 0
+    const active = storage.accounts[activeIdx]
+
+    if (this.accountMode === 'manual') {
+      // STRICT manual mode, resolved BEFORE affinity: a conversation pin may point
+      // at a different account than the active one (pins survive across sessions),
+      // so honouring it would send requests to an account the user did not choose —
+      // which reads exactly like the pool switching itself after a blip cleared the
+      // pin. One account, chosen by the user, for every conversation.
+      return active !== undefined && active.enabled !== false
+        ? { account: active, index: activeIdx }
+        : undefined
+    }
+
     const pinnedKey = this.affinityFor(conversationKey, now)
     if (pinnedKey !== null) {
       const pinnedIdx = storage.accounts.findIndex((a) => this.accountKey(a) === pinnedKey)
@@ -1095,20 +1111,6 @@ export class AgySessionManager {
       .map((account, index) => ({ account, index }))
       .filter(({ account }) => account.enabled !== false)
     if (eligible.length === 0) return undefined
-
-    const activeIdx = typeof storage.activeIndex === 'number' && storage.activeIndex >= 0 && storage.activeIndex < storage.accounts.length
-      ? storage.activeIndex
-      : 0
-    const active = storage.accounts[activeIdx]
-
-    if (this.accountMode === 'manual') {
-      // Strict manual mode: the active account is the answer, cooling and
-      // rate-limit state included. Only `activateAccount` moves the pool, so a
-      // request never silently lands on an account the user did not pick.
-      return active !== undefined && active.enabled !== false
-        ? { account: active, index: activeIdx }
-        : undefined
-    }
 
     if (isUsable(active)) {
       return { account: active, index: activeIdx }
@@ -1391,7 +1393,9 @@ export class AgySessionManager {
 
       // A pinned (test) call must not touch the affinity pin: probing an account
       // is not "using" it, and pinning would steer the next real conversation.
-      if (accountIndex === undefined) this.setAffinity(conversationKey, key, Date.now())
+      if (accountIndex === undefined && this.accountMode !== 'manual') {
+        this.setAffinity(conversationKey, key, Date.now())
+      }
       return {
         auth,
         account: picked.account,

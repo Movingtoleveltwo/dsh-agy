@@ -117,6 +117,23 @@ describe('AgySessionManager', () => {
     expect((await sessions.getSession('gemini-3-flash'))!.index).toBe(0)
   })
 
+  it('manual mode ignores a conversation pin that points at another account', async () => {
+    // The pin survives across sessions, so honouring it served requests from an
+    // account the user had not chosen — and when a blip cleared the pin the next
+    // request jumped back to the active one. That looked exactly like the pool
+    // switching itself.
+    stubQuotaLedger(drainedGemini5h())
+    const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 1))
+    const sessions = new AgySessionManager({ store, accountMode: 'manual' })
+
+    // Pin a conversation to account 0 while the active account is 1.
+    const first = await sessions.getSession('gemini-3-flash', undefined, 'conversation-1')
+    expect(first!.index).toBe(1)
+    await store.mutate((draft) => { draft.activeIndex = 1 })
+    const again = await sessions.getSession('gemini-3-flash', undefined, 'conversation-1')
+    expect(again!.index).toBe(1)
+  })
+
   it('auto mode still shifts, so the relay stays available', async () => {
     stubQuotaLedger(drainedGemini5h())
     const store = new InMemoryAccountStore(storage([account('a@x'), account('b@x')], 0))
