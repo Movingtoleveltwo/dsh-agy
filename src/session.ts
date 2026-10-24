@@ -1495,16 +1495,23 @@ export class AgySessionManager {
       const account = storage.accounts.find((a) => this.accountKey(a) === key)
       if (!account) return
 
-      const decision = decideRotation(
-        kind,
-        account,
-        consecutive,
-        info?.retryAfterMs,
-        info?.rateLimitCategory,
-        info?.resetTime,
-        quotaVerdict,
-        networkStorm,
-      )
+      // In manual mode a credential verdict changes NOTHING: there is no sibling to
+      // steer to, so parking only paints a "需验证/冷却" badge over an account that is
+      // still the only one in use — and with a flaky link those verdicts are mostly
+      // false anyway (verified: every account refreshed fine while parked). The next
+      // request simply retries.
+      const decision = this.accountMode === 'manual' && kind === 'auth-failure'
+        ? { action: 'retry' as const, backoffMs: 1000 }
+        : decideRotation(
+          kind,
+          account,
+          consecutive,
+          info?.retryAfterMs,
+          info?.rateLimitCategory,
+          info?.resetTime,
+          quotaVerdict,
+          networkStorm,
+        )
 
       // Keep the appeal link beside the challenge state so a user can act on it.
       // Only overwritten when the upstream actually supplied one, so a later
@@ -1629,6 +1636,31 @@ export class AgySessionManager {
     const account = session.account
     const key = this.accountKey(account)
     this.failureCounts.delete(key)
+    // A completed turn IS the proof a verify would give: clear any parked marker a
+    // false verdict left behind, so the panel stops showing a state the account is
+    // demonstrably not in.
+    if (account.verificationRequired === true || account.cooldownReason === 'validation-required') {
+      account.verificationRequired = false
+      account.verificationRequiredAt = undefined
+      account.verificationRequiredReason = undefined
+      if (account.cooldownReason === 'validation-required') {
+        account.coolingDownUntil = undefined
+        account.cooldownReason = undefined
+        account.cooldownSetAt = undefined
+      }
+      void this.store.mutate((s) => {
+        const target = s.accounts.find((candidate) => this.accountKey(candidate) === key)
+        if (!target) return
+        target.verificationRequired = false
+        target.verificationRequiredAt = undefined
+        target.verificationRequiredReason = undefined
+        if (target.cooldownReason === 'validation-required') {
+          target.coolingDownUntil = undefined
+          target.cooldownReason = undefined
+          target.cooldownSetAt = undefined
+        }
+      }).catch(() => {})
+    }
     // The link is healthy again: stop stretching the retries and stop blaming it
     // for the next 429.
     this.networkTrail.delete(key)
@@ -1803,6 +1835,12 @@ export class AgySessionManager {
           target.verificationRequiredAt = undefined
           target.verificationRequiredReason = undefined
           target.verificationUrl = undefined
+          // The parking window came from the SAME verdict this probe just disproved.
+          if (target.cooldownReason === 'validation-required') {
+            target.coolingDownUntil = undefined
+            target.cooldownReason = undefined
+            target.cooldownSetAt = undefined
+          }
         }
       })
       // No model tokens are billed by a userinfo probe, but the call is a real
