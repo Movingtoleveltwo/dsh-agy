@@ -10,7 +10,7 @@ import {
   parseSseDataLine,
   resolveStreamIdleTimeoutMs,
 } from '../src/adapter/parse.ts'
-import { catalogModelList, fetchAvailableModels, listAgyModels, mergeModelCatalog, resolveAgyModel } from '../src/adapter/models.ts'
+import { catalogModelList, fetchAvailableModels, geminiQuotaFromDiscoveredModels, listAgyModelListing, listAgyModels, mergeModelCatalog, resolveAgyModel } from '../src/adapter/models.ts'
 import { AGY_PUBLIC_MODELS, formatTieredModelName, isChatCallableModelId } from '../src/adapter/catalog.ts'
 import { AgyAdapter, buildRequestHeaders } from '../src/adapter/adapter.ts'
 import type { AgyAccountSession } from '../src/adapter/adapter.ts'
@@ -1723,6 +1723,29 @@ describe('models', () => {
     expect(models.length).toBeGreaterThan(0)
   })
 
+  it('extracts Gemini quota from the existing model-discovery request', async () => {
+    const fetchImpl = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        models: {
+          'gemini-3.6-flash-high': { quotaInfo: { remainingFraction: 0.97, resetTime: '2026-10-31T23:05:00.000Z' } },
+          'gemini-3.6-pro-high': { quotaInfo: { remainingFraction: 0.98, resetTime: '2026-10-31T23:05:00.000Z' } },
+          'gemma-3-27b': { quotaInfo: { remainingFraction: 0.01 } },
+          'claude-sonnet-4-6': { quotaInfo: { remainingFraction: 0.02 } },
+        },
+      }),
+    })) as unknown as typeof fetch
+    const listing = await listAgyModelListing('access-token', 'project-id', fetchImpl)
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1)
+    expect(listing.quotaSourceAvailable).toBe(true)
+    expect(listing.geminiQuota).toMatchObject({
+      remainingFraction: 0.97,
+      resetTime: '2026-10-31T23:05:00.000Z',
+    })
+    expect(geminiQuotaFromDiscoveredModels({ models: { 'claude-sonnet-4-6': { quotaInfo: { remainingFraction: 0.1 } } } })).toBeNull()
+  })
+
   it('declares input modalities per catalog vision metadata (unknown ids default to image)', () => {
     const merged = mergeModelCatalog({ models: { 'gemini-3.6-flash-high': {}, 'some-new-model': {} } })
     expect(merged.find((m) => m.id === 'gemini-3.6-flash-high')?.inputModalities).toEqual(['text', 'image'])
@@ -3289,6 +3312,35 @@ describe('AgyAdapter', () => {
     // Forced refresh bypasses cache
     await adapter.listAllModels(true)
     expect(fetchSpy).toHaveBeenCalledTimes(2)
+  })
+
+  it('serves the cached Gemini quota only for its discovery account without another fetch', async () => {
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({
+      models: {
+        'gemini-3.8-flash-tiered': {
+          quotaInfo: { remainingFraction: 0.97, resetTime: '2026-10-31T23:05:00.000Z' },
+        },
+      },
+    }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchSpy)
+    const adapter = new AgyAdapter({
+      getSession: async () => session({
+        auth: { access: 'token-123', refresh: 'r', expires: Date.now() + 3600000 },
+      }),
+      reportFailure: async () => {},
+    })
+
+    await adapter.listAllModels()
+    const quota = await adapter.cachedGeminiQuotaFor({ email: 'a@b.c', refresh: 'rt|p', addedAt: 0, lastUsed: 0 })
+    const otherAccount = await adapter.cachedGeminiQuotaFor({ email: 'other@b.c', refresh: 'rt|other', addedAt: 0, lastUsed: 0 })
+
+    expect(quota).toMatchObject({ remainingFraction: 0.97, resetTime: '2026-10-31T23:05:00.000Z' })
+    expect(otherAccount).toBeNull()
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    adapter.invalidateModelCache()
+    expect(adapter.peekCachedGeminiQuotaFor({ email: 'a@b.c', refresh: 'rt|p', addedAt: 0, lastUsed: 0 }))
+      .toMatchObject({ remainingFraction: 0.97 })
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 
   it('drops the cached model list on invalidateModelCache, re-probing on the next call', async () => {

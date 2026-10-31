@@ -31,7 +31,8 @@ import { aliasVar, installAgyStyles } from './styles.ts'
 import { en, zh, type AgyLocaleKey } from './locales.ts'
 import { h } from './element.ts'
 import { AgyQuotaBadge } from './quota-badge.ts'
-import { agoText, quotaColor, resetText, stateLabel, untilText, windowLabel, MINUTE_MS, HOUR_MS } from './quota-view.ts'
+import { agoText, quotaColor, quotaGroupTitle, resetText, stateLabel, untilText, windowLabel, windowRows, MINUTE_MS, HOUR_MS } from './quota-view.ts'
+import { filterGeminiQuotaGroups } from '../quota-display.ts'
 import type { AccountView, AgyRpcClient, AgyRpcResult, ModelView, MultimodalView, StatsView, ThinkingBudgets } from '../rpc-contract.ts'
 import { CLAUDE_BUDGET_MAX, CLAUDE_BUDGET_MIN, THINKING_BUDGET_MAX, THINKING_BUDGET_MIN, THINKING_LEVELS } from '../thinking-types.ts'
 import { MULTIMODAL_DEFAULT_MB, MULTIMODAL_MAX_MB, MULTIMODAL_MIN_MB } from '../multimodal-types.ts'
@@ -623,8 +624,9 @@ function LimitsCard(props: {
   t: T
 }): ReactNode {
   const { account, now, t } = props
+  const groups = filterGeminiQuotaGroups(account.limits)
   return card(t('limitsTitle'),
-    account.limits === null || account.limits.length === 0
+    groups.length === 0
       ? h('div', { className: 'agy-empty' }, t('limitsUnavailable'))
       // The snapshot's age is shown, not just its values. These windows come from
       // a TTL cache and a FAILED refresh keeps the previous numbers rather than
@@ -635,10 +637,11 @@ function LimitsCard(props: {
           ? null
           : h('div', { className: 'agy-limit-age' },
             t('limitsMeasured', { ago: agoText(new Date(account.limitsUpdatedAt).toISOString(), t, now) })),
-        ...account.limits.map((group) => h('div', { className: 'agy-limit-group', key: group.name },
-          h('div', { className: 'agy-limit-group-name' }, group.name),
+        ...groups.map((group) => h('div', { className: 'agy-limit-group', key: group.name },
+          h('div', { className: 'agy-limit-group-name' }, quotaGroupTitle(group, t)),
           ...group.windows.map((window) => {
-            const fraction = window.remainingFraction
+            const row = windowRows([window], t, now)[0]!
+            const fraction = row.percent === null ? null : window.remainingFraction
             // Burn projection: rate (fraction/hour) over remaining fraction
             // gives hours-to-empty. Spoken ONLY when that lands BEFORE the
             // window's reset — otherwise the reset time this row already shows
@@ -654,18 +657,18 @@ function LimitsCard(props: {
               && hoursLeft < resetHours
             return h('div', { key: window.bucketId, className: 'agy-limit-item' },
               h('div', { className: 'agy-limit-header' },
-                h('span', { className: 'agy-limit-k' }, windowLabel(window.window, t)),
+                h('span', { className: 'agy-limit-k' }, row.label),
                 h('div', { className: 'agy-limit-status' },
-                  window.resetTime === null ? null : h('span', { className: 'agy-limit-reset' }, resetText(window.resetTime, t, now)),
+                  row.reset === null ? null : h('span', { className: 'agy-limit-reset' }, row.reset),
                   h('span', {
                     className: 'agy-limit-p',
                     style: fraction === null ? undefined : { color: quotaColor(fraction) },
-                  }, fraction === null ? t('valueUnknown') : `${Math.round(fraction * 100)}%`),
+                  }, row.percent === null ? t('valueUnknown') : `${row.percent}%`),
                 )),
               h('div', { className: 'agy-limit-track' },
                 fraction === null
                   ? null
-                  : h('i', { style: { width: `${Math.round(fraction * 100)}%`, background: quotaColor(fraction) } })),
+                  : h('i', { style: { width: `${row.percent}%`, background: quotaColor(fraction) } })),
               exhaustsFirst
                 ? h('div', { className: 'agy-limit-burn' },
                   t('limitBurnWarn', { value: burnHorizon(hoursLeft!, t) }))

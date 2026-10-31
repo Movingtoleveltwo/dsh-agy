@@ -7,6 +7,7 @@
 import { ReasoningEffortId, type LlmModelInfo, type LlmModelReasoningInfo, type LlmResolvedModelInfo, type ModelModality } from '@deepseek-ai/dsh-llm'
 import { AGY_ENDPOINT_FALLBACKS, getAgyBootstrapUserAgent } from '../oauth/constants.ts'
 import { proxiedFetch } from '../proxy.ts'
+import type { GeminiModelQuotaSnapshot } from '../types.ts'
 import { AGY_PUBLIC_MODELS, catalogModel, isChatCallableModelId, isLevelThinkingModel } from './catalog.ts'
 
 export const AGY_PROVIDER = 'agy'
@@ -82,6 +83,40 @@ export interface DiscoveredModels {
   agentModelSorts?: { displayName?: string; groups?: { modelIds?: string[] }[] }[]
   /** Selectable-thinking families, e.g. `{flash: ['gemini-3.8-flash-tiered']}`. */
   tieredModelIds?: Record<string, string[]>
+}
+
+export interface AgyModelListing {
+  models: readonly LlmModelInfo[]
+  geminiQuota: GeminiModelQuotaSnapshot | null
+  quotaSourceAvailable: boolean
+}
+
+export function geminiQuotaFromDiscoveredModels(
+  discovered: DiscoveredModels,
+  updatedAt = Date.now(),
+): GeminiModelQuotaSnapshot | null {
+  const readings = Object.entries(discovered.models ?? {}).flatMap(([id, entry]) => {
+    if (!id.toLowerCase().startsWith('gemini-')) return []
+    const fraction = entry.quotaInfo?.remainingFraction
+    if (typeof fraction !== 'number' || !Number.isFinite(fraction)) return []
+    const rawResetTime = entry.quotaInfo?.resetTime
+    const resetTime = typeof rawResetTime === 'string' && Number.isFinite(Date.parse(rawResetTime))
+      ? rawResetTime
+      : null
+    return [{ remainingFraction: Math.max(0, Math.min(1, fraction)), resetTime }]
+  })
+  if (readings.length === 0) return null
+  readings.sort((left, right) => {
+    if (left.remainingFraction !== right.remainingFraction) {
+      return left.remainingFraction - right.remainingFraction
+    }
+    if (left.resetTime === null && right.resetTime === null) return 0
+    if (left.resetTime === null) return 1
+    if (right.resetTime === null) return -1
+    return Date.parse(left.resetTime) - Date.parse(right.resetTime)
+  })
+  const reading = readings[0]
+  return reading === undefined ? null : { ...reading, updatedAt }
 }
 
 /** Role keys whose members are not agent chat models. */
@@ -242,20 +277,35 @@ export function catalogModelList(): LlmModelInfo[] {
   }))
 }
 
+/** Adapter-facing listing with quota data retained from the same discovery call. */
+export async function listAgyModelListing(
+  accessToken: string | undefined,
+  projectId: string | undefined,
+  fetchImpl: typeof fetch = proxiedFetch,
+): Promise<AgyModelListing> {
+  if (!accessToken) {
+    return { models: catalogModelList(), geminiQuota: null, quotaSourceAvailable: false }
+  }
+  try {
+    const dynamic = await fetchAvailableModels(accessToken, projectId, fetchImpl)
+    const merged = mergeModelCatalog(dynamic)
+    return {
+      models: merged.length > 0 ? merged : catalogModelList(),
+      geminiQuota: geminiQuotaFromDiscoveredModels(dynamic),
+      quotaSourceAvailable: true,
+    }
+  } catch {
+    return { models: catalogModelList(), geminiQuota: null, quotaSourceAvailable: false }
+  }
+}
+
 /** Adapter-facing listing: dynamic first, catalog fallback. */
 export async function listAgyModels(
   accessToken: string | undefined,
   projectId: string | undefined,
   fetchImpl: typeof fetch = proxiedFetch,
 ): Promise<readonly LlmModelInfo[]> {
-  if (!accessToken) return catalogModelList()
-  try {
-    const dynamic = await fetchAvailableModels(accessToken, projectId, fetchImpl)
-    const merged = mergeModelCatalog(dynamic)
-    return merged.length > 0 ? merged : catalogModelList()
-  } catch {
-    return catalogModelList()
-  }
+  return (await listAgyModelListing(accessToken, projectId, fetchImpl)).models
 }
 
 /** Resolve one exact model's metadata (catalog-backed; dynamic ids pass through). */

@@ -29,6 +29,7 @@ import {
 } from '../src/client/quota-view.ts'
 import { zh } from '../src/client/locales.ts'
 import { SOFT_QUOTA_THRESHOLD, WEEKLY_QUOTA_THRESHOLD } from '../src/runtime/rotation.ts'
+import { displayGeminiQuota } from '../src/quota-display.ts'
 import type { AccountView } from '../src/rpc-contract.ts'
 import type { QuotaGroup, QuotaWindow } from '../src/types.ts'
 
@@ -251,6 +252,22 @@ describe('badge window selection', () => {
     expect(quota).toEqual({ percent: 30, window: '5h' })
   })
 
+  it('ignores third-party limits and reads only the Gemini group', () => {
+    const quota = pickBadgeQuota([account({
+      limits: [
+        group('Claude and GPT models', [window('3p-5h', '5h', 0.01)]),
+        group('Gemini Models', [window('gemini-5h', '5h', 0.97)]),
+      ],
+    })], NOW)
+    expect(quota).toEqual({ percent: 97, window: '5h' })
+  })
+
+  it('reports no badge reading or cards for a third-party-only snapshot', () => {
+    const current = account({ limits: [group('Claude and GPT models', [window('3p-5h', '5h', 0.4)])] })
+    expect(pickBadgeQuota([current], NOW)).toBeNull()
+    expect(buildQuotaCards(current, t, NOW)).toEqual([])
+  })
+
   it('skips a leading group with no tracked window instead of ending the search', () => {
     const quota = pickBadgeQuota([account({
       limits: [
@@ -269,15 +286,62 @@ describe('quota cards', () => {
       limits: [group('Empty', []), group('Gemini Models', [window('h', '5h', 0.5)])],
     }), t, NOW)
     expect(cards).toHaveLength(1)
-    expect(cards[0]?.title).toBe('Gemini Models')
+    expect(cards[0]?.title).toBe(zh.quotaGroupGemini)
   })
 
-  it('keeps upstream group order and falls back for an unnamed group', () => {
+  it('keeps only Gemini groups and localizes their title', () => {
     const cards = buildQuotaCards(account({
-      limits: [group('', [window('h', '5h', 0.5)]), group('Claude and GPT models', [window('c', 'weekly', 0.5)])],
+      limits: [
+        group('Claude and GPT models', [window('3p-weekly', 'weekly', 0.5)]),
+        group('', [window('gemini-5h', '5h', 0.5)]),
+      ],
     }), t, NOW)
-    expect(cards.map((card) => card.title)).toEqual([zh.quotaGroupFallback, 'Claude and GPT models'])
+    expect(cards.map((card) => card.title)).toEqual([zh.quotaGroupGemini])
     expect(cards[0]?.key).toBe('group-0')
+  })
+
+  it('builds the Gemini 5h card and countdown from cached model quota', () => {
+    const displayed = displayGeminiQuota(
+      [group('Claude and GPT models', [window('3p-5h', '5h', 0.4)])],
+      at(-20),
+      { remainingFraction: 0.97, resetTime: at(65), updatedAt: NOW },
+    )
+    const current = account({ limits: displayed.groups, limitsUpdatedAt: displayed.updatedAt })
+    const cards = buildQuotaCards(current, t, NOW)
+
+    expect(cards).toHaveLength(1)
+    expect(cards[0]?.title).toBe(zh.quotaGroupGemini)
+    expect(cards[0]?.windows[0]?.percent).toBe(97)
+    expect(cards[0]?.windows[0]?.reset).toBe(
+      zh.quotaResetIn.replace('{value}', zh.relHoursMinutes.replace('{h}', '1').replace('{m}', '5')),
+    )
+    expect(JSON.stringify(cards)).not.toContain('Claude')
+  })
+
+  it('fills a missing Gemini 5h window without replacing grouped weekly data', () => {
+    const groups = [group('Gemini Models', [window('gemini-weekly', 'weekly', 0.71)])]
+    const displayed = displayGeminiQuota(
+      groups,
+      NOW - 60_000,
+      { remainingFraction: 0.97, resetTime: at(65), updatedAt: NOW },
+    )
+    expect(displayed.groups?.[0]?.windows.map((entry) => [entry.window, entry.remainingFraction])).toEqual([
+      ['weekly', 0.71],
+      ['5h', 0.97],
+    ])
+    expect(displayed.updatedAt).toBe(NOW - 60_000)
+    expect(groups[0]?.windows).toHaveLength(1)
+  })
+
+  it('keeps the real grouped rolling window when model quota differs', () => {
+    const groups = [group('Gemini Models', [window('gemini-5h', '5h', 0.63)])]
+    const displayed = displayGeminiQuota(groups, NOW - 60_000, {
+      remainingFraction: 0.97,
+      resetTime: at(65),
+      updatedAt: NOW,
+    })
+    expect(displayed.groups).toEqual(groups)
+    expect(displayed.updatedAt).toBe(NOW - 60_000)
   })
 
   it('withholds the figure of a stale row and explains why', () => {
@@ -397,5 +461,3 @@ describe('refresh policy', () => {
     })).toBe('auto')
   })
 })
-
-

@@ -10,7 +10,7 @@ import { MultimodalConfigStore } from '../src/multimodal-config.ts'
 import { UiPrefsStore } from '../src/ui-prefs.ts'
 import type { AccountStore } from '../src/store/accounts.ts'
 import type { AgySessionManager } from '../src/session.ts'
-import type { AccountStorageV4, ManagedAccount } from '../src/types.ts'
+import type { AccountStorageV4, GeminiModelQuotaSnapshot, ManagedAccount } from '../src/types.ts'
 
 function account(overrides: Partial<ManagedAccount> = {}): ManagedAccount {
   return { refresh: 'refresh-a', addedAt: 1, lastUsed: 1, email: 'a@x.com', ...overrides }
@@ -59,6 +59,7 @@ function makeHarness(options: {
   inFlight?: Array<{ index: number, email: string | null, count: number }>
   /** What the session's burn-rate snapshot reports (defaults to none). */
   limitBurn?: Array<{ index: number, perHour: Record<string, number> }>
+  cachedGeminiQuota?: GeminiModelQuotaSnapshot | null
   baseUrl?: () => string
 } = {}): Harness {
   const accounts = options.accounts ?? [account()]
@@ -150,6 +151,8 @@ function makeHarness(options: {
       { id: 'model-a', name: 'Model A' },
       { id: 'model-b', name: 'Model B' },
     ],
+    peekCachedGeminiQuota: () => options.cachedGeminiQuota ?? null,
+    getCachedGeminiQuota: async () => options.cachedGeminiQuota ?? null,
     baseUrl: options.baseUrl ?? (() => 'http://127.0.0.1:3080'),
   })
   // A getter, not a copied primitive: the counter changes after this return.
@@ -274,11 +277,22 @@ describe('agy management RPC', () => {
   it('carries the burn rates on the limits reply, per index', async () => {
     // The rate only exists after the sampling path has seen two probes; the
     // reply degrades to null rather than failing when the session has none.
-    const withRate = makeHarness({ limitBurn: [{ index: 0, perHour: { 'g-5h': 0.02 } }] })
+    const withRate = makeHarness({
+      accounts: [account({
+        cachedLimits: {
+          updatedAt: 1_700_000_000_000,
+          groups: [{
+            name: 'Gemini Models',
+            windows: [{ bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.5, resetTime: null }],
+          }],
+        },
+      })],
+      limitBurn: [{ index: 0, perHour: { 'gemini-5h': 0.02, '3p-5h': 0.04 } }],
+    })
     const result = await withRate.management.call('account.limits', {}) as {
       limits: Array<{ burn: Record<string, number> | null }>
     }
-    expect(result.limits[0]?.burn).toEqual({ 'g-5h': 0.02 })
+    expect(result.limits[0]?.burn).toEqual({ 'gemini-5h': 0.02 })
 
     const withoutRate = makeHarness()
     const plain = await withoutRate.management.call('account.limits', {}) as {
@@ -333,6 +347,67 @@ describe('agy management RPC', () => {
     expect(after.accounts[0]?.limits?.[0]?.windows.map((w) => w.window)).toEqual(['5h', 'weekly'])
     expect(after.accounts[0]?.limits?.[0]?.windows[0]?.remainingFraction).toBe(0.16)
     expect(after.accounts[0]?.limitsUpdatedAt).toBe(1_700_000_000_000)
+  })
+
+  it('projects cached Gemini model quota without changing the grouped runtime cache', async () => {
+    const groupedLimits = {
+      updatedAt: 1_700_000_000_000,
+      groups: [{
+        name: 'Claude and GPT models',
+        windows: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 0.2, resetTime: '2026-10-31T23:05:00Z' }],
+      }],
+    }
+    const snapshot = {
+      remainingFraction: 0.97,
+      resetTime: '2026-10-31T23:05:00Z',
+      updatedAt: 1_798_000_000_000,
+    }
+    const harness = makeHarness({
+      accounts: [account({ cachedLimits: groupedLimits })],
+      cachedGeminiQuota: snapshot,
+    })
+    const listed = await harness.management.call('account.list', {}) as {
+      accounts: Array<{ limits: Array<{ name: string }> | null, limitsUpdatedAt: number | null }>
+    }
+    expect(listed.accounts[0]).toMatchObject({
+      limits: [{ name: 'Gemini Models' }],
+      limitsUpdatedAt: snapshot.updatedAt,
+    })
+
+    const result = await harness.management.call('account.limits', {}) as {
+      limits: Array<{ groups: Array<{ name: string, windows: Array<{ remainingFraction: number, resetTime: string }> }> | null, updatedAt: number | null }>
+    }
+    expect(result.limits[0]).toMatchObject({
+      updatedAt: snapshot.updatedAt,
+      groups: [{
+        name: 'Gemini Models',
+        windows: [{
+          bucketId: 'gemini-models-5h',
+          window: '5h',
+          remainingFraction: 0.97,
+          resetTime: snapshot.resetTime,
+        }],
+      }],
+    })
+    expect((await harness.store.load()).accounts[0]?.cachedLimits).toEqual(groupedLimits)
+  })
+
+  it('hides third-party limits when no cached Gemini quota exists', async () => {
+    const harness = makeHarness({
+      accounts: [account({
+        cachedLimits: {
+          updatedAt: 1_700_000_000_000,
+          groups: [{
+            name: 'Claude and GPT models',
+            windows: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 0.2, resetTime: null }],
+          }],
+        },
+      })],
+    })
+    const result = await harness.management.call('account.limits', {}) as {
+      limits: Array<{ groups: unknown, updatedAt: number | null }>
+    }
+    expect(result.limits[0]).toMatchObject({ groups: null, updatedAt: null })
   })
 
   it('validates the account index on mutating calls', async () => {

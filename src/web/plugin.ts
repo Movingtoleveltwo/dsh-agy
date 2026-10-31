@@ -195,6 +195,8 @@ async function registerAgyWeb(ctx: Context, webServer: WebServerLike): Promise<(
     // The adapter's *unfiltered* catalog, so a hidden model still appears in
     // the settings list alongside the switch that un-hides it.
     listAllModels: () => adapter.listAllModels(),
+    peekCachedGeminiQuota: (account) => adapter.peekCachedGeminiQuotaFor(account),
+    getCachedGeminiQuota: (account) => adapter.cachedGeminiQuotaFor(account),
     // Activating an account can switch the account model discovery rides; the
     // cache carries no account key, so the RPC drops it (see
     // `AgyAdapter.invalidateModelCache`).
@@ -360,4 +362,3 @@ function isFailure(value: unknown): value is {
 }
 
 export { createOpenAiRelayHandler } from './openai-relay.js'
-

@@ -23,6 +23,7 @@
 import { QUOTA_WINDOWS, type QuotaGroup, type QuotaWindow } from '../types.ts'
 import { SOFT_QUOTA_THRESHOLD, WEEKLY_QUOTA_THRESHOLD, parseFutureResetMs } from '../runtime/rotation.ts'
 import type { AccountView } from '../rpc-contract.ts'
+import { filterGeminiQuotaGroups, isGeminiQuotaGroup } from '../quota-display.ts'
 import type { AgyLocaleKey } from './locales.ts'
 import { aliasVar } from './styles.ts'
 
@@ -62,10 +63,10 @@ export interface QuotaWindowRow {
   stale: boolean
 }
 
-/** One rendered group card. */
+/** One rendered Gemini quota card. */
 export interface QuotaCard {
   key: string
-  /** Upstream's own group label (e.g. `Gemini Models`). */
+  /** Localized Gemini quota label. */
   title: string
   windows: QuotaWindowRow[]
 }
@@ -101,6 +102,11 @@ export function stateLabel(state: AccountView['state'], t: QuotaTranslate): stri
     case 'verification-required': return t('stateVerificationRequired')
     case 'disabled': return t('stateDisabled')
   }
+}
+
+export function quotaGroupTitle(group: QuotaGroup, t: QuotaTranslate): string {
+  if (isGeminiQuotaGroup(group)) return t('quotaGroupGemini')
+  return group.name || t('quotaGroupFallback')
 }
 
 /**
@@ -290,14 +296,13 @@ function windowPressure(window: QuotaWindow, now: number): number | null {
  * groups would blend one budget with another. Within that group the window with
  * the smallest threshold multiple wins.
  *
- * Deliberately no family inference here (the badge used to match group names
- * against `/gemini/`): upstream's grouping is a payload detail, and the pool's
- * own family mapping lives in `runtime/quota.ts`, which the browser bundle does
- * not carry.
+ * The presentation filter keeps the badge scoped to Gemini even if an RPC
+ * caller passes unfiltered upstream groups.
  */
 export function pickBadgeWindow(limits: readonly QuotaGroup[] | null | undefined, now: number): QuotaWindow | null {
   if (!limits || limits.length === 0) return null
-  for (const group of limits) {
+  const groups = filterGeminiQuotaGroups(limits)
+  for (const group of groups) {
     const candidates = rotationWindows(group)
     if (candidates.length === 0) continue
     let best: QuotaWindow | null = null
@@ -319,7 +324,7 @@ export function pickBadgeWindow(limits: readonly QuotaGroup[] | null | undefined
   // No group reports a window we block on: the shortest window that is still
   // live is the best remaining proxy, so an upstream window vocabulary added
   // later still yields a number instead of a fallback count.
-  for (const group of limits) {
+  for (const group of groups) {
     const usable = sortWindows(group.windows).filter((window) => !windowIsStale(window, now))
     const first = usable[0]
     if (first !== undefined) return first
@@ -365,18 +370,13 @@ export function windowRows(
 }
 
 /**
- * Build the quota cards for one account.
- *
- * One card per upstream group, exactly as the group arrived: the grouped
- * windows are the only quota channel this plugin has now, and upstream's own
- * split ("Gemini Models" / "Claude and GPT models") cannot be re-derived from
- * model-id prefixes — `3p-*` covers Claude AND GPT.
+ * Build the Gemini quota cards for one account.
  *
  * A group whose windows all turned out to be unusable would render as an empty
  * card that pushes a real one off screen, so those are dropped.
  */
 export function buildQuotaCards(account: AccountView | undefined, t: QuotaTranslate, now: number): QuotaCard[] {
-  const groups = account?.limits
+  const groups = filterGeminiQuotaGroups(account?.limits)
   if (!groups || groups.length === 0) return []
   const cards: QuotaCard[] = []
   for (const group of groups) {
@@ -384,7 +384,7 @@ export function buildQuotaCards(account: AccountView | undefined, t: QuotaTransl
     if (rows.length === 0) continue
     cards.push({
       key: group.name || `group-${cards.length}`,
-      title: group.name || t('quotaGroupFallback'),
+      title: quotaGroupTitle(group, t),
       windows: rows,
     })
   }

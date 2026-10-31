@@ -136,6 +136,12 @@ export interface QuotaGroup {
   windows: QuotaWindow[]
 }
 
+export interface GeminiModelQuotaSnapshot {
+  remainingFraction: number
+  resetTime: string | null
+  updatedAt: number
+}
+
 /**
  * The grouped 5-hour / weekly windows, cached per account.
  *

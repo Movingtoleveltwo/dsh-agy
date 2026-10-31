@@ -21,7 +21,7 @@ import type {
 } from '@deepseek-ai/dsh-llm'
 
 import { AgyAuthError, AgyPoolBlockedError } from '../types.ts'
-import type { AgyAccountSession, FailureKind, ManagedAccount, OAuthAuthDetails } from '../types.ts'
+import type { AgyAccountSession, FailureKind, GeminiModelQuotaSnapshot, ManagedAccount, OAuthAuthDetails } from '../types.ts'
 import type { RateLimitCategory } from '../runtime/classify.ts'
 import { fetchAgyFirstOk } from '../oauth/constants.ts'
 import {
@@ -43,7 +43,7 @@ import { toAgyRequestBody } from './translate.ts'
 import type { AgyResolvedImage } from './translate.ts'
 import { resolveMultimodalFiles } from './multimodal.ts'
 import { AgyStreamIdleTimeoutError, parseAgySse, UnmappedFinishReasonError } from './parse.ts'
-import { AGY_PROVIDER, catalogModelList, listAgyModels, resolveAgyModel } from './models.ts'
+import { AGY_PROVIDER, catalogModelList, listAgyModelListing, resolveAgyModel } from './models.ts'
 
 export type { AgyAccountSession }
 
@@ -244,6 +244,7 @@ export class AgyAdapter extends LlmAdapter {
   private readonly options: AgyAdapterOptions
   private readonly memoryImages = new Map<string, AgyResolvedImage>()
   private cachedModels: { models: readonly LlmModelInfo[]; at: number } | null = null
+  private cachedGeminiQuota: { accountKey: string; snapshot: GeminiModelQuotaSnapshot } | null = null
   private inFlightModels: Promise<readonly LlmModelInfo[]> | null = null
 
   constructor(options: AgyAdapterOptions) {
@@ -316,9 +317,19 @@ export class AgyAdapter extends LlmAdapter {
         // Model discovery is account-scoped: route it through the account's proxy
         // (control-plane class, so the standard timeouts apply).
         const routing = { proxyUrl: session?.account.proxy }
-        const models = await listAgyModels(session?.auth.access, session?.account.projectId, accountFetch(routing))
-        this.cachedModels = { models, at: Date.now() }
-        return models
+        const listing = await listAgyModelListing(
+          session?.auth.access,
+          session?.account.projectId,
+          accountFetch(routing),
+        )
+        const accountKey = session?.account.email ?? session?.account.id ?? null
+        if (listing.quotaSourceAvailable) {
+          this.cachedGeminiQuota = accountKey !== null && listing.geminiQuota !== null
+            ? { accountKey, snapshot: listing.geminiQuota }
+            : null
+        }
+        this.cachedModels = { models: listing.models, at: Date.now() }
+        return listing.models
       } catch (error) {
         if (error instanceof AgyPoolBlockedError || error instanceof AgyAuthError) {
           return catalogModelList()
@@ -346,6 +357,17 @@ export class AgyAdapter extends LlmAdapter {
    */
   invalidateModelCache(): void {
     this.cachedModels = null
+  }
+
+  async cachedGeminiQuotaFor(account: ManagedAccount): Promise<GeminiModelQuotaSnapshot | null> {
+    if (this.inFlightModels) await this.inFlightModels.catch(() => undefined)
+    return this.peekCachedGeminiQuotaFor(account)
+  }
+
+  peekCachedGeminiQuotaFor(account: ManagedAccount): GeminiModelQuotaSnapshot | null {
+    const accountKey = account.email ?? account.id ?? null
+    if (accountKey === null || this.cachedGeminiQuota?.accountKey !== accountKey) return null
+    return this.cachedGeminiQuota.snapshot
   }
 
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {

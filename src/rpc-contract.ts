@@ -80,17 +80,10 @@ export interface AccountView {
   /** Masked proxy (`protocol//host:port`), never credentials. */
   proxy: string | null
   /**
-   * Grouped 5-hour / weekly windows for this account, or null when not yet
-   * measured.
-   *
-   * These are upstream's per-GROUP windows (Gemini vs Claude+GPT), from
-   * `retrieveUserQuotaSummary` — a different endpoint from the per-model
-   * `quotaInfo` that feeds rotation. They are refreshed by a SEPARATE call
-   * (`account.limits`, backed by `session.refreshLimits`) rather than riding the
-   * scheduling quota refresh: that one is skipped for a solo pool because writing
-   * its cache can block the only account, which is exactly why the windows are
-   * fetched on a path that touches `cachedLimits` alone. So this arrives on its
-   * own request, not with `account.list`.
+   * Gemini-only display projection, or null when not yet measured. It prefers
+   * Gemini groups from `retrieveUserQuotaSummary`, then falls back to the
+   * account-matched model-discovery cache. Third-party groups never cross this
+   * view boundary; neither source writes synthetic data to `cachedLimits`.
    */
   limits: QuotaGroup[] | null
   /** When `limits` was measured (Unix ms), or null when never. */
@@ -248,13 +241,15 @@ export interface AgyRpcMethods {
   'account.verify': { payload: { index: number }; result: { ok: boolean; email?: string; error?: string } }
   'account.health': { payload: { indices?: number[] }; result: { results: unknown[] } }
   /**
-   * Refresh and return the 5h/weekly windows for every enabled account.
+   * Refresh and return the Gemini-only quota view for enabled accounts.
    *
    * Separate from `account.list` because that reply is deliberately probe-free;
    * the client renders the list immediately and merges these in on arrival.
    * Server-side this is TTL-gated, so it does not re-probe per view. It works for
    * a pool of ANY size — including a single account, which the scheduling quota
-   * refresh skips (measuring that one could block the only account).
+   * refresh skips (measuring that one could block the only account). When the
+   * grouped endpoint omits Gemini, the display may use the already-cached model
+   * discovery snapshot; this does not modify runtime quota state.
    */
   'account.limits': {
     /**

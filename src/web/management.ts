@@ -21,6 +21,8 @@ import { AGY_PROVIDER } from '../adapter/models.ts'
 import type { DiscoveredModelEntry } from '../adapter/models.ts'
 import { clearExpiredState } from '../runtime/rotation.ts'
 import { foldWindowBreakdown } from '../stats.ts'
+import { displayGeminiQuota } from '../quota-display.ts'
+import type { GeminiModelQuotaSnapshot, ManagedAccount } from '../types.ts'
 import { THINKING_BUDGET_MAX, THINKING_BUDGET_MIN } from '../thinking-budget.ts'
 import { CLAUDE_BUDGET_MAX, CLAUDE_BUDGET_MIN } from '../thinking-types.ts'
 import { dayKey } from '../stats.ts'
@@ -95,8 +97,10 @@ export interface AgyManagementOptions {
    * A function rather than the adapter itself so this module depends on the one
    * capability it needs. It must not be `llm.listModels()`, which already has
    * the hidden set applied — see the `model.list` handler.
-   */
+  */
   listAllModels: () => Promise<readonly { id: string; name: string }[]>
+  peekCachedGeminiQuota: (account: ManagedAccount) => GeminiModelQuotaSnapshot | null
+  getCachedGeminiQuota: (account: ManagedAccount) => Promise<GeminiModelQuotaSnapshot | null>
   /**
    * Drop the adapter's cached model list.
    *
@@ -212,6 +216,11 @@ export function createAgyManagement(options: AgyManagementOptions): AgyManagemen
             ? 'cooling'
             : 'active'
       const key = account.email ?? account.id
+      const quotaView = displayGeminiQuota(
+        account.cachedLimits?.groups,
+        account.cachedLimits?.updatedAt,
+        options.peekCachedGeminiQuota(account),
+      )
       rows.push({
         index,
         email: account.email ?? null,
@@ -253,24 +262,16 @@ export function createAgyManagement(options: AgyManagementOptions): AgyManagemen
           : null,
         fingerprintHistory: (account.fingerprintHistory ?? []).length,
         proxy: account.proxy ? maskProxyUrl(account.proxy) : null,
-        // Read from the cache the session manager already refreshes alongside the
-        // per-model quota, so showing the windows costs no request. Null means
-        // "never measured" and renders as an explicit placeholder rather than a
-        // zero, which would read as an exhausted account.
-        limits: account.cachedLimits?.groups ?? null,
-        limitsUpdatedAt: account.cachedLimits?.updatedAt ?? null,
+        limits: quotaView.groups,
+        limitsUpdatedAt: quotaView.updatedAt,
         // The burn rate arrives via `account.limits` (it exists only after the
         // sampling path has run twice); `account.list` stays probe-free.
         limitBurn: null,
         usage: key === undefined ? null : toAccountUsageView(ledger.accounts[key]),
       })
     }
-    // Per-model quota is deliberately NOT fetched here (nor anywhere else): it
-    // costs an upstream round trip, and embedding it in this reply once meant the
-    // accounts list could not render until that probe finished — on a slow
-    // network the panel showed "no accounts" behind a permanent spinner,
-    // indistinguishable from data loss. The grouped 5h/weekly windows are the
-    // surviving quota display, and they arrive via `account.limits`.
+    // `account.list` remains probe-free. `account.limits` may supplement the
+    // grouped cache from model discovery that already ran through the adapter.
     return rows
   }
 
@@ -401,11 +402,23 @@ export function createAgyManagement(options: AgyManagementOptions): AgyManagemen
       const burn = await sessions.limitBurnRates().catch(() => [])
       const burnByIndex = new Map(burn.map((entry) => [entry.index, entry.perHour]))
       return {
-        limits: fresh.accounts.map((account, index) => ({
-          index,
-          groups: account.cachedLimits?.groups ?? null,
-          updatedAt: account.cachedLimits?.updatedAt ?? null,
-          burn: burnByIndex.get(index) ?? null,
+        limits: await Promise.all(fresh.accounts.map(async (account, index) => {
+          const modelQuota = await options.getCachedGeminiQuota(account).catch(() => null)
+          const quotaView = displayGeminiQuota(
+            account.cachedLimits?.groups,
+            account.cachedLimits?.updatedAt,
+            modelQuota,
+          )
+          const visibleBuckets = new Set(quotaView.groups?.flatMap((group) => group.windows.map((window) => window.bucketId)) ?? [])
+          const sampledBurn = burnByIndex.get(index)
+          const visibleBurn = sampledBurn === undefined
+            ? null
+            : Object.fromEntries(Object.entries(sampledBurn).filter(([bucketId]) => visibleBuckets.has(bucketId)))
+          return {
+            index,
+            ...quotaView,
+            burn: visibleBurn !== null && Object.keys(visibleBurn).length > 0 ? visibleBurn : null,
+          }
         })),
         measured: result.measured.length,
         failed: result.failed.length,
