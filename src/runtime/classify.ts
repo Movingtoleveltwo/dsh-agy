@@ -34,18 +34,18 @@ export interface ClassifiedError {
  * permission error is not mistaken for a recoverable challenge — the cost of a
  * false positive is a healthy account parked behind a timed block.
  */
-const VERIFICATION_PHRASES = [
-  'validation_required',
-  'verify your account',
-  'verification required',
-  'verification_required',
-] as const
-
-/** Whether a 403 body asks the account owner to verify rather than meaning dead credentials. */
+/** Only a structured upstream challenge may grant verification-state write access. */
 export function isVerificationRequired(bodyText: string | undefined): boolean {
   if (!bodyText) return false
-  const text = bodyText.toLowerCase()
-  return VERIFICATION_PHRASES.some((phrase) => text.includes(phrase))
+  try {
+    const data = JSON.parse(bodyText) as { error?: Record<string, unknown> }
+    const error = data.error
+    if (!error || typeof error !== 'object') return false
+    const values = [error.status, error.message, error.code]
+    return values.some((value) => typeof value === 'string' && value.toUpperCase() === 'VALIDATION_REQUIRED')
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -92,31 +92,20 @@ export function extractVerificationUrl(bodyText: string | undefined): string | u
  */
 export type RateLimitCategory = 'soft_rate_limit' | 'rate_limited' | 'quota_exhausted' | 'unknown'
 
-const QUOTA_EXHAUSTED_KEYWORDS = [
-  'quota_exhausted',
-  'quota exhausted',
-  'quota reached',
-  'enable overages',
-  'individual quota',
-]
-
 /** Classify a 429 body into the four upstream categories. */
 export function classifyRateLimit(
   bodyText: string | undefined,
   retryAfterMs: number | undefined,
 ): RateLimitCategory {
-  const text = (bodyText ?? '').toLowerCase()
-  if (QUOTA_EXHAUSTED_KEYWORDS.some((keyword) => text.includes(keyword))) {
-    return 'quota_exhausted'
-  }
   if (retryAfterMs !== undefined && retryAfterMs < 3000) {
     return 'soft_rate_limit'
   }
   if (retryAfterMs !== undefined) {
     return 'rate_limited'
   }
-  // No explicit retry hint: "quota" wording → daily quota, otherwise unknown.
-  return text.includes('quota') || text.includes('resource_exhausted') ? 'quota_exhausted' : 'unknown'
+  // Error wording is not balance evidence. Hard exhaustion is promoted only by
+  // the request path when a matching model-family bucket is exactly zero.
+  return 'unknown'
 }
 
 const RATE_LIMIT_RESET_FIELDS = ['resetTime', 'reset_time', 'resetAt', 'quotaResetTime'] as const
@@ -171,7 +160,8 @@ export function classifyHttpError(
     }
   }
   if (status === 401) {
-    return { kind: 'auth-failure', status, message: bodyText ? bodyText.slice(0, 200) : undefined }
+    // Generation endpoint rejection is not OAuth refresh-token revocation.
+    return { kind: 'transient', status, message: bodyText ? bodyText.slice(0, 200) : undefined }
   }
   if (status === 403) {
     // A verification wall is its own signal, checked BEFORE the auth-failure
@@ -187,20 +177,9 @@ export function classifyHttpError(
         message: bodyText ? bodyText.slice(0, 200) : undefined,
       }
     }
-    // Google also reports quota walls as 403 RESOURCE_EXHAUSTED, and the
-    // endpoint fallback chain ends on hosts answering 403 for "no license"
-    // (not bad auth). Only treat a 403 as auth-failure when the body carries
-    // no quota wording — a false revoke permanently disables the account.
-    const category = classifyRateLimit(bodyText, undefined)
-    if (category === 'quota_exhausted') {
-      return {
-        kind: 'rate-limit',
-        rateLimitCategory: category,
-        status,
-        message: bodyText ? bodyText.slice(0, 200) : undefined,
-      }
-    }
-    return { kind: 'auth-failure', status, message: bodyText ? bodyText.slice(0, 200) : undefined }
+    // A normal 403 is endpoint/permission scope, not proof that OAuth credentials
+    // were revoked. Only a structured validation challenge above is account state.
+    return { kind: 'transient', status, message: bodyText ? bodyText.slice(0, 200) : undefined }
   }
   if (status === 404) {
     // Model/route missing — nothing to rotate for; surface as transient request error.
@@ -358,8 +337,8 @@ export function describeFetchError(error: unknown): string {
  */
 export function classifyFetchError(error: unknown, routing?: AccountRouting): ClassifiedError {
   const message = describeFetchError(error)
-  if (error instanceof DOMException && error.name === 'AbortError') {
-    return { kind: 'network-error', message }
+  if ((error instanceof DOMException || error instanceof Error) && error.name === 'AbortError') {
+    return { kind: 'request-error', message }
   }
   // A tagged error is a definite proxy verdict (fast-fail pre-check, or a
   // dispatcher failure), so it stays authoritative in either context.

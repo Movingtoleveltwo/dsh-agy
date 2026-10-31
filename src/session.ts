@@ -1183,6 +1183,10 @@ export class AgySessionManager {
     },
   ): Promise<void> {
     if (!session?.account) return
+    // Transport failures and caller cancellations have no account-state write
+    // authority. Do not even enter the store transaction (which persists).
+    if (kind === 'network-error' || kind === 'proxy-unreachable' || kind === 'request-error'
+      || (kind === 'rate-limit' && info?.rateLimitCategory === 'soft_rate_limit')) return
     const key = this.accountKey(session.account)
     const consecutive = (this.failureCounts.get(key) ?? 0) + 1
     this.failureCounts.set(key, consecutive)

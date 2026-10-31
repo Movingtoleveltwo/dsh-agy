@@ -31,6 +31,7 @@ import {
   isSessionAccumulationOverflow,
 } from '../runtime/classify.ts'
 import { accountFetch } from '../proxy.ts'
+import { familyKeyOf } from '../runtime/quota.ts'
 import {
   bumpSessionGeneration,
   currentSessionGeneration,
@@ -604,6 +605,46 @@ export class AgyAdapter extends LlmAdapter {
 
       if (!response.ok) {
         const classified = classifyHttpError(response.status, response.headers, bodyText)
+        // Text such as RESOURCE_EXHAUSTED is not proof of a drained bucket. A
+        // hard handoff requires a recent, exact-zero observation for this model's
+        // own family; missing/stale/other-family data remains a retryable 429.
+        if (response.status === 429 && classified.kind === 'rate-limit') {
+          const family = familyKeyOf(options.model)
+          const now = Date.now()
+          const fresh = (observedAt: number | undefined): boolean =>
+            typeof observedAt === 'number' && now - observedAt >= 0 && now - observedAt <= 5 * 60_000
+          const resetIsPresent = (resetTime: string | null | undefined): boolean =>
+            typeof resetTime === 'string' && resetTime.length > 0
+          const cachedQuota = session.account.cachedQuota?.[family]
+          const quotaFresh = fresh(session.account.cachedQuotaUpdatedAt)
+          const cachedQuotaZero = family !== 'unknown' && quotaFresh && (
+            cachedQuota?.remainingFraction === 0
+            || (typeof cachedQuota?.weeklyFraction === 'number'
+              && cachedQuota.weeklyFraction <= 0.005
+              && resetIsPresent(cachedQuota.weeklyResetTime))
+          )
+          const matchesFamily = (name: string): boolean => {
+            const label = name.toLowerCase()
+            if (family === 'google') return label.includes('gemini') || label.includes('google')
+            if (family === 'anthropic' || family === 'openai') {
+              return label.includes('claude') || label.includes('gpt') || label.includes('3p')
+            }
+            return false
+          }
+          const limits = session.account.cachedLimits
+          const limitsZero = fresh(limits?.updatedAt) && (limits?.groups ?? [])
+            .filter((group) => matchesFamily(group.name))
+            .some((group) => group.windows.some((window) =>
+              window.remainingFraction === 0
+              || (window.window.toLowerCase() === 'weekly'
+                && typeof window.remainingFraction === 'number'
+                && window.remainingFraction <= 0.005
+                && resetIsPresent(window.resetTime)),
+            ))
+          const zero = cachedQuotaZero || limitsZero
+          if (zero) classified.rateLimitCategory = 'quota_exhausted'
+          else if (classified.rateLimitCategory !== 'rate_limited') classified.rateLimitCategory = 'soft_rate_limit'
+        }
         await this.options.reportFailure(classified.kind, session, {
           retryAfterMs: classified.retryAfterMs,
           status: response.status,
@@ -786,7 +827,7 @@ export class AgyAdapter extends LlmAdapter {
         this.recordUsage(session, options.model, { ok: true, usage, ttftMs }, attemptStartedAt)
         return
       } catch (error) {
-        if (error instanceof DOMException && error.name === 'AbortError') {
+        if ((error instanceof DOMException || error instanceof Error) && error.name === 'AbortError') {
           this.recordUsage(session, options.model, { ok: false, reason: 'aborted', usage }, attemptStartedAt)
           await response.body?.cancel().catch(() => {})
           throw new LlmError('agy stream aborted', 'ABORTED', { cause: error })

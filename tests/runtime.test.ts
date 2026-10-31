@@ -70,7 +70,7 @@ describe('classifyHttpError', () => {
 
   it('sub-classifies 429 bodies into quota/soft/rate categories', () => {
     const quota = classifyHttpError(429, new Headers(), JSON.stringify({ error: { message: 'Individual quota reached. Contact your administrator to enable overages.' } }))
-    expect(quota.rateLimitCategory).toBe('quota_exhausted')
+    expect(quota.rateLimitCategory).toBe('unknown')
     const soft = classifyHttpError(429, new Headers({ 'retry-after': '1' }), '{}')
     expect(soft.rateLimitCategory).toBe('soft_rate_limit')
     const rate = classifyHttpError(429, new Headers({ 'retry-after': '120' }), '{}')
@@ -78,24 +78,23 @@ describe('classifyHttpError', () => {
     const unknown = classifyHttpError(429, new Headers(), '{}')
     expect(unknown.rateLimitCategory).toBe('unknown')
     const resource = classifyHttpError(429, new Headers(), JSON.stringify({ error: { status: 'RESOURCE_EXHAUSTED' } }))
-    expect(resource.rateLimitCategory).toBe('quota_exhausted')
+    expect(resource.rateLimitCategory).toBe('unknown')
   })
 
-  it('classifies 401 and plain 403 as auth-failure', () => {
-    expect(classifyHttpError(401, new Headers()).kind).toBe('auth-failure')
-    expect(classifyHttpError(403, new Headers()).kind).toBe('auth-failure')
+  it('does not treat generation 401 or ordinary 403 as OAuth revocation', () => {
+    expect(classifyHttpError(401, new Headers()).kind).toBe('transient')
+    expect(classifyHttpError(403, new Headers()).kind).toBe('transient')
   })
 
-  it('classifies 403 quota walls (RESOURCE_EXHAUSTED) as rate-limit', () => {
+  it('classifies 403 quota walls (RESOURCE_EXHAUSTED) as transient', () => {
     const quota = classifyHttpError(
       403,
       new Headers(),
       JSON.stringify({ error: { status: 'RESOURCE_EXHAUSTED', message: 'Individual quota reached.' } }),
     )
-    expect(quota.kind).toBe('rate-limit')
-    expect(quota.rateLimitCategory).toBe('quota_exhausted')
+    expect(quota.kind).toBe('transient')
     const plain = classifyHttpError(403, new Headers(), '{"error":"access_denied"}')
-    expect(plain.kind).toBe('auth-failure')
+    expect(plain.kind).toBe('transient')
   })
 
   it('separates a verification challenge from dead credentials', () => {
@@ -113,13 +112,13 @@ describe('classifyHttpError', () => {
     expect(challenge.kind).toBe('verification-required')
     expect(challenge.verificationUrl).toBe('https://accounts.google.com/verify?token=abc')
 
-    // A genuine ban is still terminal.
+    // In generation path, plain 403 including suspension messages are treated as transient (疑罪从无); true credential revocation is strictly guarded by OAuth refresh invalid_grant.
     const banned = classifyHttpError(
       403,
       new Headers(),
       '{"error":{"code":403,"message":"Your account has been suspended due to a violation of the Terms of Service"}}',
     )
-    expect(banned.kind).toBe('auth-failure')
+    expect(banned.kind).toBe('transient')
   })
 
   it('extracts the appeal link from either RPC metadata field, or textually', () => {
@@ -147,7 +146,7 @@ describe('classifyHttpError', () => {
 
   it('classifies fetch failures as network-error', () => {
     expect(classifyFetchError(new TypeError('fetch failed')).kind).toBe('network-error')
-    expect(classifyFetchError(new DOMException('aborted', 'AbortError')).kind).toBe('network-error')
+    expect(classifyFetchError(new DOMException('aborted', 'AbortError')).kind).toBe('request-error')
   })
 
   // Issue #29 (1): bare socket codes mean "proxy unreachable" ONLY while an

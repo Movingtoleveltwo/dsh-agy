@@ -350,9 +350,9 @@ export function decideRotation(
       return { action: 'retry', backoffMs }
     }
     case 'proxy-unreachable': {
-      // Per-account proxy dead: fail-closed, skip this account for this request only.
-      // Do NOT write coolingDownUntil / rateLimitResetTimes — next request may retry.
-      return { action: 'rotate', backoffMs: Math.min(backoffMs, 1000) }
+      // A proxy socket failure is still a transport failure, not evidence against
+      // the account. Preserve the account and retry through the same route.
+      return { action: 'retry', backoffMs }
     }
   }
 }

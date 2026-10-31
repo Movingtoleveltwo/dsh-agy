@@ -2988,7 +2988,7 @@ describe('AgyAdapter', () => {
     }
   })
 
-  it('reports and throws QUOTA (terminal) on daily quota exhaustion', async () => {
+  it('treats quota wording without a matching fresh zero balance as a soft limit', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('{"error":{"status":"RESOURCE_EXHAUSTED"}}', { status: 429 })))
     const failures: Array<{ kind: string; session: AgyAccountSession }> = []
     const adapter = new AgyAdapter({
@@ -2997,7 +2997,7 @@ describe('AgyAdapter', () => {
     })
     await expect(async () => {
       for await (const _ of adapter.stream(generateOptions())) void _
-    }).rejects.toMatchObject({ code: 'QUOTA' })
+    }).rejects.toMatchObject({ code: 'RATE_LIMIT' })
     expect(failures[0]?.kind).toBe('rate-limit')
     expect(failures[0]?.session.account.email).toBe('a@b.c')
   })
