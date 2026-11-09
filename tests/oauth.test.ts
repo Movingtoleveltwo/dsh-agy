@@ -331,18 +331,19 @@ describe('bootstrap UA version freshness', () => {
 
   it('publishes the resolved version for every User-Agent builder', async () => {
     setResolvedAgyVersion(undefined)
+    _clearVersionCacheForTest()
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('antigravity-auto-updater')) {
-        return new Response(JSON.stringify([{ version: '1.2.3' }, { version: '1.20.1' }]), { status: 200 })
+        return new Response(JSON.stringify([{ version: '2.2.3' }, { version: '2.20.1' }]), { status: 200 })
       }
-      return new Response(JSON.stringify({ tag_name: '1.19.0' }), { status: 200 })
+      return new Response(JSON.stringify({ tag_name: '2.30.0' }), { status: 200 })
     }) as unknown as (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
-    expect(await resolveAntigravityVersion(fetchImpl)).toBe('1.19.0')
+    expect(await resolveAntigravityVersion(fetchImpl)).toBe('2.30.0')
     // Resolution must reach the bootstrap UA without any call site passing it.
-    expect(getAgyBootstrapUserAgent()).toContain('Antigravity/1.19.0')
-    expect(antigravityUserAgent()).toBe('antigravity/1.19.0 darwin/arm64')
+    expect(getAgyBootstrapUserAgent()).toContain('Antigravity/2.30.0')
+    expect(antigravityUserAgent()).toBe('antigravity/2.30.0 darwin/arm64')
   })
 
   it('reports nothing observed when the feeds yield nothing', async () => {
@@ -381,12 +382,12 @@ describe('bootstrap UA version freshness', () => {
     const routed = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('antigravity-auto-updater')) {
-        return new Response(JSON.stringify([{ version: '1.21.0' }]), { status: 200 })
+        return new Response(JSON.stringify([{ version: '2.31.0' }]), { status: 200 })
       }
-      return new Response(JSON.stringify({ tag_name: '1.21.0' }), { status: 200 })
+      return new Response(JSON.stringify({ tag_name: '2.31.0' }), { status: 200 })
     }) as unknown as (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
-    expect(await resolveAntigravityVersionBounded(1_000, routed)).toBe('1.21.0')
+    expect(await resolveAntigravityVersionBounded(1_000, routed)).toBe('2.31.0')
     // Every request went through the injected fetch, never the global one.
     expect(routed).toHaveBeenCalled()
 

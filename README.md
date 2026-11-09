@@ -103,6 +103,42 @@ dsh-agy logout         # remove account
 | `dsh-agy health` | `--index <n...>` — check only these accounts (default: all enabled)<br>`--interval <ms>` — repeat on an interval instead of once | Batch health check (refresh + userinfo), re-enables accounts whose credentials are live again |
 | `dsh-agy logout` | `--index <n>` — account index (default: active)<br>`--email <email>` — account email | Remove an account |
 
+### Standalone HTTP relay (no DSH host)
+
+```sh
+dsh-agy login                         # or import existing accounts
+dsh-agy serve                         # default: 127.0.0.1:3080
+dsh-agy serve --host 127.0.0.1 --port 3089
+# From this repository after npm run build:
+bin/dsh-agy.js serve --port 3089
+```
+
+Set Hermes or another OpenAI-compatible client's base URL to
+`http://127.0.0.1:3089/agy/v1`. The service reuses the existing encrypted
+`$DSH_HOME/agy/agy-accounts.json` store (including legacy migration), account
+routing/rotation, model visibility, thinking budgets, inline file limits and
+usage ledger. It starts with native Node HTTP, without a DSH Web server,
+Settings UI, management RPC or OAuth callback. Optional DSH peer packages are
+not needed by the built CLI.
+
+```sh
+curl http://127.0.0.1:3089/agy/v1/health
+curl http://127.0.0.1:3089/agy/v1/models
+```
+
+The complete existing `/agy/v1` handler is available, including streamed and
+non-streamed `POST /agy/v1/chat/completions`. Health checks do not validate
+upstream credentials; model discovery falls back to the built-in catalog if
+accounts or the upstream service are unavailable. Use `login`/`import` before
+making real generation requests. SIGINT/SIGTERM stop accepting new requests,
+drain active requests for up to five seconds, then close remaining connections
+and flush pending usage/recent activity.
+
+**Security:** this relay has no API-key authentication. The default is loopback
+only. Do not expose it publicly with `--host 0.0.0.0`/`::` without a trusted,
+authenticated reverse proxy or equivalent access control. It does not inherit
+the DSH Web host's browser-authentication fence.
+
 ### Per-account proxy
 
 Each account can have its own proxy; credentials are encrypted at rest and displayed masked as `protocol//host:port`.

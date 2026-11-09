@@ -58,6 +58,7 @@ let publishedVersion: string | undefined
  */
 function publishVersion(version: string | null | undefined): void {
   if (version === null || version === undefined) return
+  if (compareSemver(version, AGY_VERSION_FALLBACK) < 0) return
   const best = pickNewestVersion(version, publishedVersion)
   if (best === null || best === publishedVersion) return
   publishedVersion = best
@@ -172,7 +173,11 @@ export async function resolveAntigravityCliVersion(fetchImpl: FetchLike = proxie
  * the fallback is the value under test.
  */
 export async function resolveObservedAgyVersion(fetchImpl: FetchLike = proxiedFetch): Promise<string | undefined> {
-  return (await resolveObservedVersion(cliState, CLI_RELEASE_URL, parseCliRelease, fetchImpl)) ?? undefined
+  const version = (await resolveObservedVersion(cliState, CLI_RELEASE_URL, parseCliRelease, fetchImpl)) ?? undefined
+  if (version && compareSemver(version, AGY_VERSION_FALLBACK) < 0) {
+    return undefined
+  }
+  return version
 }
 
 /** Best available version: the claimed product line, cached 6h. */
@@ -235,6 +240,7 @@ const cliState: VersionState = { inFlight: null }
  * process state, and dropping it would let a test's User-Agent move backwards.
  */
 export function _clearVersionCacheForTest(): void {
+  publishedVersion = undefined
   ideState.cache = undefined
   cliState.cache = undefined
   ideState.inFlight = null

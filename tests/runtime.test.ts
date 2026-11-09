@@ -865,15 +865,15 @@ describe('version resolver', () => {
     const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.includes('antigravity-auto-updater')) {
-        return new Response(JSON.stringify([{ version: '1.15.0' }, { version: '1.20.1' }]), { status: 200 })
+        return new Response(JSON.stringify([{ version: '2.25.0' }, { version: '2.27.0' }]), { status: 200 })
       }
       // No leading `v`: that is the shape the real feed returns (`tag: "1.2.9"`),
       // and a `v`-prefixed tag is not what this parser accepts.
-      return new Response(JSON.stringify({ tag_name: '1.19.0' }), { status: 200 })
+      return new Response(JSON.stringify({ tag_name: '2.29.0' }), { status: 200 })
     }) as unknown as (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
 
     const version = await resolveAntigravityVersion(fetchImpl)
-    expect(version).toBe('1.19.0')
+    expect(version).toBe('2.29.0')
   })
 
   it('falls back to the pinned version when sources fail', async () => {

@@ -85,6 +85,35 @@ dsh-agy logout         # 删除账号
 | `dsh-agy health` | `--index <n...>` — 只检查指定账号（默认全部启用账号）<br>`--interval <ms>` — 按间隔重复检查 | 批量健康检查（refresh + userinfo），凭据恢复有效的账号自动重新启用 |
 | `dsh-agy logout` | `--index <n>` — 账号索引（默认当前 active）<br>`--email <email>` — 账号邮箱 | 删除账号 |
 
+### 独立接口转发服务（不需要 DSH 宿主）
+
+```sh
+dsh-agy login                         # 也可以导入已有账号
+dsh-agy serve                         # 默认监听 127.0.0.1:3080
+dsh-agy serve --host 127.0.0.1 --port 3089
+# 在仓库中运行 npm run build 后，也可以直接启动：
+bin/dsh-agy.js serve --port 3089
+```
+
+将 Hermes 等兼容 OpenAI 的客户端接口地址设为
+`http://127.0.0.1:3089/agy/v1`。服务复用现有加密账号文件
+`$DSH_HOME/agy/agy-accounts.json`（包括旧路径迁移），以及账号代理与轮转、模型隐藏、
+思考预算、文件内联上限和用量账本。它直接使用 Node 原生 HTTP 服务，不启动 DSH 网页宿主、
+设置界面、管理接口或授权回调；构建后的命令行也不需要安装可选的 DSH 宿主依赖包。
+
+```sh
+curl http://127.0.0.1:3089/agy/v1/health
+curl http://127.0.0.1:3089/agy/v1/models
+```
+
+现有 `/agy/v1` 路由完整保留，包括流式和非流式的 `POST /agy/v1/chat/completions`。
+健康检查只说明本地服务正常，不验证上游凭据；没有账号或上游发现失败时，模型列表会回退到内置目录。
+真实生成请求前须先登录或导入账号。收到中断或终止信号后，服务停止接收新请求，最多等待五秒让在途请求完成，
+再关闭剩余连接并保存待写入的用量与近期活动。
+
+**安全边界：** 此服务不提供接口密钥认证，默认只监听本机。除非已通过带认证的可信反向代理或等效访问控制保护，
+否则不要用 `--host 0.0.0.0` 或 `::` 暴露到公网；它不继承 DSH 网页宿主的浏览器认证屏障。
+
 ### 每账号代理（Per-account proxy）
 
 每个账号可独立配置代理；凭据落盘加密，展示时脱敏为 `protocol//host:port`。

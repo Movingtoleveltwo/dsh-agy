@@ -1,8 +1,11 @@
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
-import { writeBlobFile } from '../src/cli/index.ts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createProgram, writeBlobFile } from '../src/cli/index.ts'
+
+const { serveCommand } = vi.hoisted(() => ({ serveCommand: vi.fn() }))
+vi.mock('../src/cli/serve.ts', () => ({ serveCommand }))
 
 const dirs: string[] = []
 
@@ -42,5 +45,30 @@ describe('dsh-agy export blob file', () => {
     const file = join(tempDir(), 'dsh-agy-1.blob')
     writeBlobFile(file, 'AGY-BLOB-PAYLOAD')
     expect(readFileSync(file, 'utf8')).toBe('AGY-BLOB-PAYLOAD\n')
+  })
+})
+
+
+describe('dsh-agy serve command', () => {
+  afterEach(() => { vi.clearAllMocks(); vi.unstubAllEnvs() })
+
+  it('parses default listen options', async () => {
+    vi.stubEnv('DSH_AGY_DISABLE', '0')
+    await createProgram().parseAsync(['serve'], { from: 'user' })
+    expect(serveCommand).toHaveBeenCalledWith({ port: 3080, host: '127.0.0.1' })
+  })
+
+  it('parses numeric --port and custom --host', async () => {
+    vi.stubEnv('DSH_AGY_DISABLE', '0')
+    await createProgram().parseAsync(['serve', '--port', '3089', '--host', '0.0.0.0'], { from: 'user' })
+    expect(serveCommand).toHaveBeenCalledWith({ port: 3089, host: '0.0.0.0' })
+  })
+
+  it.each(['0', '-1', '65536', '3089oops', '3.5', 'NaN'])('rejects invalid port %s before starting', async (port) => {
+    const program = createProgram()
+    program.commands.find((command) => command.name() === 'serve')!
+      .exitOverride().configureOutput({ writeErr: () => {} })
+    await expect(program.parseAsync(['serve', '--port', port], { from: 'user' })).rejects.toThrow('port must be an integer')
+    expect(serveCommand).not.toHaveBeenCalled()
   })
 })

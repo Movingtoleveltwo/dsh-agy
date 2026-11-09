@@ -2,13 +2,26 @@ import { defineConfig } from 'tsdown'
 
 export default defineConfig([
   {
-    entry: ['src/index.ts', 'src/cli/index.ts', 'src/web/plugin.ts'],
+    entry: ['src/index.ts', 'src/web/plugin.ts'],
     outDir: 'lib',
     format: ['esm'],
     platform: 'node',
     target: 'es2024',
     dts: true,
     clean: true,
+  },
+  {
+    entry: { 'cli/index': 'src/cli/index.ts' },
+    outDir: 'lib',
+    format: ['esm'],
+    platform: 'node',
+    target: 'es2024',
+    dts: true,
+    clean: false,
+    // The standalone relay uses the official adapter base/error vocabulary,
+    // but npm installs may omit every optional DSH peer. Bundle that library
+    // and its transitive dependencies; never bootstrap a Cordis application.
+    deps: { alwaysBundle: [/^@deepseek-ai\//] },
   },
   {
     entry: { client: 'src/client/index.ts' },

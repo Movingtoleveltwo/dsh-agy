@@ -1,10 +1,10 @@
 /**
- * dsh-agy CLI: login / status / import / verify / logout.
+ * dsh-agy CLI: login / status / import / verify / logout / serve.
  * Standalone bin — the dsh launcher has no plugin subcommand slot, and the
  * remote paste-blob flow must run on machines without a harness.
  */
 
-import { Command } from 'commander'
+import { Command, InvalidArgumentError } from 'commander'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createInterface } from 'node:readline/promises'
@@ -479,6 +479,22 @@ export function createProgram(): Command {
       process.exit(1)
     }
   })
+
+  program
+    .command('serve')
+    .description('Start a standalone OpenAI-compatible HTTP relay (no DSH host required)')
+    .option('--port <number>', 'HTTP listen port', (value: string) => {
+      if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
+        throw new InvalidArgumentError('port must be an integer between 1 and 65535')
+      }
+      return Number(value)
+    }, 3080)
+    .option('--host <string>', 'HTTP listen address (no authentication; keep loopback unless secured)', '127.0.0.1')
+    .action(async (options: { port: number; host: string }) => {
+      // Keep the account-management CLI independent of relay/adapter loading.
+      const { serveCommand } = await import('./serve.ts')
+      await serveCommand(options)
+    })
 
   program
     .command('login')

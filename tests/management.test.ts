@@ -10,7 +10,7 @@ import { MultimodalConfigStore } from '../src/multimodal-config.ts'
 import { UiPrefsStore } from '../src/ui-prefs.ts'
 import type { AccountStore } from '../src/store/accounts.ts'
 import type { AgySessionManager } from '../src/session.ts'
-import type { AccountStorageV4, GeminiModelQuotaSnapshot, ManagedAccount } from '../src/types.ts'
+import type { AccountStorageV4, ManagedAccount } from '../src/types.ts'
 
 function account(overrides: Partial<ManagedAccount> = {}): ManagedAccount {
   return { refresh: 'refresh-a', addedAt: 1, lastUsed: 1, email: 'a@x.com', ...overrides }
@@ -59,7 +59,6 @@ function makeHarness(options: {
   inFlight?: Array<{ index: number, email: string | null, count: number }>
   /** What the session's burn-rate snapshot reports (defaults to none). */
   limitBurn?: Array<{ index: number, perHour: Record<string, number> }>
-  cachedGeminiQuota?: GeminiModelQuotaSnapshot | null
   baseUrl?: () => string
 } = {}): Harness {
   const accounts = options.accounts ?? [account()]
@@ -151,8 +150,6 @@ function makeHarness(options: {
       { id: 'model-a', name: 'Model A' },
       { id: 'model-b', name: 'Model B' },
     ],
-    peekCachedGeminiQuota: () => options.cachedGeminiQuota ?? null,
-    getCachedGeminiQuota: async () => options.cachedGeminiQuota ?? null,
     baseUrl: options.baseUrl ?? (() => 'http://127.0.0.1:3080'),
   })
   // A getter, not a copied primitive: the counter changes after this return.
@@ -349,44 +346,45 @@ describe('agy management RPC', () => {
     expect(after.accounts[0]?.limitsUpdatedAt).toBe(1_700_000_000_000)
   })
 
-  it('projects cached Gemini model quota without changing the grouped runtime cache', async () => {
+  it('projects Google native Gemini Models quota while filtering 3P models', async () => {
     const groupedLimits = {
       updatedAt: 1_700_000_000_000,
-      groups: [{
-        name: 'Claude and GPT models',
-        windows: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 0.2, resetTime: '2026-10-31T23:05:00Z' }],
-      }],
-    }
-    const snapshot = {
-      remainingFraction: 0.97,
-      resetTime: '2026-10-31T23:05:00Z',
-      updatedAt: 1_798_000_000_000,
+      groups: [
+        {
+          name: 'Gemini Models',
+          windows: [
+            { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.55, resetTime: '2026-11-02T15:00:00Z' },
+            { bucketId: 'gemini-5h', window: '5h', remainingFraction: 0.66, resetTime: '2026-10-31T23:05:00Z' },
+          ],
+        },
+        {
+          name: 'Claude and GPT models',
+          windows: [{ bucketId: '3p-5h', window: '5h', remainingFraction: 0.2, resetTime: '2026-10-31T23:05:00Z' }],
+        },
+      ],
     }
     const harness = makeHarness({
       accounts: [account({ cachedLimits: groupedLimits })],
-      cachedGeminiQuota: snapshot,
     })
     const listed = await harness.management.call('account.list', {}) as {
       accounts: Array<{ limits: Array<{ name: string }> | null, limitsUpdatedAt: number | null }>
     }
     expect(listed.accounts[0]).toMatchObject({
       limits: [{ name: 'Gemini Models' }],
-      limitsUpdatedAt: snapshot.updatedAt,
+      limitsUpdatedAt: groupedLimits.updatedAt,
     })
 
     const result = await harness.management.call('account.limits', {}) as {
-      limits: Array<{ groups: Array<{ name: string, windows: Array<{ remainingFraction: number, resetTime: string }> }> | null, updatedAt: number | null }>
+      limits: Array<{ groups: Array<{ name: string, windows: Array<{ bucketId: string, remainingFraction: number }> }> | null, updatedAt: number | null }>
     }
     expect(result.limits[0]).toMatchObject({
-      updatedAt: snapshot.updatedAt,
+      updatedAt: groupedLimits.updatedAt,
       groups: [{
         name: 'Gemini Models',
-        windows: [{
-          bucketId: 'gemini-models-5h',
-          window: '5h',
-          remainingFraction: 0.97,
-          resetTime: snapshot.resetTime,
-        }],
+        windows: [
+          { bucketId: 'gemini-weekly', remainingFraction: 0.55 },
+          { bucketId: 'gemini-5h', remainingFraction: 0.66 },
+        ],
       }],
     })
     expect((await harness.store.load()).accounts[0]?.cachedLimits).toEqual(groupedLimits)

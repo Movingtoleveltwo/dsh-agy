@@ -138,7 +138,7 @@ export async function fetchAgyFirstOk(
  * numerically is meaningless and mixing them advertises a version that does not
  * exist for the product we name.
  */
-export const AGY_VERSION_FALLBACK = '1.2.9'
+export const AGY_VERSION_FALLBACK = '2.29.0'
 
 /**
  * `ClientMetadata.platform` value: the proto enum NAME, as protobuf-JSON emits it.
